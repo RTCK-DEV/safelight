@@ -9,8 +9,9 @@ pub mod decode;
 pub mod develop;
 pub mod engine;
 pub mod ffi;
+pub mod gpu;
 pub mod recipe;
 
-pub use develop::RgbaImage;
+pub use develop::{histogram, RgbaImage};
 pub use engine::Engine;
 pub use recipe::{Recipe, Sidecar, WbMode};

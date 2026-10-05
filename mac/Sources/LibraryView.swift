@@ -21,12 +21,44 @@ struct LibraryView: View {
                 } else {
                     ScrollView {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
-                            ForEach(store.photos) { photo in
+                            ForEach(store.filtered) { photo in
                                 ThumbCell(photo: photo)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(.white.opacity(0.7),
+                                                    lineWidth: store.selection == photo ? 2 : 0)
+                                    )
                                     .onTapGesture { store.selection = photo }
                             }
                         }
                         .padding(8)
+                    }
+                    .safeAreaInset(edge: .bottom) {
+                        HStack(spacing: 10) {
+                            Picker("Rating", selection: $store.minRating) {
+                                Text("★ all").tag(0)
+                                ForEach(1...5, id: \.self) { Text("★\($0)+").tag($0) }
+                            }
+                            .frame(width: 90)
+                            Menu {
+                                Button("All labels") { store.labelFilter = "" }
+                                ForEach(labelColors, id: \.name) { l in
+                                    Button(l.name) { store.labelFilter = l.name }
+                                }
+                            } label: {
+                                Label(store.labelFilter.isEmpty ? "Label" : store.labelFilter,
+                                      systemImage: "tag")
+                                    .labelStyle(.titleAndIcon)
+                            }
+                            .frame(width: 100)
+                            Spacer()
+                            Text("\(store.filtered.count)/\(store.photos.count)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.bar)
                     }
                 }
             }
@@ -56,7 +88,7 @@ struct ThumbCell: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            ZStack {
+            ZStack(alignment: .bottomLeading) {
                 Rectangle().fill(.quaternary)
                     .aspectRatio(1.4, contentMode: .fit)
                 if let image {
@@ -65,6 +97,12 @@ struct ThumbCell: View {
                         .scaledToFit()
                 } else {
                     ProgressView()
+                }
+                if let c = labelColors.first(where: { $0.name == photo.label })?.color {
+                    Circle()
+                        .fill(c)
+                        .frame(width: 8, height: 8)
+                        .padding(4)
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 6))

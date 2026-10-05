@@ -172,6 +172,19 @@ impl Catalog {
         )?;
         Ok(())
     }
+
+    pub fn set_label(&self, asset: &Path, label: &str) -> Result<()> {
+        let sp = sidecar_path_for(asset);
+        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        sc.label = label.to_string();
+        write_sidecar(&sp, &sc)?;
+        self.db.execute(
+            "INSERT INTO files(path,name,folder,kind,rating,label) VALUES(?1,'','','raw',0,?2)
+             ON CONFLICT(path) DO UPDATE SET label=?2",
+            params![asset.to_string_lossy(), sc.label],
+        )?;
+        Ok(())
+    }
 }
 
 pub fn read_sidecar(sc_path: &Path) -> Result<Sidecar> {

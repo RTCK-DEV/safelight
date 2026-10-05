@@ -38,6 +38,10 @@ pub struct Params {
     pub vibrance: f32,
     pub sharpen: f32,
     pub noise_luma: f32,
+    pub rotation_deg: f32,
+    pub clarity: f32,
+    pub vignette: f32,
+    pub grain: f32,
 }
 
 fn inv3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
@@ -177,6 +181,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, auto_means: Option<[f32; 3]>) -> Par
         vibrance: r.vibrance,
         sharpen: r.sharpen,
         noise_luma: r.noise_luma,
+        rotation_deg: r.rotation_deg.clamp(-45.0, 45.0),
+        clarity: r.clarity.clamp(-1.0, 1.0),
+        vignette: r.vignette.clamp(-1.0, 1.0),
+        grain: r.grain.clamp(0.0, 1.0),
     }
 }
 
@@ -296,42 +304,6 @@ fn demosaic_pixel(
         }
     }
     out
-}
-
-fn rotate_rgba(data: &[u8], w: usize, h: usize, flip: i32) -> (Vec<u8>, usize, usize) {
-    match flip {
-        3 => {
-            let mut o = vec![0u8; data.len()];
-            for y in 0..h {
-                for x in 0..w {
-                    let si = (y * w + x) * 4;
-                    let di = ((h - 1 - y) * w + (w - 1 - x)) * 4;
-                    o[di..di + 4].copy_from_slice(&data[si..si + 4]);
-                }
-            }
-            (o, w, h)
-        }
-        5 | 6 => {
-            let (nw, nh) = (h, w);
-            let mut o = vec![0u8; data.len()];
-            for y in 0..h {
-                for x in 0..w {
-                    let si = (y * w + x) * 4;
-                    let (dx, dy) = if flip == 6 {
-                        // 90deg CW: dst(x') = h-1-y, dst(y') = x
-                        (h - 1 - y, x)
-                    } else {
-                        // 90deg CCW
-                        (y, w - 1 - x)
-                    };
-                    let di = (dy * nw + dx) * 4;
-                    o[di..di + 4].copy_from_slice(&data[si..si + 4]);
-                }
-            }
-            (o, nw, nh)
-        }
-        _ => (data.to_vec(), w, h),
-    }
 }
 
 /// black level + white point normalization factors per CFA colour index.
@@ -466,7 +438,8 @@ fn develop_raster(
     finish_linear(lin, w, h, &p, flip, max_px)
 }
 
-/// shared tail: spatial ops (NR/sharpen) -> adjust -> gamma -> rotate -> resize
+/// shared tail: spatial ops -> straighten/flip/fit-resize -> adjust ->
+/// grain/vignette -> gamma. Same ordering as the gpu.rs finish pass.
 fn finish_linear(
     mut lin: Vec<[f32; 3]>,
     w: usize,
@@ -478,31 +451,103 @@ fn finish_linear(
     if p.noise_luma > 0.0 {
         lin = chroma_smooth(&lin, w, h, p.noise_luma);
     }
-    if p.sharpen > 0.0 {
-        lin = unsharp(&lin, w, h, p.sharpen);
+    if p.sharpen > 0.0 || p.clarity != 0.0 {
+        lin = sharpen_clarity(&lin, w, h, p.sharpen, p.clarity);
     }
-    let mut out = vec![0u8; w * h * 4];
-    for (i, px) in lin.iter().enumerate() {
-        let adj = adjust(*px, p);
-        for c in 0..3 {
-            out[i * 4 + c] = (srgb_encode(adj[c]) * 255.0 + 0.5) as u8;
-        }
-        out[i * 4 + 3] = 255;
-    }
-    let (rot, rw, rh) = rotate_rgba(&out, w, h, flip);
-    let img = image::RgbaImage::from_raw(rw as u32, rh as u32, rot)
-        .unwrap_or_else(|| image::RgbaImage::new(1, 1));
-    let img = if max_px > 0 && rw.max(rh) as u32 > max_px {
-        let (nw, nh) = fit(rw as u32, rh as u32, max_px);
-        image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle)
-    } else {
-        img
+    let (fw, fh) = match flip {
+        5 | 6 => (h, w),
+        _ => (w, h),
     };
-    RgbaImage {
-        width: img.width(),
-        height: img.height(),
-        data: img.into_raw(),
+    let (dw, dh) = if max_px > 0 { fit(fw as u32, fh as u32, max_px) } else { (fw as u32, fh as u32) };
+    let (dw, dh) = (dw.max(1) as usize, dh.max(1) as usize);
+    let cx = (fw as f32 - 1.0) * 0.5;
+    let cy = (fh as f32 - 1.0) * 0.5;
+    let sin = p.rotation_deg.to_radians().sin();
+    let cos = p.rotation_deg.to_radians().cos();
+    let mut out = vec![0u8; dw * dh * 4];
+    for dy in 0..dh {
+        for dx in 0..dw {
+            // dst -> post-flip frame, undo straighten, undo flip -> src
+            let mut fx = (dx as f32 + 0.5) * fw as f32 / dw as f32 - 0.5;
+            let mut fy = (dy as f32 + 0.5) * fh as f32 / dh as f32 - 0.5;
+            let px = fx - cx;
+            let py = fy - cy;
+            fx = cx + px * cos + py * sin;
+            fy = cy - px * sin + py * cos;
+            let (sx, sy) = match flip {
+                3 => (w as f32 - 1.0 - fx, h as f32 - 1.0 - fy),
+                6 => (fy, h as f32 - 1.0 - fx),
+                5 => (w as f32 - 1.0 - fy, fx),
+                _ => (fx, fy),
+            };
+            let col = bilinear(&lin, w, h, sx, sy);
+            let mut adj = adjust(col, p);
+            if p.grain > 0.0 {
+                for (c, seed) in adj.iter_mut().zip([0.0f32, 17.0, 43.0]) {
+                    *c += (hash_px(dx, dy, seed) - 0.5) * p.grain * 0.12;
+                }
+            }
+            if p.vignette != 0.0 {
+                let nx = (dx as f32 + 0.5) / dw as f32 * 2.0 - 1.0;
+                let ny = (dy as f32 + 0.5) / dh as f32 * 2.0 - 1.0;
+                let d = (nx * nx + ny * ny).sqrt() * 0.7071;
+                let f = 1.0 - p.vignette * sstep(0.35, 1.05, d) * 0.9;
+                for c in &mut adj {
+                    *c *= f;
+                }
+            }
+            let o = (dy * dw + dx) * 4;
+            for c in 0..3 {
+                out[o + c] = (srgb_encode(adj[c]) * 255.0 + 0.5) as u8;
+            }
+            out[o + 3] = 255;
+        }
     }
+    RgbaImage {
+        width: dw as u32,
+        height: dh as u32,
+        data: out,
+    }
+}
+
+fn bilinear(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32) -> [f32; 3] {
+    let x0 = sx.floor() as i32;
+    let y0 = sy.floor() as i32;
+    if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
+        if x0 >= 0 && y0 >= 0 && (x0 as usize) < w && (y0 as usize) < h {
+            return lin[y0 as usize * w + x0 as usize];
+        }
+        return [0.0; 3];
+    }
+    let tx = sx - x0 as f32;
+    let ty = sy - y0 as f32;
+    let (x0, y0) = (x0 as usize, y0 as usize);
+    let at = |x: usize, y: usize| lin[y * w + x];
+    let mut o = [0.0f32; 3];
+    for c in 0..3 {
+        let a = at(x0, y0)[c] * (1.0 - tx) + at(x0 + 1, y0)[c] * tx;
+        let b = at(x0, y0 + 1)[c] * (1.0 - tx) + at(x0 + 1, y0 + 1)[c] * tx;
+        o[c] = a * (1.0 - ty) + b * ty;
+    }
+    o
+}
+
+fn hash_px(x: usize, y: usize, seed: f32) -> f32 {
+    let v = (x as f32 * (12.9898 + seed) + y as f32 * (78.233 + seed * 1.7)).sin() * 43758.5453;
+    v - v.floor()
+}
+
+/// 256-bin histogram of rendered rgba8 pixels: [R,G,B,luma] * 256.
+pub fn histogram(rgba8: &[u8]) -> [u32; 1024] {
+    let mut h = [0u32; 1024];
+    for px in rgba8.chunks_exact(4) {
+        h[px[0] as usize] += 1;
+        h[256 + px[1] as usize] += 1;
+        h[512 + px[2] as usize] += 1;
+        let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) as usize;
+        h[768 + l.min(255)] += 1;
+    }
+    h
 }
 
 fn fit(w: u32, h: u32, max_px: u32) -> (u32, u32) {
@@ -557,18 +602,48 @@ fn chroma_smooth(lin: &[[f32; 3]], w: usize, h: usize, amount: f32) -> Vec<[f32;
     out
 }
 
-/// unsharp mask on each channel, 3x3 box blur.
-fn unsharp(lin: &[[f32; 3]], w: usize, h: usize, amount: f32) -> Vec<[f32; 3]> {
+/// unsharp mask (3x3) + clarity (5x5 midtone-weighted local contrast).
+fn sharpen_clarity(
+    lin: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    sharpen: f32,
+    clarity: f32,
+) -> Vec<[f32; 3]> {
     let chans: Vec<Vec<f32>> = (0..3)
         .map(|c| lin.iter().map(|p| p[c]).collect())
         .collect();
+    let boxn = |chan: &[f32], x: usize, y: usize, rad: i32| {
+        let mut s = 0.0f32;
+        let mut n = 0u32;
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                    s += chan[ny as usize * w + nx as usize];
+                    n += 1;
+                }
+            }
+        }
+        s / n as f32
+    };
     let mut out = vec![[0.0f32; 3]; lin.len()];
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
+            let lum = (0.2126 * lin[i][0] + 0.7152 * lin[i][1] + 0.0722 * lin[i][2])
+                .clamp(0.0, 1.0);
+            let mid = 4.0 * lum * (1.0 - lum);
             for c in 0..3 {
-                let blur = box3(&chans[c], w, h, x, y);
-                out[i][c] = lin[i][c] + amount * 0.8 * (lin[i][c] - blur);
+                let mut v = lin[i][c];
+                if sharpen != 0.0 {
+                    v += sharpen * 0.8 * (v - boxn(&chans[c], x, y, 1));
+                }
+                if clarity != 0.0 {
+                    v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));
+                }
+                out[i][c] = v;
             }
         }
     }

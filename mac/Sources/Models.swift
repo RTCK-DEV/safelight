@@ -35,6 +35,10 @@ struct Recipe: Codable, Equatable {
     var curve: [[Double]] = []
     var sharpen: Double = 0
     var noise_luma: Double = 0
+    var rotation_deg: Double = 0
+    var clarity: Double = 0
+    var vignette: Double = 0
+    var grain: Double = 0
 }
 
 /// Mirrors araware_core::recipe::Sidecar.

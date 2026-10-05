@@ -79,9 +79,19 @@ final class AraEngine: @unchecked Sendable {
         cgImage(path.withCString { araware_thumbnail(handle, $0, maxPx) })
     }
 
-    func render(path: String, recipe: Recipe, maxPx: UInt32) -> CGImage? {
+    /// Render plus the output-image histogram (R,G,B,luma x 256).
+    func render(path: String, recipe: Recipe, maxPx: UInt32) -> (CGImage?, [[UInt32]]) {
         let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        return cgImage(js.withCString { r in path.withCString { araware_render(handle, $0, r, maxPx) } })
+        var bins = [UInt32](repeating: 0, count: 1024)
+        let img = bins.withUnsafeMutableBufferPointer { buf in
+            buf.baseAddress!.withMemoryRebound(to: AraHistogram.self, capacity: 1) { hist in
+                js.withCString { r in
+                    path.withCString { araware_render_h(handle, $0, r, maxPx, hist) }
+                }
+            }
+        }
+        let rows = (0..<4).map { ch in Array(bins[(ch * 256)..<(ch * 256 + 256)]) }
+        return (cgImage(img), rows)
     }
 
     func export(path: String, recipe: Recipe) -> CGImage? {
@@ -111,5 +121,10 @@ final class AraEngine: @unchecked Sendable {
     @discardableResult
     func setRating(path: String, _ rating: Int) -> Bool {
         path.withCString { araware_set_rating(handle, $0, Int32(rating)) } == 0
+    }
+
+    @discardableResult
+    func setLabel(path: String, _ label: String) -> Bool {
+        label.withCString { l in path.withCString { araware_set_label(handle, $0, l) } } == 0
     }
 }

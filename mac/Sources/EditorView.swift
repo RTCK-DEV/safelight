@@ -2,6 +2,11 @@ import SwiftUI
 import ImageIO
 import UniformTypeIdentifiers
 
+let labelColors: [(name: String, color: Color)] = [
+    ("red", .red), ("orange", .orange), ("yellow", .yellow),
+    ("green", .green), ("blue", .blue), ("purple", .purple),
+]
+
 struct EditorView: View {
     let photo: Photo
 
@@ -9,6 +14,7 @@ struct EditorView: View {
     @State private var rating = 0
     @State private var label = ""
     @State private var image: CGImage?
+    @State private var hist: [[UInt32]] = []
     @State private var rendering = false
     @State private var dirty = false
     @State private var status = ""
@@ -39,6 +45,20 @@ struct EditorView: View {
                                 AraEngine.shared.setRating(path: photo.path, r)
                                 dirty = true
                             }
+                    }
+                    HStack {
+                        LabelPicker(label: $label)
+                            .onChange(of: label) { _, l in
+                                AraEngine.shared.setLabel(path: photo.path, l)
+                                dirty = true
+                            }
+                        Spacer()
+                    }
+
+                    if !hist.isEmpty {
+                        HistogramView(hist: hist)
+                            .frame(height: 88)
+                            .padding(.vertical, 2)
                     }
 
                     GroupBox("Light") {
@@ -71,7 +91,24 @@ struct EditorView: View {
                             SliderRow("Noise", $recipe.noise_luma, 0...1)
                         }
                     }
+                    GroupBox("Transform") {
+                        VStack(spacing: 8) {
+                            SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
+                        }
+                    }
+                    GroupBox("Effects") {
+                        VStack(spacing: 8) {
+                            SliderRow("Clarity", $recipe.clarity, -1...1)
+                            SliderRow("Vignette", $recipe.vignette, -1...1)
+                            SliderRow("Grain", $recipe.grain, 0...1)
+                        }
+                    }
 
+                    HStack(spacing: 8) {
+                        Button("Copy") { copyRecipe() }
+                        Button("Paste") { pasteRecipe() }
+                        Button("Reset") { recipe = Recipe() }
+                    }
                     HStack {
                         Button("Save") { save() }
                         Button("Export JPEG…") { export() }
@@ -113,6 +150,25 @@ struct EditorView: View {
         dirty = false
     }
 
+    private func copyRecipe() {
+        guard let data = try? JSONEncoder().encode(recipe),
+              let js = String(data: data, encoding: .utf8) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(js, forType: .string)
+        status = "Recipe copied"
+    }
+
+    private func pasteRecipe() {
+        guard let js = NSPasteboard.general.string(forType: .string),
+              let data = js.data(using: .utf8),
+              let r = try? JSONDecoder().decode(Recipe.self, from: data) else {
+            status = "No recipe on clipboard"
+            return
+        }
+        recipe = r
+        status = "Recipe pasted"
+    }
+
     private func scheduleRender() {
         renderTask?.cancel()
         renderTask = Task {
@@ -126,9 +182,10 @@ struct EditorView: View {
         rendering = true
         let r = recipe
         Task.detached { [path = photo.path] in
-            let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1800) }
+            let (img, h) = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1800) }
             await MainActor.run {
                 if let img { image = img }
+                if !h.isEmpty { hist = h }
                 rendering = false
             }
         }
@@ -156,6 +213,57 @@ struct EditorView: View {
                 }
                 CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
                 status = CGImageDestinationFinalize(dest) ? "Exported \(url.lastPathComponent)" : "Export failed"
+            }
+        }
+    }
+}
+
+/// R,G,B + luma overlay histogram (log scale).
+struct HistogramView: View {
+    let hist: [[UInt32]]
+
+    var body: some View {
+        Canvas { ctx, size in
+            let chans: [(Int, Color)] = [
+                (0, .red.opacity(0.55)), (1, .green.opacity(0.55)), (2, .blue.opacity(0.55)),
+                (3, .white.opacity(0.7)),
+            ]
+            let maxv = hist.flatMap { $0 }.map { log1p(Double($0)) }.max() ?? 1
+            for (ch, color) in chans where hist.count > ch {
+                var p = Path()
+                for x in 0..<256 {
+                    let v = log1p(Double(hist[ch][x])) / maxv
+                    let px = CGFloat(x) / 255 * size.width
+                    let py = size.height - CGFloat(v) * size.height
+                    if x == 0 { p.move(to: CGPoint(x: px, y: py)) } else { p.addLine(to: CGPoint(x: px, y: py)) }
+                }
+                ctx.stroke(p, with: .color(color), lineWidth: 1)
+            }
+        }
+        .background(Color(white: 0.15))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+    }
+}
+
+struct LabelPicker: View {
+    @Binding var label: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(labelColors, id: \.name) { l in
+                Circle()
+                    .fill(l.color)
+                    .frame(width: 14, height: 14)
+                    .overlay(Circle().stroke(.primary, lineWidth: label == l.name ? 1.5 : 0))
+                    .opacity(label.isEmpty || label == l.name ? 1 : 0.45)
+                    .onTapGesture { label = (label == l.name) ? "" : l.name }
+            }
+            if !label.isEmpty {
+                Button("Clear") { label = "" }
+                    .font(.caption2)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
             }
         }
     }

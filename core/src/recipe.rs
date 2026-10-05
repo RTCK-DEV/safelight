@@ -44,6 +44,14 @@ pub struct Recipe {
     pub sharpen: f32,
     /// luminance noise reduction 0..1
     pub noise_luma: f32,
+    /// straighten angle in degrees, -10..10
+    pub rotation_deg: f32,
+    /// mid-tone local contrast -1..1
+    pub clarity: f32,
+    /// corner darkening -1..1 (positive darkens)
+    pub vignette: f32,
+    /// film grain 0..1
+    pub grain: f32,
 }
 
 impl Default for Recipe {
@@ -63,6 +71,10 @@ impl Default for Recipe {
             curve: Vec::new(),
             sharpen: 0.0,
             noise_luma: 0.0,
+            rotation_deg: 0.0,
+            clarity: 0.0,
+            vignette: 0.0,
+            grain: 0.0,
         }
     }
 }

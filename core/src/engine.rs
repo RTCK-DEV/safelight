@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::catalog::{AssetEntry, Catalog};
 use crate::decode::{self, Decoded};
 use crate::develop::{self, RgbaImage};
+use crate::gpu::Gpu;
 use crate::recipe::{sidecar_path_for, Recipe, Sidecar};
 
 struct State {
@@ -18,6 +19,8 @@ struct State {
 pub struct Engine {
     state: Mutex<State>,
     catalog: Catalog,
+    /// dropped permanently after the first GPU failure (device may be poisoned)
+    gpu: Mutex<Option<Gpu>>,
 }
 
 impl Engine {
@@ -28,6 +31,7 @@ impl Engine {
                 decoded: None,
             }),
             catalog: Catalog::open()?,
+            gpu: Mutex::new(Gpu::try_new()),
         })
     }
 
@@ -39,6 +43,7 @@ impl Engine {
                 decoded: None,
             }),
             catalog: Catalog::open_mem()?,
+            gpu: Mutex::new(Gpu::try_new()),
         })
     }
 
@@ -53,7 +58,23 @@ impl Engine {
 
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
-        self.with_decoded(path, |d| Ok(develop::develop_cpu(d, recipe, max_px)))
+        self.with_decoded(path, |d| {
+            let mut gpu = self.gpu.lock().unwrap();
+            if let (Decoded::Mosaic(m), Some(g)) = (d, gpu.as_ref()) {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    g.develop(m, recipe, max_px)
+                }));
+                match r {
+                    Ok(Ok(img)) => return Ok(img),
+                    Ok(Err(e)) => log::warn!("GPU develop failed, using CPU: {e:#}"),
+                    Err(_) => log::warn!("GPU develop panicked, using CPU"),
+                }
+                // a failed device may be poisoned: drop it for good
+                *gpu = None;
+            }
+            drop(gpu);
+            Ok(develop::develop_cpu(d, recipe, max_px))
+        })
     }
 
     /// export: full-res render (max_px = 0)
@@ -156,5 +177,9 @@ impl Engine {
 
     pub fn set_rating(&self, asset: &Path, rating: i32) -> Result<()> {
         self.catalog.set_rating(asset, rating)
+    }
+
+    pub fn set_label(&self, asset: &Path, label: &str) -> Result<()> {
+        self.catalog.set_label(asset, label)
     }
 }

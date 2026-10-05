@@ -24,6 +24,14 @@ final class LibraryStore: ObservableObject {
     @Published var folder: URL?
     @Published var selection: Photo?
     @Published var scanning = false
+    @Published var minRating = 0
+    @Published var labelFilter = ""
+
+    var filtered: [Photo] {
+        photos.filter {
+            $0.rating >= minRating && (labelFilter.isEmpty || $0.label == labelFilter)
+        }
+    }
 
     let eng = AraEngine.shared
 

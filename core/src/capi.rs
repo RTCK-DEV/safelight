@@ -17,6 +17,12 @@ pub struct AraImage {
     pub height: u32,
 }
 
+/// 256-bin x 4-channel (R,G,B,luma) histogram of the rendered output.
+#[repr(C)]
+pub struct AraHistogram {
+    pub bins: [u32; 1024],
+}
+
 thread_local! {
     static LAST_ERROR: Mutex<CString> = Mutex::new(CString::new("").unwrap());
 }
@@ -160,6 +166,29 @@ pub unsafe extern "C" fn araware_render(
     }
 }
 
+/// like araware_render, and additionally fills `hist` (nullable) with the
+/// output-image histogram.
+#[no_mangle]
+pub unsafe extern "C" fn araware_render_h(
+    e: *mut c_void,
+    path: *const c_char,
+    recipe_json: *const c_char,
+    max_px: u32,
+    hist: *mut AraHistogram,
+) -> AraImage {
+    let img = araware_render(e, path, recipe_json, max_px);
+    if !hist.is_null() {
+        let bins = if img.data.is_null() {
+            [0u32; 1024]
+        } else {
+            let data = std::slice::from_raw_parts(img.data as *const u8, img.len);
+            crate::develop::histogram(data)
+        };
+        (*hist).bins = bins;
+    }
+    img
+}
+
 /// full-res render for export; RGBA8 out
 #[no_mangle]
 pub unsafe extern "C" fn araware_export(
@@ -224,6 +253,22 @@ pub unsafe extern "C" fn araware_set_rating(
 ) -> i32 {
     let Some(eng) = engine(e) else { return -1 };
     match eng.set_rating(Path::new(&cstr(path)), rating) {
+        Ok(()) => 0,
+        Err(err) => {
+            set_err(&err);
+            -2
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn araware_set_label(
+    e: *mut c_void,
+    path: *const c_char,
+    label: *const c_char,
+) -> i32 {
+    let Some(eng) = engine(e) else { return -1 };
+    match eng.set_label(Path::new(&cstr(path)), &cstr(label)) {
         Ok(()) => 0,
         Err(err) => {
             set_err(&err);

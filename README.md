@@ -17,7 +17,8 @@ at a directory of RAW files, no Lightroom-style import step.
 
 | piece | path | what it does |
 |---|---|---|
-| engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), CPU develop pipeline (WB, cam→sRGB, tone curve, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma NR), embedded-thumbnail extraction, EXIF |
+| engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto, cam→sRGB, tone curve, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma NR, clarity, straighten, vignette, grain), embedded-thumbnail extraction, EXIF |
+| GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→NR→sharpen/clarity→finish (resize+straighten+flip+adjust+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
 | catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + recipe) |
 | C ABI | `core/src/capi.rs` | opaque engine handle, images as `{data,len,w,h}` RGBA8, JSON in/out |
 | CLI | `cli/` | `render`, `thumb`, `reference`, `scan`, `meta`, `rate` — test harness + batch tool |
@@ -54,7 +55,11 @@ araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sani
   "saturation": 0.0, "vibrance": 0.2,
   "temperature": -0.1, "tint": 0.0, "wb_mode": "as_shot",
   "curve": [],              // [[x,y]...] catmull-rom control points, 0..1
-  "sharpen": 0.2, "noise_luma": 0.1
+  "sharpen": 0.2, "noise_luma": 0.1,
+  "rotation_deg": 0.0,      // straighten, -10..10
+  "clarity": 0.0,           // midtone local contrast, -1..1
+  "vignette": 0.0,          // -1..1 (positive = darkened corners)
+  "grain": 0.0              // film grain, 0..1
 }
 ```
 
@@ -71,8 +76,8 @@ All edits are non-destructive: ratings and recipes live in
 
 ## Roadmap / known limits
 
-- CPU demosaic is a generic same-colour-mean (fine for previews, soft at 100%);
-  a wgpu compute pipeline is the planned fast path (wgpu is already a dep).
+- Demosaic is a generic same-colour-mean on both paths (fine for previews,
+  soft at 100%); a higher-quality method is the obvious next step.
 - X-Trans renders work; cross-checked on Fuji X-E1 RAF.
 - No lens corrections yet (lensfun integration is the obvious next step).
 - Windows/Linux shell not started — engine is portable by design
