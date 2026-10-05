@@ -1,0 +1,5 @@
+/target
+mac/build/
+.DS_Store
+*.tiff
+*.pgm
