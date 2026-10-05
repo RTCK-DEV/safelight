@@ -106,10 +106,10 @@ struct EditorView: View {
         sc.rating = rating
         sc.label = label
         sc.recipe = recipe
+        let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
         status = AraEngine.shared.writeSidecar(path: photo.path, sc)
-            ? "Saved \(photo.id.replacingOccurrences(of: photo.path, with: "")).araware.json"
+            ? "Saved \(stem).araware.json"
             : "Save failed: \(AraEngine.shared.lastError)"
-        if status.isEmpty { status = "Saved" }
         dirty = false
     }
 
