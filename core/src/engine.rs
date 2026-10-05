@@ -1,0 +1,160 @@
+//! High-level engine API shared by the C FFI surface and the CLI.
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::Result;
+use serde_json::{json, Value};
+
+use crate::catalog::{AssetEntry, Catalog};
+use crate::decode::{self, Decoded};
+use crate::develop::{self, RgbaImage};
+use crate::recipe::{sidecar_path_for, Recipe, Sidecar};
+
+struct State {
+    path: Option<PathBuf>,
+    decoded: Option<Decoded>,
+}
+
+pub struct Engine {
+    state: Mutex<State>,
+    catalog: Catalog,
+}
+
+impl Engine {
+    pub fn new() -> Result<Engine> {
+        Ok(Engine {
+            state: Mutex::new(State {
+                path: None,
+                decoded: None,
+            }),
+            catalog: Catalog::open()?,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_mem() -> Result<Engine> {
+        Ok(Engine {
+            state: Mutex::new(State {
+                path: None,
+                decoded: None,
+            }),
+            catalog: Catalog::open_mem()?,
+        })
+    }
+
+    fn with_decoded<R>(&self, path: &Path, f: impl FnOnce(&Decoded) -> Result<R>) -> Result<R> {
+        let mut st = self.state.lock().unwrap();
+        if st.path.as_deref() != Some(path) || st.decoded.is_none() {
+            st.decoded = Some(decode::decode(path)?);
+            st.path = Some(path.to_path_buf());
+        }
+        f(st.decoded.as_ref().unwrap())
+    }
+
+    /// render with a recipe, fit inside max_px (0 = full res)
+    pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
+        self.with_decoded(path, |d| Ok(develop::develop_cpu(d, recipe, max_px)))
+    }
+
+    /// export: full-res render (max_px = 0)
+    pub fn export(&self, path: &Path, recipe: &Recipe) -> Result<RgbaImage> {
+        self.render(path, recipe, 0)
+    }
+
+    /// fast preview: embedded thumbnail if any, else small develop.
+    pub fn thumbnail(&self, path: &Path, max_px: u32) -> Result<RgbaImage> {
+        if decode::is_raw(path) {
+            if let Ok(Some(t)) = decode::embedded_thumb(path) {
+                let img = image::RgbaImage::from_raw(t.w as u32, t.h as u32, t.rgba);
+                if let Some(img) = img {
+                    let out = if max_px > 0 && t.w.max(t.h) as u32 > max_px {
+                        let s = max_px as f32 / t.w.max(t.h) as f32;
+                        image::imageops::resize(
+                            &img,
+                            ((t.w as f32 * s) as u32).max(1),
+                            ((t.h as f32 * s) as u32).max(1),
+                            image::imageops::FilterType::Triangle,
+                        )
+                    } else {
+                        img
+                    };
+                    return Ok(RgbaImage {
+                        width: out.width(),
+                        height: out.height(),
+                        data: out.into_raw(),
+                    });
+                }
+            }
+        }
+        self.render(path, &Recipe::default(), max_px.max(1))
+    }
+
+    pub fn scan(&self, folder: &Path) -> Result<Vec<AssetEntry>> {
+        self.catalog.scan(folder)
+    }
+
+    pub fn metadata(&self, path: &Path) -> Result<Value> {
+        let mut v = json!({
+            "path": path.to_string_lossy(),
+            "kind": if decode::is_raw(path) { "raw" } else { "raster" },
+        });
+        if decode::is_raster(path) {
+            if let Ok(f) = std::fs::File::open(path) {
+                let ex = exif::Reader::new()
+                    .read_from_container(&mut std::io::BufReader::new(f));
+                if let Ok(ex) = ex {
+                    let get = |t: exif::Tag| {
+                        ex.get_field(t, exif::In::PRIMARY)
+                            .map(|f| f.display_value().to_string())
+                    };
+                    v["make"] = json!(get(exif::Tag::Make).unwrap_or_default());
+                    v["model"] = json!(get(exif::Tag::Model).unwrap_or_default());
+                    v["lens"] = json!(get(exif::Tag::LensModel).unwrap_or_default());
+                    v["iso"] = json!(get(exif::Tag::PhotographicSensitivity).unwrap_or_default());
+                    v["shutter"] = json!(get(exif::Tag::ExposureTime).unwrap_or_default());
+                    v["aperture"] = json!(get(exif::Tag::FNumber).unwrap_or_default());
+                    v["focal"] = json!(get(exif::Tag::FocalLength).unwrap_or_default());
+                }
+            }
+            return Ok(v);
+        }
+        // RAW: open via libraw just for info (decode fills nothing else)
+        let d = decode::decode(path)?;
+        match d {
+            Decoded::Mosaic(m) => {
+                v["make"] = json!(m.info.make);
+                v["model"] = json!(m.info.model);
+                v["lens"] = json!(m.info.lens);
+                v["iso"] = json!(m.info.iso);
+                v["shutter"] = json!(m.info.shutter);
+                v["aperture"] = json!(m.info.aperture);
+                v["focal"] = json!(m.info.focal);
+                v["timestamp"] = json!(m.info.timestamp);
+                v["width"] = json!(m.w);
+                v["height"] = json!(m.h);
+            }
+            Decoded::Raster { w, h, .. } => {
+                v["width"] = json!(w);
+                v["height"] = json!(h);
+            }
+        }
+        Ok(v)
+    }
+
+    pub fn read_sidecar(&self, asset: &Path) -> Result<Sidecar> {
+        let sp = sidecar_path_for(asset);
+        if sp.exists() {
+            crate::catalog::read_sidecar(&sp)
+        } else {
+            Ok(Sidecar::default())
+        }
+    }
+
+    pub fn write_sidecar(&self, asset: &Path, sc: &Sidecar) -> Result<()> {
+        crate::catalog::write_sidecar(&sidecar_path_for(asset), sc)
+    }
+
+    pub fn set_rating(&self, asset: &Path, rating: i32) -> Result<()> {
+        self.catalog.set_rating(asset, rating)
+    }
+}

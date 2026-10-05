@@ -1,0 +1,39 @@
+#!/bin/sh
+# Build araware.app: Rust core (static) + libraw (bundled dylib) + SwiftUI shell.
+set -e
+cd "$(dirname "$0")/.."
+
+LIBRAW_PREFIX="${LIBRAW_PREFIX:-/opt/homebrew}"
+APP=mac/build/araware.app
+
+cargo build --release -p araware-core
+
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+cp mac/Info.plist "$APP/Contents/Info.plist"
+
+# bundle libraw so the app is self-contained (LGPL dynamic linking preserved)
+LIBRAW_DYLIB=$(ls "$LIBRAW_PREFIX"/lib/libraw.*.dylib | head -1)
+cp "$LIBRAW_DYLIB" "$APP/Contents/Frameworks/"
+DYLIB_BASE=$(basename "$LIBRAW_DYLIB")
+install_name_tool -id "@rpath/$DYLIB_BASE" "$APP/Contents/Frameworks/$DYLIB_BASE"
+
+swiftc -O \
+  -import-objc-header mac/araware.h \
+  -o "$APP/Contents/MacOS/araware" \
+  mac/Sources/*.swift \
+  -L target/release -laraware_core \
+  -L "$LIBRAW_PREFIX/lib" -lraw \
+  -lc++ \
+  -framework Foundation -framework AppKit -framework SwiftUI \
+  -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
+  -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
+  -Xlinker -rpath -Xlinker "$LIBRAW_PREFIX/lib"
+
+# point the libraw reference inside the binary at the bundled copy
+install_name_tool -change "$LIBRAW_DYLIB" "@rpath/$DYLIB_BASE" \
+  "$APP/Contents/MacOS/araware" 2>/dev/null || true
+
+codesign --force --deep --sign - "$APP" 2>/dev/null || true
+
+echo "built: $APP"
