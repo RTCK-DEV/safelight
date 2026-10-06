@@ -21,6 +21,7 @@ struct EditorView: View {
     @State private var cie: [UInt32] = []
     @State private var rendering = false
     @State private var dirty = false
+    @State private var baseline = Recipe()
     @State private var status = ""
     @State private var renderTask: Task<Void, Never>?
     // tool: off|heal|dodge|burn|wbpick|clone|window|grad|flare
@@ -106,7 +107,8 @@ struct EditorView: View {
         .background(Ara.bg0)
         .task { load() }
         .onChange(of: recipe) { _, _ in
-            dirty = true
+            dirty = (recipe != baseline)
+            store.unsavedEdits[photo.path] = dirty ? recipe : nil
             scheduleRender()
         }
     }
@@ -214,14 +216,12 @@ struct EditorView: View {
                     Stars(rating: $rating)
                         .onChange(of: rating) { _, r in
                             AraEngine.shared.setRating(path: photo.path, r)
-                            dirty = true
                         }
                 }
                 HStack {
                     LabelPicker(label: $label)
                         .onChange(of: label) { _, l in
                             AraEngine.shared.setLabel(path: photo.path, l)
-                            dirty = true
                         }
                     Spacer()
                     IconAction(icon: "eye", label: "Before", active: compare) {
@@ -538,7 +538,8 @@ struct EditorView: View {
 
     private func load() {
         let sc = AraEngine.shared.sidecar(path: photo.path)
-        recipe = sc.recipe
+        baseline = sc.recipe
+        recipe = store.unsavedEdits[photo.path] ?? sc.recipe
         rating = sc.rating
         label = sc.label
         rerender()
@@ -550,10 +551,14 @@ struct EditorView: View {
         sc.label = label
         sc.recipe = recipe
         let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
-        status = AraEngine.shared.writeSidecar(path: photo.path, sc)
-            ? "Saved \(stem).araware.json"
-            : "Save failed: \(AraEngine.shared.lastError)"
-        dirty = false
+        let ok = AraEngine.shared.writeSidecar(path: photo.path, sc)
+        status = ok ? "Saved \(stem).araware.json"
+                    : "Save failed: \(AraEngine.shared.lastError)"
+        if ok {
+            baseline = recipe
+            store.unsavedEdits.removeValue(forKey: photo.path)
+            dirty = false
+        }
     }
 
     private func copyRecipe() {

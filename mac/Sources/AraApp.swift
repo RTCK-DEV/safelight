@@ -28,6 +28,10 @@ final class LibraryStore: ObservableObject {
     @Published var minRating = 0
     @Published var labelFilter = ""
 
+    /// Recipes edited but not yet saved, keyed by photo path — keeps unsaved
+    /// work alive when switching photos. Cleared when the folder reloads.
+    var unsavedEdits: [String: Recipe] = [:]
+
     var filtered: [Photo] {
         photos.filter {
             $0.rating >= minRating && (labelFilter.isEmpty || $0.label == labelFilter)
@@ -48,6 +52,7 @@ final class LibraryStore: ObservableObject {
 
     func open(_ url: URL) {
         folder = url
+        unsavedEdits.removeAll()
         scanning = true
         Task.detached { [weak self] in
             let photos = await AraEngine.shared.work { $0.scan(folder: url.path) }

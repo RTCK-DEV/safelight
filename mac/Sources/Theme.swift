@@ -28,6 +28,9 @@ struct TrackSlider: View {
     var reset: Double? = nil
     var height: CGFloat = 16
 
+    @State private var dragActive = false
+    @State private var lastStart = Date.distantPast
+
     private var def: Double {
         reset ?? (range.contains(0) ? 0 : range.lowerBound)
     }
@@ -56,13 +59,26 @@ struct TrackSlider: View {
             }
             .frame(maxHeight: .infinity)
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { g in
-                let f = (Double(g.location.x) / Double(w)).clamped(to: 0...1)
-                var v = range.lowerBound + f * span
-                v = (v / step).rounded() * step
-                value = v.clamped(to: range)
-            })
-            .onTapGesture(count: 2) { _ in value = def }
+            // DragGesture(minimumDistance:0) swallows onTapGesture, so the
+            // double-click reset is detected manually: two gesture starts
+            // within 0.3s restore the default instead of jumping position.
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { g in
+                    if !dragActive {
+                        dragActive = true
+                        if g.time.timeIntervalSince(lastStart) < 0.3 {
+                            value = def
+                            lastStart = .distantPast
+                            return
+                        }
+                        lastStart = g.time
+                    }
+                    let f = (Double(g.location.x) / Double(w)).clamped(to: 0...1)
+                    var v = range.lowerBound + f * span
+                    v = (v / step).rounded() * step
+                    value = v.clamped(to: range)
+                }
+                .onEnded { _ in dragActive = false })
         }
         .frame(height: height)
         .accessibilityElement(children: .ignore)
