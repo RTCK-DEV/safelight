@@ -71,6 +71,10 @@ struct EditorView: View {
     @State private var recipe = Recipe()
     @State private var rating = 0
     @State private var label = ""
+    // sidecar values as loaded — guards the initial-bind onChange from
+    // rewriting the sidecar file on every photo open
+    @State private var loadedRating = -1
+    @State private var loadedLabel = "\u{0}"
     @State private var image: CGImage?
     @State private var hist: [[UInt32]] = []
     @State private var wave: [UInt32] = []
@@ -536,6 +540,8 @@ struct EditorView: View {
                     Spacer()
                     Stars(rating: $rating)
                         .onChange(of: rating) { _, r in
+                            guard r != loadedRating else { return }
+                            loadedRating = r
                             AraEngine.shared.setRating(path: photo.path, r)
                             if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
                                 store.photos[i].rating = r
@@ -545,6 +551,8 @@ struct EditorView: View {
                 HStack(spacing: 6) {
                     LabelPicker(label: $label)
                         .onChange(of: label) { _, l in
+                            guard l != loadedLabel else { return }
+                            loadedLabel = l
                             AraEngine.shared.setLabel(path: photo.path, l)
                             if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
                                 store.photos[i].label = l
@@ -1119,6 +1127,8 @@ struct EditorView: View {
         recipe = store.unsavedEdits[photo.path] ?? sc.recipe
         rating = sc.rating
         label = sc.label
+        loadedRating = sc.rating
+        loadedLabel = sc.label
         image = nil
         baselineImg = nil
         undoStack.removeAll()
@@ -1398,9 +1408,12 @@ struct EditorView: View {
 
     private func setRating(_ r: Int) {
         rating = (rating == r) ? 0 : r
-        AraEngine.shared.setRating(path: photo.path, rating)
-        if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
-            store.photos[i].rating = rating
+        if rating != loadedRating {
+            loadedRating = rating
+            AraEngine.shared.setRating(path: photo.path, rating)
+            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
+                store.photos[i].rating = rating
+            }
         }
         status = "Rating \(rating)"
     }
@@ -2044,13 +2057,17 @@ struct LabelPicker: View {
     @Binding var label: String
 
     var body: some View {
-        HStack(spacing: 5) {
+        // padded hit area per dot — same fix as Stars (bare 11px dots
+        // silently missed taps landing in the inter-dot gaps)
+        HStack(spacing: 2) {
             ForEach(labelColors, id: \.name) { l in
                 Circle()
                     .fill(l.color)
                     .frame(width: 11, height: 11)
                     .overlay(Circle().stroke(.white.opacity(0.9), lineWidth: label == l.name ? 1.5 : 0))
                     .opacity(label.isEmpty || label == l.name ? 1 : 0.4)
+                    .frame(width: 15, height: 16)
+                    .contentShape(Rectangle())
                     .onTapGesture { label = (label == l.name) ? "" : l.name }
             }
             if !label.isEmpty {
@@ -2355,11 +2372,15 @@ final class ScrollMonitor {
 struct Stars: View {
     @Binding var rating: Int
     var body: some View {
-        HStack(spacing: 3) {
+        // generous hit area per star — the bare 12pt glyph is ~4px wide and
+        // swallowed most taps, silently leaving `rating` unchanged
+        HStack(spacing: 0) {
             ForEach(1...5, id: \.self) { i in
                 Image(systemName: i <= rating ? "star.fill" : "star")
                     .font(.system(size: 12))
                     .foregroundStyle(i <= rating ? Ara.gold : Ara.text3)
+                    .frame(width: 15, height: 16)
+                    .contentShape(Rectangle())
                     .onTapGesture { rating = (rating == i) ? 0 : i }
             }
         }
