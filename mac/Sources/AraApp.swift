@@ -8,8 +8,9 @@ struct AraApp: App {
         WindowGroup("araware") {
             LibraryView()
                 .environmentObject(store)
-                .frame(minWidth: 960, minHeight: 620)
+                .frame(minWidth: 1080, minHeight: 660)
         }
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Open Folder…") { store.pickFolder() }

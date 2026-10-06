@@ -12,6 +12,19 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 cp mac/Info.plist "$APP/Contents/Info.plist"
 
+# build AppIcon.icns from the committed 1024px source
+if [ -f mac/AppIcon.png ]; then
+  ICONSET=$(mktemp -d)/AppIcon.iconset
+  mkdir -p "$ICONSET"
+  for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" "64 icon_32x32@2x" \
+              "128 icon_128x128" "256 icon_128x128@2x" "256 icon_256x256" "512 icon_256x256@2x" \
+              "512 icon_512x512" "1024 icon_512x512@2x"; do
+    set -- $spec
+    sips -z "$1" "$1" mac/AppIcon.png --out "$ICONSET/$2.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+fi
+
 # bundle libraw so the app is self-contained (LGPL dynamic linking preserved)
 LIBRAW_DYLIB=$(ls "$LIBRAW_PREFIX"/lib/libraw.*.dylib | head -1)
 cp "$LIBRAW_DYLIB" "$APP/Contents/Frameworks/"

@@ -5,68 +5,67 @@ struct LibraryView: View {
 
     var body: some View {
         NavigationSplitView {
-            Group {
-                if store.scanning {
-                    ProgressView("Scanning…")
-                } else if store.photos.isEmpty {
-                    VStack(spacing: 12) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.system(size: 44))
-                            .foregroundStyle(.secondary)
-                        Text("Open a folder of RAW files")
-                            .foregroundStyle(.secondary)
-                        Button("Open Folder…") { store.pickFolder() }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
-                            ForEach(store.filtered) { photo in
-                                ThumbCell(photo: photo)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(.white.opacity(0.7),
-                                                    lineWidth: store.selection == photo ? 2 : 0)
-                                    )
-                                    .onTapGesture { store.selection = photo }
+            VStack(spacing: 0) {
+                // filter strip
+                HStack(spacing: 10) {
+                    RatingFilter(rating: $store.minRating)
+                    LabelFilter(label: $store.labelFilter)
+                    Spacer()
+                    Text("\(store.filtered.count)/\(store.photos.count)")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundStyle(Ara.text3)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Ara.bg1)
+                .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+
+                Group {
+                    if store.scanning {
+                        ProgressView("Scanning…")
+                            .tint(Ara.accent)
+                            .foregroundStyle(Ara.text2)
+                    } else if store.photos.isEmpty {
+                        VStack(spacing: 14) {
+                            ZStack {
+                                Circle().fill(Ara.bg3).frame(width: 72, height: 72)
+                                Image(systemName: "photo.on.rectangle.angled")
+                                    .font(.system(size: 28))
+                                    .foregroundStyle(Ara.accent)
                             }
+                            Text("Open a folder of RAW files")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(Ara.text2)
+                            Button("Open Folder…") { store.pickFolder() }
+                                .buttonStyle(AraPrimaryButton())
                         }
-                        .padding(8)
-                    }
-                    .safeAreaInset(edge: .bottom) {
-                        HStack(spacing: 10) {
-                            Picker("Rating", selection: $store.minRating) {
-                                Text("★ all").tag(0)
-                                ForEach(1...5, id: \.self) { Text("★\($0)+").tag($0) }
-                            }
-                            .frame(width: 90)
-                            Menu {
-                                Button("All labels") { store.labelFilter = "" }
-                                ForEach(labelColors, id: \.name) { l in
-                                    Button(l.name) { store.labelFilter = l.name }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 148), spacing: 10)], spacing: 10) {
+                                ForEach(store.filtered) { photo in
+                                    ThumbCell(photo: photo,
+                                              selected: store.selection == photo)
+                                        .onTapGesture { store.selection = photo }
                                 }
-                            } label: {
-                                Label(store.labelFilter.isEmpty ? "Label" : store.labelFilter,
-                                      systemImage: "tag")
-                                    .labelStyle(.titleAndIcon)
                             }
-                            .frame(width: 100)
-                            Spacer()
-                            Text("\(store.filtered.count)/\(store.photos.count)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                            .padding(10)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.bar)
+                        .scrollIndicators(.visible)
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .navigationTitle(store.folder?.lastPathComponent ?? "Library")
+            .background(Ara.bg1)
+            .navigationTitle(store.folder?.lastPathComponent ?? "araware")
             .toolbar {
                 ToolbarItemGroup {
-                    Button { store.pickFolder() } label: { Label("Open", systemImage: "folder") }
-                    Button { store.refresh() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                    Button { store.pickFolder() } label: {
+                        Image(systemName: "folder.badge.plus")
+                    }
+                    Button { store.refresh() } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
                 }
             }
         } detail: {
@@ -74,9 +73,63 @@ struct LibraryView: View {
                 EditorView(photo: photo)
                     .id(photo.id)
             } else {
-                Text("Select a photo")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ZStack {
+                    Ara.bg0.ignoresSafeArea()
+                    VStack(spacing: 10) {
+                        Image(systemName: "camera.aperture")
+                            .font(.system(size: 34))
+                            .foregroundStyle(Ara.text3)
+                        Text("Select a photo")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Ara.text3)
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .tint(Ara.accent)
+    }
+}
+
+/// Clickable 0–5 rating filter: tap a star to require that many stars.
+struct RatingFilter: View {
+    @Binding var rating: Int
+    var body: some View {
+        HStack(spacing: 2) {
+            Image(systemName: "star.fill")
+                .font(.system(size: 9))
+                .foregroundStyle(Ara.text3)
+            ForEach(1...5, id: \.self) { i in
+                Image(systemName: i <= rating ? "star.fill" : "star")
+                    .font(.system(size: 10))
+                    .foregroundStyle(i <= rating ? Ara.gold : Ara.text3)
+                    .onTapGesture { rating = (rating == i) ? 0 : i }
+            }
+            if rating > 0 { Text("+").font(.system(size: 9)).foregroundStyle(Ara.text3) }
+        }
+    }
+}
+
+/// Label-colour dots used as the library filter.
+struct LabelFilter: View {
+    @Binding var label: String
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(labelColors, id: \.name) { l in
+                Circle()
+                    .fill(l.color)
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: label == l.name ? 1.5 : 0))
+                    .opacity(label.isEmpty || label == l.name ? 1 : 0.35)
+                    .onTapGesture { label = (label == l.name) ? "" : l.name }
+            }
+            if !label.isEmpty {
+                Button { label = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Ara.text3)
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -84,39 +137,77 @@ struct LibraryView: View {
 
 struct ThumbCell: View {
     let photo: Photo
+    let selected: Bool
     @State private var image: CGImage?
+    @State private var hovering = false
 
     var body: some View {
-        VStack(spacing: 4) {
-            ZStack(alignment: .bottomLeading) {
-                Rectangle().fill(.quaternary)
-                    .aspectRatio(1.4, contentMode: .fit)
-                if let image {
-                    Image(image, scale: 1, label: Text(photo.name))
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    ProgressView()
+        VStack(alignment: .leading, spacing: 4) {
+            ZStack(alignment: .bottom) {
+                ZStack {
+                    Ara.bg3
+                    if let image {
+                        Image(image, scale: 1, label: Text(photo.name))
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        ProgressView().controlSize(.small).tint(Ara.text3)
+                    }
                 }
+                .aspectRatio(1.4, contentMode: .fit)
+                .clipped()
+
+                // bottom gradient info bar
+                LinearGradient(colors: [.clear, .black.opacity(0.75)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: 30)
+                HStack(alignment: .lastTextBaseline) {
+                    if photo.rating > 0 {
+                        Text(String(repeating: "★", count: photo.rating))
+                            .font(.system(size: 9))
+                            .foregroundStyle(Ara.gold)
+                    }
+                    Spacer()
+                    if photo.has_sidecar {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Ara.accent)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.bottom, 5)
+
+                // label dot
                 if let c = labelColors.first(where: { $0.name == photo.label })?.color {
-                    Circle()
-                        .fill(c)
-                        .frame(width: 8, height: 8)
-                        .padding(4)
+                    VStack {
+                        HStack {
+                            Circle()
+                                .fill(c)
+                                .frame(width: 8, height: 8)
+                                .overlay(Circle().stroke(.black.opacity(0.5), lineWidth: 0.5))
+                                .padding(6)
+                            Spacer()
+                        }
+                        Spacer()
+                    }
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            HStack(spacing: 4) {
-                Text(photo.name)
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if photo.rating > 0 {
-                    Text(String(repeating: "★", count: photo.rating))
-                        .font(.caption2)
-                        .foregroundStyle(.yellow)
-                }
-            }
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(selected ? Ara.accent : (hovering ? Ara.border : Ara.hairline),
+                            lineWidth: selected ? 2 : 1)
+            )
+            .shadow(color: .black.opacity(selected ? 0.45 : 0.0), radius: 6, y: 2)
+            .scaleEffect(hovering ? 1.02 : 1)
+            .animation(.easeOut(duration: 0.12), value: hovering)
+            .onHover { hovering = $0 }
+
+            Text(photo.name)
+                .font(.system(size: 10, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Ara.text1 : Ara.text2)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .task {
             let img = await AraEngine.shared.work { $0.thumbnail(path: photo.path, maxPx: 400) }
