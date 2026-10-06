@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 
 use crate::decode::Mosaic;
-use crate::develop::{build_params, Params, RgbaImage};
-use crate::recipe::{Recipe, WbMode};
+use crate::develop::{build_params, frame_geometry, spot_to_src, Params, RgbaImage, Stats};
+use crate::recipe::Recipe;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -37,6 +37,22 @@ struct Uni {
     g3: [u32; 4],
     /// fh (post-flip frame height), sensor visible w, sensor visible h
     g4: [u32; 4],
+    /// lift, gamma, gain (grading; gamma/gain are multipliers)
+    lgg0: [f32; 4],
+    lgg1: [f32; 4],
+    lgg2: [f32; 4],
+    /// split tone: shadow rgb + sat
+    st0: [f32; 4],
+    /// split tone: highlight rgb + sat
+    st1: [f32; 4],
+    /// crop rect in frame px: left, top, w, h
+    crop: [f32; 4],
+    /// black_pt, white_pt (auto contrast), n_spots, n_lights
+    misc: [f32; 4],
+    /// heal spots in virtual-src px: x, y, radius
+    heal: [[f32; 4]; 8],
+    /// dodge/burn lights in dst-normalized coords: x, y, radius, ev
+    lts: [[f32; 4]; 8],
 }
 
 const WGSL: &str = r#"
@@ -56,6 +72,15 @@ struct Uni {
     g2: vec4<u32>,
     g3: vec4<u32>,
     g4: vec4<u32>,
+    lgg0: vec4<f32>,
+    lgg1: vec4<f32>,
+    lgg2: vec4<f32>,
+    st0: vec4<f32>,
+    st1: vec4<f32>,
+    crop: vec4<f32>,
+    misc: vec4<f32>,
+    heal: array<vec4<f32>, 8>,
+    lts: array<vec4<f32>, 8>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -134,6 +159,9 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     atomicAdd(&stats[1], u32(clamp(c.y, 0.0, 4.0) * 1000.0));
     atomicAdd(&stats[2], u32(clamp(c.z, 0.0, 4.0) * 1000.0));
     atomicAdd(&stats[3], 1u);
+    let l = clamp(luma(c), 0.0, 1.0);
+    atomicAdd(&stats[4], u32(l * 1000.0));
+    atomicAdd(&stats[5u + u32(l * 255.0)], 1u);
 }
 
 @compute @workgroup_size(256)
@@ -205,6 +233,41 @@ fn box_at(x: u32, y: u32, rad: i32) -> vec3<f32> {
     return s / n;
 }
 
+fn px_at(x: i32, y: i32) -> vec3<f32> {
+    let cx = clamp(x, 0, i32(u.g2.x) - 1);
+    let cy = clamp(y, 0, i32(u.g2.y) - 1);
+    return io_a[u32(cy) * u.g2.x + u32(cx)].xyz;
+}
+
+// spot heal: interior pixels take the mean of a ring at 1.4x radius
+@compute @workgroup_size(256)
+fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    let w = u.g2.x;
+    let h = u.g2.y;
+    if (i >= w * h) { return; }
+    var c = io_a[i].xyz;
+    let n = u32(u.misc.z);
+    for (var s = 0u; s < n; s = s + 1u) {
+        let sp = u.heal[s];
+        let d = distance(vec2<f32>(f32(i % w), f32(i / w)), sp.xy) / max(sp.z, 1.0);
+        if (d < 1.0) {
+            var ring = vec3<f32>(0.0);
+            for (var k = 0u; k < 8u; k = k + 1u) {
+                let a = f32(k) * 6.2832 / 8.0;
+                ring = ring + px_at(
+                    i32(sp.x + sp.z * 1.4 * cos(a) + 0.5),
+                    i32(sp.y + sp.z * 1.4 * sin(a) + 0.5),
+                );
+            }
+            ring = ring / 8.0;
+            let blend = 1.0 - sstep(0.7, 1.0, d);
+            c = mix(c, ring, blend);
+        }
+    }
+    io_b[i] = vec4<f32>(c, 0.0);
+}
+
 // unsharp (3x3) + clarity (5x5 midtone-weighted local contrast)
 @compute @workgroup_size(256)
 fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
@@ -240,6 +303,12 @@ fn srgb_encode(v: f32) -> f32 {
 
 fn adjust(px: vec3<f32>) -> vec3<f32> {
     var x = px * u.a1.x;
+    // auto-contrast percentile remap
+    if (u.misc.y - u.misc.x < 0.999 || u.misc.x > 0.001) {
+        x = (x - vec3<f32>(u.misc.x)) / max(u.misc.y - u.misc.x, 0.02);
+    }
+    // lift/gamma/gain
+    x = u.lgg2.xyz * pow(max(x + u.lgg0.xyz, vec3<f32>(0.0)), 1.0 / u.lgg1.xyz);
     if (u.a2.y > 0.0) {
         x = x + u.a2.y * 0.15 * (vec3<f32>(1.0) - x);
     } else {
@@ -270,6 +339,13 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let s = max(1.0 + u.a2.z + u.a2.w * (1.0 - sat_now), 0.0);
         x = vec3<f32>(luma2) + (x - vec3<f32>(luma2)) * s;
     }
+    // split toning
+    if (u.st0.w > 0.0 || u.st1.w > 0.0) {
+        let lum = luma(x);
+        let ws = (1.0 - sstep(0.0, 0.55, lum)) * u.st0.w;
+        let wh = sstep(0.45, 1.0, lum) * u.st1.w;
+        x = x + ws * (u.st0.xyz - vec3<f32>(lum)) * 0.5 + wh * (u.st1.xyz - vec3<f32>(lum)) * 0.5;
+    }
     x = vec3<f32>(
         lut[u32(clamp(x.x, 0.0, 1.0) * 255.0)],
         lut[u32(clamp(x.y, 0.0, 1.0) * 255.0)],
@@ -291,14 +367,14 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     if (i >= dw * dh) { return; }
     let dx = i % dw;
     let dy = i / dw;
-    let fw = u.g3.w;
-    let fh = u.g4.x;
-    // dst -> post-flip frame coords
-    var fx = (f32(dx) + 0.5) * f32(fw) / f32(dw) - 0.5;
-    var fy = (f32(dy) + 0.5) * f32(fh) / f32(dh) - 0.5;
-    // undo straighten rotation about frame centre
-    let cx = (f32(fw) - 1.0) * 0.5;
-    let cy = (f32(fh) - 1.0) * 0.5;
+    // dst -> crop rect in post-flip frame coords
+    let nx = (f32(dx) + 0.5) / f32(dw);
+    let ny = (f32(dy) + 0.5) / f32(dh);
+    var fx = u.crop.x + nx * u.crop.z - 0.5;
+    var fy = u.crop.y + ny * u.crop.w - 0.5;
+    // undo straighten rotation about crop centre
+    let cx = u.crop.x + u.crop.z * 0.5 - 0.5;
+    let cy = u.crop.y + u.crop.w * 0.5 - 0.5;
     let px = fx - cx;
     let py = fy - cy;
     fx = cx + px * u.a4.z + py * u.a4.y;
@@ -340,6 +416,14 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         col = io_a[u32(y0) * sw + u32(x0)].xyz;
     }
     var adj = adjust(col);
+    // dodge/burn radial lights (dst-normalized coords)
+    let nl = u32(u.misc.w);
+    for (var li = 0u; li < nl; li = li + 1u) {
+        let lt = u.lts[li];
+        let d = distance(vec2<f32>(nx, ny), lt.xy) / max(lt.z, 1e-3);
+        let f = exp(-d * d * 2.77);
+        adj = adj * (1.0 + lt.w * f * 0.5);
+    }
     // film grain (pre-gamma, linear domain)
     if (u.a4.x > 0.0) {
         let p = vec2<f32>(f32(dx), f32(dy));
@@ -351,14 +435,14 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     }
     // vignette (post-adjust, pre-gamma; positive darkens corners)
     if (u.a3.w != 0.0) {
-        let nx = (f32(dx) + 0.5) / f32(dw) * 2.0 - 1.0;
-        let ny = (f32(dy) + 0.5) / f32(dh) * 2.0 - 1.0;
-        let d = length(vec2<f32>(nx, ny)) * 0.7071;
+        let vx = nx * 2.0 - 1.0;
+        let vy = ny * 2.0 - 1.0;
+        let d = length(vec2<f32>(vx, vy)) * 0.7071;
         adj = adj * (1.0 - u.a3.w * sstep(0.35, 1.05, d) * 0.9);
     }
-    let enc = srgb_encode(adj.x) * 255.0 + 0.5;
-    let enc2 = srgb_encode(adj.y) * 255.0 + 0.5;
-    let enc3 = srgb_encode(adj.z) * 255.0 + 0.5;
+    let enc = srgb_encode(clamp(adj.x, 0.0, 1.0)) * 255.0 + 0.5;
+    let enc2 = srgb_encode(clamp(adj.y, 0.0, 1.0)) * 255.0 + 0.5;
+    let enc3 = srgb_encode(clamp(adj.z, 0.0, 1.0)) * 255.0 + 0.5;
     outb[i] = min(u32(enc), 255u)
         | (min(u32(enc2), 255u) << 8u)
         | (min(u32(enc3), 255u) << 16u)
@@ -376,6 +460,7 @@ pub struct Gpu {
     queue: wgpu::Queue,
     demosaic: Pipe,
     stats: Pipe,
+    heal: Pipe,
     nr: Pipe,
     sharpen: Pipe,
     finish: Pipe,
@@ -389,24 +474,6 @@ fn norm_factors(m: &Mosaic) -> [f32; 4] {
     n
 }
 
-/// post-flip (oriented) frame dims
-fn flipped_dims(w: u32, h: u32, flip: i32) -> (u32, u32) {
-    match flip {
-        5 | 6 => (h, w),
-        _ => (w, h),
-    }
-}
-
-fn fit(w: u32, h: u32, max_px: u32) -> (u32, u32) {
-    if max_px == 0 || w.max(h) <= max_px {
-        return (w.max(1), h.max(1));
-    }
-    let s = max_px as f32 / w.max(h) as f32;
-    (
-        ((w as f32 * s).round() as u32).max(1),
-        ((h as f32 * s).round() as u32).max(1),
-    )
-}
 
 impl Gpu {
     pub fn try_new() -> Option<Gpu> {
@@ -491,6 +558,7 @@ impl Gpu {
         Ok(Gpu {
             demosaic: mk("demosaic_main"),
             stats: mk("stats_main"),
+            heal: mk("heal_main"),
             nr: mk("nr_main"),
             sharpen: mk("sharpen_main"),
             finish: mk("finish_main"),
@@ -542,8 +610,15 @@ impl Gpu {
             usage: U::STORAGE | U::COPY_SRC,
             mapped_at_creation: false,
         });
-        let (fw, fh) = flipped_dims(vw, vh, m.info.flip);
-        let (dw, dh) = fit(fw, fh, max_px);
+        let (fw, fh, cl, ct, ew, eh, dw, dh) = frame_geometry(
+            vw as usize,
+            vh as usize,
+            m.info.flip,
+            r.crop,
+            max_px,
+        );
+        let (fw, fh) = (fw as u32, fh as u32);
+        let (dw, dh) = (dw as u32, dh as u32);
         let out_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("out"),
             size: (dw * dh) as u64 * 4,
@@ -552,7 +627,8 @@ impl Gpu {
         });
         let stats_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats"),
-            size: 16,
+            // r,g,b,luma sums + count + 256-bin luma histogram
+            size: (5 + 256) * 4,
             usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -590,6 +666,27 @@ impl Gpu {
             g2: [vw, vh, dw, dh],
             g3: [m.cfa.w as u32, m.cfa.h as u32, samp_step, fw],
             g4: [fh, m.w as u32, m.h as u32, 0],
+            lgg0: [p.lift[0], p.lift[1], p.lift[2], 0.0],
+            lgg1: [p.gamma[0], p.gamma[1], p.gamma[2], 0.0],
+            lgg2: [p.gain[0], p.gain[1], p.gain[2], 0.0],
+            st0: [p.shadow_col[0], p.shadow_col[1], p.shadow_col[2], p.shadow_sat],
+            st1: [p.high_col[0], p.high_col[1], p.high_col[2], p.high_sat],
+            crop: [cl, ct, ew as f32, eh as f32],
+            misc: [
+                p.black_pt,
+                p.white_pt,
+                p.n_spots as f32,
+                p.n_lights as f32,
+            ],
+            heal: {
+                let mut a = [[0.0f32; 4]; 8];
+                for (i, s) in p.spots.iter().enumerate() {
+                    let (sx, sy, rad) = spot_to_src(*s, vw as usize, vh as usize, m.info.flip);
+                    a[i] = [sx, sy, rad, 0.0];
+                }
+                a
+            },
+            lts: p.lights,
         };
 
         let bind = |pipe: &Pipe| {
@@ -625,36 +722,43 @@ impl Gpu {
             cp.dispatch_workgroups(gx, groups.div_ceil(gx), 1);
         };
 
-        // auto WB: sparse stats dispatch + readback
-        let auto_means = if r.wb_mode == WbMode::Auto {
+        // scene statistics (auto WB / auto exposure / auto contrast)
+        let stats = if Stats::needs(r) {
             // keep total samples under ~64K so the u32 accumulators can't overflow
             let step = ((n_px as f64 / 65536.0).sqrt().ceil() as u32).max(2);
-            self.queue.write_buffer(&stats_b, 0, &[0u8; 16]);
+            self.queue.write_buffer(&stats_b, 0, &vec![0u8; (5 + 256) * 4]);
             self.queue
                 .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&build_params(m, r, None), step)));
             let mut enc = dev.create_command_encoder(&Default::default());
             run(&mut enc, &self.stats, (vw.div_ceil(step) * vh.div_ceil(step)) as u64);
             let stg = dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stg_stats"),
-                size: 16,
+                size: (5 + 256) * 4,
                 usage: U::COPY_DST | U::MAP_READ,
                 mapped_at_creation: false,
             });
-            enc.copy_buffer_to_buffer(&stats_b, 0, &stg, 0, 16);
+            enc.copy_buffer_to_buffer(&stats_b, 0, &stg, 0, (5 + 256) * 4);
             self.queue.submit([enc.finish()]);
-            let s = readback(dev, &stg, 16)?;
-            let sums: &[u32] = bytemuck::cast_slice(&s);
-            let cnt = sums[3].max(1) as f64;
-            Some([
-                (sums[0] as f64 / 1e3 / cnt) as f32,
-                (sums[1] as f64 / 1e3 / cnt) as f32,
-                (sums[2] as f64 / 1e3 / cnt) as f32,
-            ])
+            let s = readback(dev, &stg, (5 + 256) * 4)?;
+            let raw: &[u32] = bytemuck::cast_slice(&s);
+            let cnt = raw[3].max(1) as f64;
+            let mut st = Stats {
+                means: [
+                    (raw[0] as f64 / 1e3 / cnt) as f32,
+                    (raw[1] as f64 / 1e3 / cnt) as f32,
+                    (raw[2] as f64 / 1e3 / cnt) as f32,
+                ],
+                luma_mean: (raw[4] as f64 / 1e3 / cnt) as f32,
+                luma_hist: [0u32; 256],
+                count: raw[3] as u64,
+            };
+            st.luma_hist.copy_from_slice(&raw[5..261]);
+            Some(st)
         } else {
             None
         };
 
-        let p = build_params(m, r, auto_means);
+        let p = build_params(m, r, stats.as_ref());
         self.queue.write_buffer(&lut_b, 0, bytemuck::cast_slice(&p.lut));
         self.queue
             .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p, 0)));
@@ -662,6 +766,10 @@ impl Gpu {
         let mut enc = dev.create_command_encoder(&Default::default());
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.
+        if p.n_spots > 0 {
+            run(&mut enc, &self.heal, n_px);
+            enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
         if p.noise_luma > 0.0 {
             run(&mut enc, &self.nr, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);

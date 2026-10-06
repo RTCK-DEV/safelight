@@ -42,6 +42,61 @@ pub struct Params {
     pub clarity: f32,
     pub vignette: f32,
     pub grain: f32,
+    // grading
+    pub lift: [f32; 3],
+    pub gamma: [f32; 3],
+    pub gain: [f32; 3],
+    pub shadow_col: [f32; 3],
+    pub shadow_sat: f32,
+    pub high_col: [f32; 3],
+    pub high_sat: f32,
+    /// auto-contrast remap points (identity when 0,1)
+    pub black_pt: f32,
+    pub white_pt: f32,
+    // retouch (frame-normalized coords, converted to virtual-px inside)
+    pub spots: [[f32; 4]; 8],
+    pub n_spots: u32,
+    pub lights: [[f32; 4]; 8],
+    pub n_lights: u32,
+    pub crop: [f32; 4],
+}
+
+/// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
+#[derive(Debug, Clone)]
+pub struct Stats {
+    pub means: [f32; 3],
+    pub luma_mean: f32,
+    pub luma_hist: [u32; 256],
+    pub count: u64,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            means: [0.0; 3],
+            luma_mean: 0.0,
+            luma_hist: [0; 256],
+            count: 0,
+        }
+    }
+}
+
+impl Stats {
+    /// 256-bin luma histogram (linear 0..1 domain)
+    pub fn needs(r: &Recipe) -> bool {
+        r.wb_mode == WbMode::Auto || r.auto_exposure || r.auto_contrast
+    }
+    fn luma_percentile(&self, p: f32) -> f32 {
+        let target = (self.count as f64 * p as f64) as u64;
+        let mut acc = 0u64;
+        for (i, &b) in self.luma_hist.iter().enumerate() {
+            acc += b as u64;
+            if acc >= target.max(1) {
+                return i as f32 / 255.0;
+            }
+        }
+        1.0
+    }
 }
 
 fn inv3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
@@ -133,7 +188,74 @@ fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     lut
 }
 
-pub fn build_params(m: &Mosaic, r: &Recipe, auto_means: Option<[f32; 3]>) -> Params {
+/// hue (0..1, 0=red) -> rgb for split-toning targets
+fn hue_to_rgb(h: f32) -> [f32; 3] {
+    let h = (h - h.floor()) * 6.0;
+    let i = h as usize % 6;
+    let f = h - h.floor();
+    let seg = [
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+    ];
+    let a = seg[i];
+    let b = seg[(i + 1) % 6];
+    [
+        a[0] + (b[0] - a[0]) * f,
+        a[1] + (b[1] - a[1]) * f,
+        a[2] + (b[2] - a[2]) * f,
+    ]
+}
+
+/// cinematic presets: additive tweaks on top of the user's params.
+fn apply_look(p: &mut Params, look: &str) {
+    match look {
+        "teal_orange" => {
+            p.shadow_col = hue_to_rgb(0.52);
+            p.shadow_sat = (p.shadow_sat + 0.30).min(1.0);
+            p.high_col = hue_to_rgb(0.08);
+            p.high_sat = (p.high_sat + 0.25).min(1.0);
+            p.contrast += 0.12;
+        }
+        "film_fade" => {
+            for c in &mut p.lift {
+                *c += 0.05;
+            }
+            p.contrast -= 0.18;
+            p.saturation -= 0.20;
+        }
+        "bleach" => {
+            p.saturation -= 0.45;
+            p.contrast += 0.22;
+            p.highlights += 0.35;
+            for c in &mut p.lift {
+                *c += 0.015;
+            }
+        }
+        "noir" => {
+            p.saturation = -1.0;
+            p.contrast += 0.30;
+            for c in &mut p.lift {
+                *c += 0.01;
+            }
+        }
+        "matte" => {
+            for c in &mut p.lift {
+                *c += 0.035;
+            }
+            p.contrast -= 0.22;
+            p.saturation -= 0.12;
+            p.high_col = hue_to_rgb(0.10);
+            p.high_sat = (p.high_sat + 0.15).min(1.0);
+        }
+        _ => {}
+    }
+}
+
+pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // as-shot WB: prefer libraw's effective pre_mul (dcraw's actual channel
     // scaling), normalized to green. Fall back to cam_mul when absent.
     let mut wb = {
@@ -146,9 +268,9 @@ pub fn build_params(m: &Mosaic, r: &Recipe, auto_means: Option<[f32; 3]>) -> Par
         }
     };
     if r.wb_mode == WbMode::Auto {
-        if let Some(means) = auto_means {
-            let gm = means[1].max(1e-4);
-            wb = [gm / means[0].max(1e-4), 1.0, gm / means[2].max(1e-4)];
+        if let Some(s) = stats {
+            let gm = s.means[1].max(1e-4);
+            wb = [gm / s.means[0].max(1e-4), 1.0, gm / s.means[2].max(1e-4)];
         }
     }
     // relative temperature/tint shift (v1 approximation)
@@ -167,11 +289,68 @@ pub fn build_params(m: &Mosaic, r: &Recipe, auto_means: Option<[f32; 3]>) -> Par
         [m.rgb_cam[2][0], m.rgb_cam[2][1], m.rgb_cam[2][2]],
     ];
 
-    Params {
+    // post-WB+matrix mean luma: luma/M/WB are all linear, so luma of the
+    // mean equals the mean of luma — exact scene-mean in the working space.
+    let post_mean_luma = |s: &Stats| -> f32 {
+        let cm = [s.means[0] * wb[0], s.means[1] * wb[1], s.means[2] * wb[2]];
+        let mut l = 0.0f32;
+        for (row, wgt) in cam2srgb.iter().zip([0.2126f32, 0.7152, 0.0722]) {
+            l += wgt * (row[0] * cm[0] + row[1] * cm[1] + row[2] * cm[2]);
+        }
+        l
+    };
+    // auto exposure: steer scene mean luma toward 18% gray, cap ±3EV
+    let mut exposure_mul = (2.0f32).powf(r.exposure);
+    if r.auto_exposure {
+        if let Some(s) = stats {
+            let l = post_mean_luma(s);
+            if l > 1e-4 {
+                exposure_mul *= (2.0f32).powf((0.18f32 / l).log2().clamp(-3.0, 3.0));
+            }
+        }
+    }
+    // auto contrast: p1/p99 stretch, expressed in the post-exposure working
+    // space (raw percentiles scaled by scene gain * exposure_mul)
+    let (mut black_pt, mut white_pt) = (0.0f32, 1.0f32);
+    if r.auto_contrast {
+        if let Some(s) = stats {
+            let scene_gain = if s.luma_mean > 1e-4 {
+                post_mean_luma(s) / s.luma_mean
+            } else {
+                1.0
+            };
+            let f = scene_gain * exposure_mul;
+            black_pt = (s.luma_percentile(0.01) * f).clamp(0.0, 0.35);
+            white_pt = (s.luma_percentile(0.99) * f)
+                .clamp(black_pt + 0.02, 1.2);
+        }
+    }
+
+    let mut spots = [[0.0; 4]; 8];
+    for (i, s) in r.spots.iter().take(8).enumerate() {
+        spots[i] = [s[0].clamp(0.0, 1.0), s[1].clamp(0.0, 1.0), s[2].clamp(0.001, 0.3), 0.0];
+    }
+    let mut lights = [[0.0; 4]; 8];
+    for (i, l) in r.lights.iter().take(8).enumerate() {
+        lights[i] = [
+            l[0].clamp(0.0, 1.0),
+            l[1].clamp(0.0, 1.0),
+            l[2].clamp(0.01, 1.0),
+            l[3].clamp(-4.0, 4.0),
+        ];
+    }
+    let crop = [
+        r.crop[0].clamp(0.0, 0.9),
+        r.crop[1].clamp(0.0, 0.9),
+        r.crop[2].clamp(0.0, 0.9),
+        r.crop[3].clamp(0.0, 0.9),
+    ];
+
+    let mut p = Params {
         wb,
         m: cam2srgb,
         lut: catmull_lut(&r.curve),
-        exposure_mul: (2.0f32).powf(r.exposure),
+        exposure_mul,
         contrast: r.contrast,
         highlights: r.highlights,
         shadows: r.shadows,
@@ -185,7 +364,35 @@ pub fn build_params(m: &Mosaic, r: &Recipe, auto_means: Option<[f32; 3]>) -> Par
         clarity: r.clarity.clamp(-1.0, 1.0),
         vignette: r.vignette.clamp(-1.0, 1.0),
         grain: r.grain.clamp(0.0, 1.0),
-    }
+        lift: [
+            r.lift[0].clamp(-0.5, 0.5),
+            r.lift[1].clamp(-0.5, 0.5),
+            r.lift[2].clamp(-0.5, 0.5),
+        ],
+        gamma: [
+            r.gamma[0].clamp(0.2, 5.0),
+            r.gamma[1].clamp(0.2, 5.0),
+            r.gamma[2].clamp(0.2, 5.0),
+        ],
+        gain: [
+            r.gain[0].clamp(0.0, 4.0),
+            r.gain[1].clamp(0.0, 4.0),
+            r.gain[2].clamp(0.0, 4.0),
+        ],
+        shadow_col: hue_to_rgb(r.shadow_hue),
+        shadow_sat: r.shadow_sat.clamp(0.0, 1.0),
+        high_col: hue_to_rgb(r.highlight_hue),
+        high_sat: r.highlight_sat.clamp(0.0, 1.0),
+        black_pt,
+        white_pt,
+        spots,
+        n_spots: r.spots.len().min(8) as u32,
+        lights,
+        n_lights: r.lights.len().min(8) as u32,
+        crop,
+    };
+    apply_look(&mut p, &r.look);
+    p
 }
 
 /// smoothstep(edge0, edge1, x) helper
@@ -204,11 +411,25 @@ fn srgb_encode(v: f32) -> f32 {
 }
 
 /// apply tone+color adjustments on linear sRGB triple. Shared logic with gpu shader.
+/// order: exposure -> auto-contrast remap -> lift/gamma/gain -> blacks/whites ->
+///        contrast -> shadows/highlights -> saturation/vibrance -> split tone -> LUT
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     let mut x = rgb;
     // exposure
     for c in &mut x {
         *c *= p.exposure_mul;
+    }
+    // auto-contrast percentile remap
+    if p.white_pt - p.black_pt < 0.999 || p.black_pt > 0.001 {
+        for c in &mut x {
+            *c = (*c - p.black_pt) / (p.white_pt - p.black_pt).max(0.02);
+        }
+    }
+    // lift/gamma/gain: out = gain * pow(x + lift, 1/gamma)
+    for c in 0..3 {
+        if p.lift[c] != 0.0 || p.gamma[c] != 1.0 || p.gain[c] != 1.0 {
+            x[c] = p.gain[c] * (x[c] + p.lift[c]).max(0.0).powf(1.0 / p.gamma[c]);
+        }
     }
     // blacks / whites remap
     for c in &mut x {
@@ -244,6 +465,15 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         let s = 1.0 + p.saturation + vib;
         for c in &mut x {
             *c = luma + (*c - luma) * s.max(0.0);
+        }
+    }
+    // split toning: pull shadows/highlights toward their tint colors
+    if p.shadow_sat > 0.0 || p.high_sat > 0.0 {
+        let luma = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        let ws = (1.0 - sstep(0.0, 0.55, luma)) * p.shadow_sat;
+        let wh = sstep(0.45, 1.0, luma) * p.high_sat;
+        for c in 0..3 {
+            x[c] += ws * (p.shadow_col[c] - luma) * 0.5 + wh * (p.high_col[c] - luma) * 0.5;
         }
     }
     // tone curve lut
@@ -338,10 +568,11 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
     let vh = m.h / stride;
     let norm = norm_factors(m);
 
-    // demosaic + matrix (need scene means first when auto WB)
-    let auto_means = if r.wb_mode == WbMode::Auto {
+    // sparse scene statistics for auto WB / auto exposure / auto contrast
+    let stats = if Stats::needs(r) {
+        let mut s = Stats::default();
         let mut acc = [0.0f64; 3];
-        let mut cnt = 0u64;
+        let mut luma = 0.0f64;
         let step = 4usize; // sparse sample
         for vy in (0..vh).step_by(step) {
             for vx in (0..vw).step_by(step) {
@@ -349,18 +580,32 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
                 for ch in 0..3 {
                     acc[ch] += c[ch] as f64;
                 }
-                cnt += 1;
+                let l = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).clamp(0.0, 1.0);
+                luma += l as f64;
+                s.luma_hist[(l * 255.0) as usize] += 1;
+                s.count += 1;
             }
         }
-        Some([
-            (acc[0] / cnt as f64) as f32,
-            (acc[1] / cnt as f64) as f32,
-            (acc[2] / cnt as f64) as f32,
-        ])
+        s.means = [
+            (acc[0] / s.count as f64) as f32,
+            (acc[1] / s.count as f64) as f32,
+            (acc[2] / s.count as f64) as f32,
+        ];
+        s.luma_mean = (luma / s.count as f64) as f32;
+        if std::env::var_os("ARA_STATS").is_some() {
+            eprintln!("[stats] means={:?} luma_mean={:.4} count={}", s.means, s.luma_mean, s.count);
+            eprintln!(
+                "[stats] p1={:.4} p50={:.4} p99={:.4}",
+                s.luma_percentile(0.01),
+                s.luma_percentile(0.5),
+                s.luma_percentile(0.99)
+            );
+        }
+        Some(s)
     } else {
         None
     };
-    let p = build_params(m, r, auto_means);
+    let p = build_params(m, r, stats.as_ref());
 
     let mut lin = vec![[0.0f32; 3]; vw * vh];
     for vy in 0..vh {
@@ -422,7 +667,22 @@ fn develop_raster(
             flip,
         },
     };
-    let p = build_params(&fake, r, None);
+    // raster: histogram on the decoded image feeds auto-exposure/contrast
+    let stats = if Stats::needs(r) {
+        let mut s = Stats::default();
+        for px in rgba.chunks_exact(4).step_by(4) {
+            let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 65535.0;
+            s.luma_hist[(l.clamp(0.0, 1.0) * 255.0) as usize] += 1;
+            s.luma_mean += l;
+            s.count += 1;
+        }
+        s.luma_mean /= (s.count.max(1)) as f32;
+        s.means = [s.luma_mean; 3];
+        Some(s)
+    } else {
+        None
+    };
+    let p = build_params(&fake, r, stats.as_ref());
     // raster is already sRGB-encoded u16: decode gamma to linear, adjust, re-encode
     let mut lin = vec![[0.0f32; 3]; w * h];
     for (i, px) in rgba.chunks_exact(4).enumerate() {
@@ -438,8 +698,97 @@ fn develop_raster(
     finish_linear(lin, w, h, &p, flip, max_px)
 }
 
-/// shared tail: spatial ops -> straighten/flip/fit-resize -> adjust ->
-/// grain/vignette -> gamma. Same ordering as the gpu.rs finish pass.
+/// frame-pixel dims + crop rect + rotation pivot shared by CPU/GPU.
+/// returns (fw, fh, crop l/t in px, crop w/h in px, dw, dh)
+pub(crate) fn frame_geometry(
+    w: usize,
+    h: usize,
+    flip: i32,
+    crop: [f32; 4],
+    max_px: u32,
+) -> (usize, usize, f32, f32, f32, f32, usize, usize) {
+    let (fw, fh) = match flip {
+        5 | 6 => (h, w),
+        _ => (w, h),
+    };
+    let cl = crop[0] * fw as f32;
+    let ct = crop[1] * fh as f32;
+    let ew = (fw as f32 * (1.0 - crop[0] - crop[2])).max(1.0);
+    let eh = (fh as f32 * (1.0 - crop[1] - crop[3])).max(1.0);
+    let (dw, dh) = if max_px > 0 {
+        fit(ew as u32, eh as u32, max_px)
+    } else {
+        (ew.round().max(1.0) as u32, eh.round().max(1.0) as u32)
+    };
+    (fw, fh, cl, ct, ew, eh, dw.max(1) as usize, dh.max(1) as usize)
+}
+
+/// spot heal on the demosaiced buffer: replace each spot's interior with the
+/// mean of a ring sampled just outside its radius (dust/blemish removal).
+/// spots are [cx,cy,r] in normalized POST-FLIP frame coords.
+/// convert a normalized post-flip-frame spot [cx,cy,r] to virtual-src px
+/// (sx, sy, radius_px) — shared by CPU heal and the GPU uniform builder.
+pub fn spot_to_src(s: [f32; 4], w: usize, h: usize, flip: i32) -> (f32, f32, f32) {
+    let (fw, fh) = match flip {
+        5 | 6 => (h, w),
+        _ => (w, h),
+    };
+    let fx = s[0] * fw as f32;
+    let fy = s[1] * fh as f32;
+    let (sx, sy) = match flip {
+        3 => (w as f32 - 1.0 - fx, h as f32 - 1.0 - fy),
+        6 => (fy, h as f32 - 1.0 - fx),
+        5 => (w as f32 - 1.0 - fy, fx),
+        _ => (fx, fy),
+    };
+    (sx, sy, (s[2] * fw.max(fh) as f32).max(2.0))
+}
+
+fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: u32, flip: i32) {
+    if n == 0 {
+        return;
+    }
+    let orig = lin.to_vec();
+    // clamped sampling (same as the GPU heal pass)
+    let sample = |x: f32, y: f32| -> [f32; 3] {
+        let xi = (x.round() as i32).clamp(0, w as i32 - 1) as usize;
+        let yi = (y.round() as i32).clamp(0, h as i32 - 1) as usize;
+        orig[yi * w + xi]
+    };
+    for s in spots.iter().take(n as usize) {
+        let (sx, sy, r) = spot_to_src(*s, w, h, flip);
+        // ring mean just outside the spot
+        let mut ring = [0.0f32; 3];
+        let ring_r = r * 1.4;
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::TAU / 8.0;
+            let v = sample(sx + ring_r * a.cos(), sy + ring_r * a.sin());
+            for c in 0..3 {
+                ring[c] += v[c] / 8.0;
+            }
+        }
+        let x0 = (sx - r).max(0.0) as i32;
+        let x1 = (sx + r).min(w as f32 - 1.0) as i32;
+        let y0 = (sy - r).max(0.0) as i32;
+        let y1 = (sy + r).min(h as f32 - 1.0) as i32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let d = ((x as f32 - sx).hypot(y as f32 - sy)) / r;
+                if d < 1.0 {
+                    // soft edge + slight texture preservation via neighbor noise
+                    let blend = 1.0 - sstep(0.7, 1.0, d);
+                    let i = y as usize * w + x as usize;
+                    for c in 0..3 {
+                        lin[i][c] = lin[i][c] * (1.0 - blend) + ring[c] * blend;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// shared tail: spatial ops -> straighten/flip/crop/fit-resize -> adjust ->
+/// dodge/burn -> grain/vignette -> gamma. Same ordering as the gpu.rs finish pass.
 fn finish_linear(
     mut lin: Vec<[f32; 3]>,
     w: usize,
@@ -448,28 +797,26 @@ fn finish_linear(
     flip: i32,
     max_px: u32,
 ) -> RgbaImage {
+    heal_lin(&mut lin, w, h, &p.spots, p.n_spots, flip);
     if p.noise_luma > 0.0 {
         lin = chroma_smooth(&lin, w, h, p.noise_luma);
     }
     if p.sharpen > 0.0 || p.clarity != 0.0 {
         lin = sharpen_clarity(&lin, w, h, p.sharpen, p.clarity);
     }
-    let (fw, fh) = match flip {
-        5 | 6 => (h, w),
-        _ => (w, h),
-    };
-    let (dw, dh) = if max_px > 0 { fit(fw as u32, fh as u32, max_px) } else { (fw as u32, fh as u32) };
-    let (dw, dh) = (dw.max(1) as usize, dh.max(1) as usize);
-    let cx = (fw as f32 - 1.0) * 0.5;
-    let cy = (fh as f32 - 1.0) * 0.5;
+    let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, p.crop, max_px);
+    let cx = cl + ew * 0.5 - 0.5;
+    let cy = ct + eh * 0.5 - 0.5;
     let sin = p.rotation_deg.to_radians().sin();
     let cos = p.rotation_deg.to_radians().cos();
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
-            // dst -> post-flip frame, undo straighten, undo flip -> src
-            let mut fx = (dx as f32 + 0.5) * fw as f32 / dw as f32 - 0.5;
-            let mut fy = (dy as f32 + 0.5) * fh as f32 / dh as f32 - 0.5;
+            // dst -> crop rect in post-flip frame, undo straighten, undo flip -> src
+            let nx = (dx as f32 + 0.5) / dw as f32;
+            let ny = (dy as f32 + 0.5) / dh as f32;
+            let mut fx = cl + nx * ew - 0.5;
+            let mut fy = ct + ny * eh - 0.5;
             let px = fx - cx;
             let py = fy - cy;
             fx = cx + px * cos + py * sin;
@@ -482,15 +829,23 @@ fn finish_linear(
             };
             let col = bilinear(&lin, w, h, sx, sy);
             let mut adj = adjust(col, p);
+            // dodge/burn radial lights (dst-normalized coords)
+            for l in p.lights.iter().take(p.n_lights as usize) {
+                let d = ((nx - l[0]).hypot(ny - l[1])) / l[2].max(1e-3);
+                let f = (-d * d * 2.77).exp(); // gaussian falloff
+                adj[0] *= 1.0 + l[3] * f * 0.5;
+                adj[1] *= 1.0 + l[3] * f * 0.5;
+                adj[2] *= 1.0 + l[3] * f * 0.5;
+            }
             if p.grain > 0.0 {
                 for (c, seed) in adj.iter_mut().zip([0.0f32, 17.0, 43.0]) {
                     *c += (hash_px(dx, dy, seed) - 0.5) * p.grain * 0.12;
                 }
             }
             if p.vignette != 0.0 {
-                let nx = (dx as f32 + 0.5) / dw as f32 * 2.0 - 1.0;
-                let ny = (dy as f32 + 0.5) / dh as f32 * 2.0 - 1.0;
-                let d = (nx * nx + ny * ny).sqrt() * 0.7071;
+                let vx = nx * 2.0 - 1.0;
+                let vy = ny * 2.0 - 1.0;
+                let d = (vx * vx + vy * vy).sqrt() * 0.7071;
                 let f = 1.0 - p.vignette * sstep(0.35, 1.05, d) * 0.9;
                 for c in &mut adj {
                     *c *= f;
@@ -498,7 +853,7 @@ fn finish_linear(
             }
             let o = (dy * dw + dx) * 4;
             for c in 0..3 {
-                out[o + c] = (srgb_encode(adj[c]) * 255.0 + 0.5) as u8;
+                out[o + c] = (srgb_encode(adj[c].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
             }
             out[o + 3] = 255;
         }

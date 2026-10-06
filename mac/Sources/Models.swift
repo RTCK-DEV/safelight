@@ -39,6 +39,22 @@ struct Recipe: Codable, Equatable {
     var clarity: Double = 0
     var vignette: Double = 0
     var grain: Double = 0
+    // grading
+    var lift: [Double] = [0, 0, 0]
+    var gamma: [Double] = [1, 1, 1]
+    var gain: [Double] = [1, 1, 1]
+    var shadow_hue: Double = 0.55
+    var shadow_sat: Double = 0
+    var highlight_hue: Double = 0.08
+    var highlight_sat: Double = 0
+    var look: String = ""
+    // auto correction
+    var auto_exposure: Bool = false
+    var auto_contrast: Bool = false
+    // retouch
+    var crop: [Double] = [0, 0, 0, 0]
+    var spots: [[Double]] = []
+    var lights: [[Double]] = []
 }
 
 /// Mirrors araware_core::recipe::Sidecar.

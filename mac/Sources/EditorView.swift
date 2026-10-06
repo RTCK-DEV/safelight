@@ -19,19 +19,61 @@ struct EditorView: View {
     @State private var dirty = false
     @State private var status = ""
     @State private var renderTask: Task<Void, Never>?
+    @State private var retouchMode = "off" // off|heal|dodge|burn
+    @State private var spotSize = 0.05
+    @State private var lightRadius = 0.25
+    @State private var lightEV = 0.5
+
+    /// letterboxed image rect inside the preview area
+    private func imageRect(in size: CGSize) -> CGRect {
+        guard let image else { return .zero }
+        let iw = CGFloat(image.width), ih = CGFloat(image.height)
+        let pad: CGFloat = 8
+        let avail = CGSize(width: size.width - pad * 2, height: size.height - pad * 2)
+        let sc = min(avail.width / iw, avail.height / ih)
+        let w = iw * sc, h = ih * sc
+        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+    }
+
+    private func placeAt(_ loc: CGPoint, in size: CGSize) {
+        guard retouchMode != "off" else { return }
+        let rect = imageRect(in: size)
+        guard rect.width > 0 else { return }
+        let nx = ((loc.x - rect.minX) / rect.width).clamped(to: 0...1)
+        let ny = ((loc.y - rect.minY) / rect.height).clamped(to: 0...1)
+        switch retouchMode {
+        case "heal":
+            // spots are frame-normalized (pre-crop) coords
+            let cl = recipe.crop[0], ct = recipe.crop[1]
+            let sw = 1 - recipe.crop[0] - recipe.crop[2]
+            let sh = 1 - recipe.crop[1] - recipe.crop[3]
+            recipe.spots.append([cl + nx * sw, ct + ny * sh, spotSize, 0])
+        case "dodge", "burn":
+            recipe.lights.append([nx, ny, lightRadius, retouchMode == "dodge" ? lightEV : -lightEV])
+        default: break
+        }
+    }
 
     var body: some View {
         HSplitView {
-            ZStack {
-                Color(white: 0.12)
-                if let image {
-                    Image(image, scale: 1, label: Text(photo.name))
-                        .resizable()
-                        .scaledToFit()
-                        .padding(8)
-                } else {
-                    ProgressView()
+            GeometryReader { geo in
+                ZStack {
+                    Color(white: 0.12)
+                    if let image {
+                        let rect = imageRect(in: geo.size)
+                        Image(image, scale: 1, label: Text(photo.name))
+                            .resizable()
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                        retouchMarkers(in: rect)
+                    } else {
+                        ProgressView()
+                    }
                 }
+                .contentShape(Rectangle())
+                .gesture(SpatialTapGesture().onEnded { v in
+                    placeAt(v.location, in: geo.size)
+                })
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -63,6 +105,17 @@ struct EditorView: View {
 
                     GroupBox("Light") {
                         VStack(spacing: 8) {
+                            HStack {
+                                Button("Auto") {
+                                    recipe.wb_mode = .auto
+                                    recipe.auto_exposure = true
+                                    recipe.auto_contrast = true
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                Toggle("Exp", isOn: $recipe.auto_exposure).font(.caption)
+                                Toggle("Contrast", isOn: $recipe.auto_contrast).font(.caption)
+                            }
                             SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
                             SliderRow("Contrast", $recipe.contrast, -1...1)
                             SliderRow("Highlights", $recipe.highlights, -1...1)
@@ -83,6 +136,58 @@ struct EditorView: View {
                             SliderRow("Tint", $recipe.tint, -1...1)
                             SliderRow("Saturation", $recipe.saturation, -1...1)
                             SliderRow("Vibrance", $recipe.vibrance, -1...1)
+                        }
+                    }
+                    GroupBox("Grade") {
+                        VStack(spacing: 8) {
+                            Picker("Look", selection: $recipe.look) {
+                                Text("None").tag("")
+                                Text("Teal & Orange").tag("teal_orange")
+                                Text("Film Fade").tag("film_fade")
+                                Text("Bleach Bypass").tag("bleach")
+                                Text("Noir").tag("noir")
+                                Text("Matte").tag("matte")
+                            }
+                            Text("Lift / Gamma / Gain (R G B)").font(.caption2).foregroundStyle(.secondary)
+                            TriRow("Lift", $recipe.lift, -0.25...0.25)
+                            TriRow("Gamma", $recipe.gamma, 0.5...2)
+                            TriRow("Gain", $recipe.gain, 0.5...2)
+                            Text("Split Tone").font(.caption2).foregroundStyle(.secondary)
+                            SliderRow("Shd Hue", $recipe.shadow_hue, 0...1)
+                            SliderRow("Shd Sat", $recipe.shadow_sat, 0...1)
+                            SliderRow("Hi Hue", $recipe.highlight_hue, 0...1)
+                            SliderRow("Hi Sat", $recipe.highlight_sat, 0...1)
+                        }
+                    }
+                    GroupBox("Retouch") {
+                        VStack(spacing: 8) {
+                            Picker("Tool", selection: $retouchMode) {
+                                Text("Off").tag("off")
+                                Text("Heal").tag("heal")
+                                Text("Dodge").tag("dodge")
+                                Text("Burn").tag("burn")
+                            }
+                            .pickerStyle(.segmented)
+                            if retouchMode == "heal" {
+                                SliderRow("Size", $spotSize, 0.01...0.15)
+                            } else if retouchMode != "off" {
+                                SliderRow("Radius", $lightRadius, 0.05...0.6)
+                                SliderRow("EV", $lightEV, 0...2)
+                            }
+                            if !recipe.spots.isEmpty || !recipe.lights.isEmpty {
+                                ForEach(recipe.spots.indices, id: \.self) { i in
+                                    MarkRow("Spot \(i + 1)") { recipe.spots.remove(at: i) }
+                                }
+                                ForEach(recipe.lights.indices, id: \.self) { i in
+                                    MarkRow("Light \(i + 1) \(recipe.lights[i][3] >= 0 ? "+" : "")\(String(format: "%.1f", recipe.lights[i][3]))EV") {
+                                        recipe.lights.remove(at: i)
+                                    }
+                                }
+                            }
+                            SliderRow("Crop L", $recipe.crop[0], 0...0.45)
+                            SliderRow("Crop T", $recipe.crop[1], 0...0.45)
+                            SliderRow("Crop R", $recipe.crop[2], 0...0.45)
+                            SliderRow("Crop B", $recipe.crop[3], 0...0.45)
                         }
                     }
                     GroupBox("Detail") {
@@ -267,6 +372,78 @@ struct LabelPicker: View {
             }
         }
     }
+}
+
+extension EditorView {
+    /// marker overlay for heal spots / dodge-burn lights
+    @ViewBuilder
+    func retouchMarkers(in rect: CGRect) -> some View {
+        let cl = recipe.crop[0], ct = recipe.crop[1]
+        let sw = (1 - recipe.crop[0] - recipe.crop[2])
+        let sh = (1 - recipe.crop[1] - recipe.crop[3])
+        Canvas { ctx, _ in
+        for s in recipe.spots {
+            let nx = (s[0] - cl) / max(sw, 0.01)
+            let ny = (s[1] - ct) / max(sh, 0.01)
+            let cx = rect.minX + nx * rect.width
+            let cy = rect.minY + ny * rect.height
+            let r = s[2] * rect.width
+            let path = Circle().path(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+            ctx.stroke(path, with: .color(.red.opacity(0.9)), lineWidth: 1.5)
+        }
+        for l in recipe.lights {
+            let cx = rect.minX + l[0] * rect.width
+            let cy = rect.minY + l[1] * rect.height
+            let r = l[2] * rect.width
+            let path = Circle().path(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+            let col: Color = l[3] >= 0 ? .yellow : .purple
+            ctx.stroke(path, with: .color(col.opacity(0.9)), lineWidth: 1.5)
+        }
+        }
+    }
+}
+
+/// delete row for a placed spot/light
+struct MarkRow: View {
+    let title: String
+    let onDelete: () -> Void
+    init(_ title: String, onDelete: @escaping () -> Void) {
+        self.title = title
+        self.onDelete = onDelete
+    }
+    var body: some View {
+        HStack {
+            Text(title).font(.caption)
+            Spacer()
+            Button("×") { onDelete() }.buttonStyle(.plain).foregroundStyle(.red)
+        }
+    }
+}
+
+/// three-channel row (R G B) bound to a [Double] of length 3
+struct TriRow: View {
+    let title: String
+    @Binding var v: [Double]
+    let range: ClosedRange<Double>
+    init(_ title: String, _ v: Binding<[Double]>, _ range: ClosedRange<Double>) {
+        self.title = title
+        self._v = v
+        self.range = range
+    }
+    var body: some View {
+        if v.count == 3 {
+            HStack(spacing: 6) {
+                Text(title).font(.caption).frame(width: 40, alignment: .leading)
+                ForEach(0..<3, id: \.self) { i in
+                    Slider(value: $v[i], in: range)
+                }
+            }
+        }
+    }
+}
+
+private extension Double {
+    func clamped(to r: ClosedRange<Double>) -> Double { min(max(self, r.lowerBound), r.upperBound) }
 }
 
 struct SliderRow: View {

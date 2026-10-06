@@ -17,8 +17,8 @@ at a directory of RAW files, no Lightroom-style import step.
 
 | piece | path | what it does |
 |---|---|---|
-| engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto, cam→sRGB, tone curve, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma NR, clarity, straighten, vignette, grain), embedded-thumbnail extraction, EXIF |
-| GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→NR→sharpen/clarity→finish (resize+straighten+flip+adjust+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
+| engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto, cam→sRGB, tone curve, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma NR, clarity, straighten, vignette, grain, grading, retouch), embedded-thumbnail extraction, EXIF |
+| GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→heal→NR→sharpen/clarity→finish (crop+resize+straighten+flip+adjust+dodge/burn+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
 | catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + recipe) |
 | C ABI | `core/src/capi.rs` | opaque engine handle, images as `{data,len,w,h}` RGBA8, JSON in/out |
 | CLI | `cli/` | `render`, `thumb`, `reference`, `scan`, `meta`, `rate` — test harness + batch tool |
@@ -59,7 +59,21 @@ araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sani
   "rotation_deg": 0.0,      // straighten, -10..10
   "clarity": 0.0,           // midtone local contrast, -1..1
   "vignette": 0.0,          // -1..1 (positive = darkened corners)
-  "grain": 0.0              // film grain, 0..1
+  "grain": 0.0,             // film grain, 0..1
+
+  // DaVinci-style grading
+  "lift": [0,0,0], "gamma": [1,1,1], "gain": [1,1,1],
+  "shadow_hue": 0.55, "shadow_sat": 0.3,    // split tone, hue 0..1 (0.52≈teal)
+  "highlight_hue": 0.08, "highlight_sat": 0.2,
+  "look": "teal_orange",  // preset: none|teal_orange|film_fade|bleach|noir|matte
+
+  // auto correction (sparse scene stats drive all three)
+  "wb_mode": "auto", "auto_exposure": true, "auto_contrast": true,
+
+  // retouch
+  "crop": [0,0,0,0],        // [left,top,right,bottom] fractions of frame
+  "spots": [[0.5,0.3,0.04,0]],   // spot heal [cx,cy,r], frame-normalized (max 8)
+  "lights": [[0.5,0.7,0.25,0.8]] // dodge/burn [cx,cy,r,ev], dst-normalized (max 8)
 }
 ```
 

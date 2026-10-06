@@ -52,6 +52,33 @@ pub struct Recipe {
     pub vignette: f32,
     /// film grain 0..1
     pub grain: f32,
+    // ---- grading (DaVinci-style lift/gamma/gain + split tone + look) ----
+    /// per-channel shadow offset, typically -0.25..0.25
+    pub lift: [f32; 3],
+    /// per-channel midtone exponent multiplier, typically 0.5..2
+    pub gamma: [f32; 3],
+    /// per-channel highlight multiplier, typically 0.5..2
+    pub gain: [f32; 3],
+    /// split tone: shadow hue (0..1) + amount (0..1)
+    pub shadow_hue: f32,
+    pub shadow_sat: f32,
+    /// split tone: highlight hue + amount
+    pub highlight_hue: f32,
+    pub highlight_sat: f32,
+    /// cinematic preset: "none"|"teal_orange"|"film_fade"|"bleach"|"noir"|"matte"
+    pub look: String,
+    // ---- automatic correction ----
+    /// histogram-driven exposure compensation
+    pub auto_exposure: bool,
+    /// histogram percentile white/black point stretch
+    pub auto_contrast: bool,
+    // ---- retouch ----
+    /// crop fractions [left, top, right, bottom] 0..0.9 (post-rotation frame)
+    pub crop: [f32; 4],
+    /// spot heal marks [cx, cy, radius, _] in normalized post-flip frame coords
+    pub spots: Vec<[f32; 4]>,
+    /// dodge/burn radial lights [cx, cy, radius, ev] in normalized frame coords
+    pub lights: Vec<[f32; 4]>,
 }
 
 impl Default for Recipe {
@@ -75,6 +102,19 @@ impl Default for Recipe {
             clarity: 0.0,
             vignette: 0.0,
             grain: 0.0,
+            lift: [0.0; 3],
+            gamma: [1.0; 3],
+            gain: [1.0; 3],
+            shadow_hue: 0.55,
+            shadow_sat: 0.0,
+            highlight_hue: 0.08,
+            highlight_sat: 0.0,
+            look: String::new(),
+            auto_exposure: false,
+            auto_contrast: false,
+            crop: [0.0; 4],
+            spots: Vec::new(),
+            lights: Vec::new(),
         }
     }
 }
