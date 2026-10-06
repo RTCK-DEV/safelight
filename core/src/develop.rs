@@ -75,10 +75,15 @@ pub struct Params {
     pub ql: [f32; 3],
     pub qadj: [f32; 4],
     pub q_invert: bool,
+    /// matte finesse [clean_black, clean_white]
+    pub q_clean: [f32; 2],
+    /// matte finesse blur → widens soft edges
+    pub q_blur: f32,
+    /// highlight/isolate preview of the key
+    pub q_show: bool,
     pub has_qual: bool,
-    /// power windows [kind, a,b,c,d, soft, ev, sat, temp, invert] (circle: a..d=cx,cy,rx,ry + rot in kind-sign? see pack)
-    /// packed: [kind, p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, invert]
-    pub wins: [[f32; 10]; 4],
+    /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
+    pub wins: [[f32; 12]; 4],
     pub n_wins: u32,
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
     pub zones: [[f32; 4]; 4],
@@ -489,8 +494,9 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         v
     };
 
-    // power windows → packed [kind, p0..p5, ev, sat, temp, invert]
-    let mut wins = [[0.0; 10]; 4];
+    // power windows → packed [kind, p0..p5, ev, sat, temp, strength]
+    // strength = opacity × enabled (folded so disabled windows are free)
+    let mut wins = [[0.0; 12]; 4];
     for (i, w) in r.windows.iter().take(4).enumerate() {
         wins[i] = [
             (if w.kind == "gradient" { 1.0 } else { 0.0 }) + (if w.invert { 2.0 } else { 0.0 }),
@@ -503,6 +509,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             w.ev.clamp(-4.0, 4.0),
             w.sat.clamp(-1.0, 1.0),
             w.temp.clamp(-1.0, 1.0),
+            if w.enabled { w.opacity.clamp(0.0, 1.0) } else { 0.0 },
+            0.0,
         ];
     }
 
@@ -609,6 +617,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             r.qadj[3].clamp(-1.0, 1.0),
         ],
         q_invert: r.q_invert,
+        q_clean: [r.q_clean[0].clamp(0.0, 1.0), r.q_clean[1].clamp(0.0, 1.0)],
+        q_blur: r.q_blur.clamp(0.0, 1.0),
+        q_show: r.q_show,
+        // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
         n_wins: r.windows.len().min(4) as u32,
@@ -811,20 +823,37 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         }
         x = x2;
     }
-    // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask
-    if p.has_qual {
+    // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask.
+    // Also runs when only q_show is set so the matte can be previewed.
+    if p.has_qual || p.q_show {
         let (h, s, _v) = rgb_to_hsv(x);
         let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
-        let mh = 1.0 - sstep(p.qh[1], p.qh[1] + p.qh[2].max(1e-4), hue_dist(h, p.qh[0]));
-        let ms = sstep(p.qs[0] - p.qs[2], p.qs[0] + p.qs[2], s)
-            * (1.0 - sstep(p.qs[1] - p.qs[2], p.qs[1] + p.qs[2], s));
-        let ml = sstep(p.ql[0] - p.ql[2], p.ql[0] + p.ql[2], l)
-            * (1.0 - sstep(p.ql[1] - p.ql[2], p.ql[1] + p.ql[2], l));
+        // matte finesse "blur" ≈ dilate soft edges on every channel
+        let qb = p.q_blur * 0.25;
+        let mh = 1.0 - sstep(p.qh[1], p.qh[1] + (p.qh[2] + qb).max(1e-4), hue_dist(h, p.qh[0]));
+        let qs2 = p.qs[2] + qb;
+        let ms = sstep(p.qs[0] - qs2, p.qs[0] + qs2, s)
+            * (1.0 - sstep(p.qs[1] - qs2, p.qs[1] + qs2, s));
+        let ql2 = p.ql[2] + qb;
+        let ml = sstep(p.ql[0] - ql2, p.ql[0] + ql2, l)
+            * (1.0 - sstep(p.ql[1] - ql2, p.ql[1] + ql2, l));
         let mut mask = mh * ms * ml;
+        // clean black/white: remap the matte to push mid-tones to 0/1
+        let cb = p.q_clean[0];
+        let cw = p.q_clean[1];
+        if cb > 0.0 || cw < 1.0 {
+            mask = ((mask - cb) / (cw - cb).max(1e-4)).clamp(0.0, 1.0);
+        }
         if p.q_invert {
             mask = 1.0 - mask;
         }
-        if mask > 0.001 {
+        // highlight/isolate: desaturate everything outside the key
+        if p.q_show {
+            for c in 0..3 {
+                x[c] = l + (x[c] - l) * mask;
+            }
+        }
+        if mask > 0.001 && p.has_qual {
             let h2 = h + p.qadj[0];
             let s2 = (s * (1.0 + p.qadj[1])).clamp(0.0, 1.0);
             let mut xq = hsv_to_rgb(h2, s2, _v);
@@ -1302,7 +1331,7 @@ fn finish_linear(
             }
             // power windows: local ev/sat/temp inside the mask
             for win in p.wins.iter().take(p.n_wins as usize) {
-                let mask = window_mask(win, nx, ny);
+                let mask = window_mask(win, nx, ny) * win[10];
                 if mask <= 0.001 {
                     continue;
                 }
@@ -1362,8 +1391,8 @@ fn finish_linear(
 }
 
 /// power-window mask value at dst-normalized (nx,ny)
-/// packed [kind(+2=invert), a,b,c,d, rot, soft, ev, sat, temp]
-fn window_mask(w: &[f32; 10], nx: f32, ny: f32) -> f32 {
+/// packed [kind(+2=invert), a,b,c,d, rot, soft, ev, sat, temp, strength]
+fn window_mask(w: &[f32], nx: f32, ny: f32) -> f32 {
     let kind = w[0] as i32 % 2;
     let inv = w[0] >= 2.0;
     let mask = if kind == 1 {

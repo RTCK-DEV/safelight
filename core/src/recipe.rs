@@ -106,6 +106,12 @@ pub struct Recipe {
     /// inside-mask adjustments [hue_shift, sat_gain, lum_gain, temp]
     pub qadj: [f32; 4],
     pub q_invert: bool,
+    /// matte finesse: [clean_black, clean_white] remap of the key 0..1
+    pub q_clean: [f32; 2],
+    /// matte finesse: blur radius (dilates HSL soft edges) 0..1
+    pub q_blur: f32,
+    /// highlight mode: preview the key — qualified in colour, rest grey
+    pub q_show: bool,
     /// power windows: parametric spatial masks carrying local adjustments (max 4)
     pub windows: Vec<PowerWindow>,
     // ---- HDR wheels + raw gamma controls ----
@@ -153,6 +159,19 @@ pub struct PowerWindow {
     pub sat: f32,            // saturation offset -1..1
     pub temp: f32,           // warm(+)/cool(-) -1..1
     pub invert: bool,
+    /// window on/off (DaVinci: per-window visibility eye)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// adjustment strength 0..1 (DaVinci window opacity)
+    #[serde(default = "default_one")]
+    pub opacity: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_one() -> f32 {
+    1.0
 }
 
 impl Default for PowerWindow {
@@ -164,6 +183,8 @@ impl Default for PowerWindow {
             sat: 0.0,
             temp: 0.0,
             invert: false,
+            enabled: true,
+            opacity: 1.0,
         }
     }
 }
@@ -219,6 +240,9 @@ impl Default for Recipe {
             ql: [0.0, 1.0, 0.05],
             qadj: [0.0; 4],
             q_invert: false,
+            q_clean: [0.0, 1.0],
+            q_blur: 0.0,
+            q_show: false,
             windows: Vec::new(),
             z_dark: [0.0; 4],
             z_shadow: [0.0; 4],
@@ -249,6 +273,23 @@ impl Recipe {
     }
 }
 
+/// A named snapshot of a recipe (DaVinci "grade version" / still).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GradeVersion {
+    pub name: String,
+    pub recipe: Recipe,
+}
+
+impl Default for GradeVersion {
+    fn default() -> Self {
+        GradeVersion {
+            name: String::new(),
+            recipe: Recipe::default(),
+        }
+    }
+}
+
 /// Sidecar file contents stored next to each asset as `<stem>.araware.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -257,6 +298,8 @@ pub struct Sidecar {
     pub rating: i32,
     pub label: String,
     pub recipe: Recipe,
+    /// saved grade versions (DaVinci stills/versions)
+    pub versions: Vec<GradeVersion>,
 }
 
 impl Default for Sidecar {
@@ -266,6 +309,7 @@ impl Default for Sidecar {
             rating: 0,
             label: String::new(),
             recipe: Recipe::default(),
+            versions: Vec::new(),
         }
     }
 }

@@ -26,7 +26,8 @@ fn main() -> Result<()> {
             let out = args.get(3).map(String::as_str).unwrap_or("out.png");
             let recipe = args
                 .get(4)
-                .and_then(|s| Recipe::from_json(s))
+                .and_then(|s| std::fs::read_to_string(s).ok())
+                .and_then(|s| Recipe::from_json(&s))
                 .unwrap_or_default();
             let max_px: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
             let t = std::time::Instant::now();

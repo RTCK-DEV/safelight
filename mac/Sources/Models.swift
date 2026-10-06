@@ -29,8 +29,24 @@ struct PowerWindow: Codable, Equatable, Identifiable {
     var sat: Double = 0
     var temp: Double = 0
     var invert: Bool = false
+    var enabled: Bool = true         // per-window on/off
+    var opacity: Double = 1          // adjustment strength 0..1
 
-    enum CodingKeys: String, CodingKey { case kind, p, ev, sat, temp, invert }
+    enum CodingKeys: String, CodingKey { case kind, p, ev, sat, temp, invert, enabled, opacity }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = (try? c.decode(String.self, forKey: .kind)) ?? "circle"
+        p = (try? c.decode([Double].self, forKey: .p)) ?? [0.5, 0.5, 0.2, 0.2, 0, 0.4]
+        ev = (try? c.decode(Double.self, forKey: .ev)) ?? 0
+        sat = (try? c.decode(Double.self, forKey: .sat)) ?? 0
+        temp = (try? c.decode(Double.self, forKey: .temp)) ?? 0
+        invert = (try? c.decode(Bool.self, forKey: .invert)) ?? false
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
+        opacity = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+    }
 }
 
 /// Mirrors araware_core::recipe::Recipe (serde snake_case).
@@ -89,6 +105,9 @@ struct Recipe: Codable, Equatable {
     var ql: [Double] = [0.0, 1.0, 0.1]
     var qadj: [Double] = [0, 0, 0, 0]  // hue shift, sat, lum, temp
     var q_invert: Bool = false
+    var q_clean: [Double] = [0, 1]     // matte finesse: clean black/white remap
+    var q_blur: Double = 0             // matte finesse: edge blur/dilate
+    var q_show: Bool = false           // highlight/isolate preview of the key
     var q_enabled: Bool = false        // UI-side gate; cleared qualifiers are no-ops
     var windows: [PowerWindow] = []
     // HDR zone wheels [hue, amount, ev, sat]
@@ -129,7 +148,7 @@ extension Recipe {
         case offset, midtone_hue, midtone_sat
         case curve_r, curve_g, curve_b
         case hue_hue, hue_sat, hue_lum, lum_sat, sat_sat
-        case qh, qs, ql, qadj, q_invert, windows
+        case qh, qs, ql, qadj, q_invert, q_clean, q_blur, q_show, windows
         case z_dark, z_shadow, z_light, z_global
         case pivot, highlight_rolloff, shadow_rolloff
         case mixer, mono, clones
@@ -188,6 +207,9 @@ extension Recipe {
         ql = opt(.ql, [Double].self) ?? [0.0, 1.0, 0.1]
         qadj = opt(.qadj, [Double].self) ?? [0, 0, 0, 0]
         q_invert = opt(.q_invert, Bool.self) ?? false
+        q_clean = opt(.q_clean, [Double].self) ?? [0, 1]
+        q_blur = opt(.q_blur, Double.self) ?? 0
+        q_show = opt(.q_show, Bool.self) ?? false
         windows = opt(.windows, [PowerWindow].self) ?? []
         z_dark = opt(.z_dark, [Double].self) ?? [0, 0, 0, 0]
         z_shadow = opt(.z_shadow, [Double].self) ?? [0, 0, 0, 0]
@@ -209,10 +231,32 @@ extension Recipe {
     }
 }
 
+/// Mirrors araware_core::recipe::GradeVersion: named recipe snapshot
+/// (DaVinci grade version / gallery still).
+struct GradeVersion: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var name: String = ""
+    var recipe: Recipe = Recipe()
+
+    enum CodingKeys: String, CodingKey { case name, recipe }
+
+    init(name: String = "", recipe: Recipe = Recipe()) {
+        self.name = name
+        self.recipe = recipe
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        recipe = (try? c.decode(Recipe.self, forKey: .recipe)) ?? Recipe()
+    }
+}
+
 /// Mirrors araware_core::recipe::Sidecar.
 struct Sidecar: Codable {
     var version: Int = 1
     var rating: Int = 0
     var label: String = ""
     var recipe: Recipe = Recipe()
+    var versions: [GradeVersion] = []
 }

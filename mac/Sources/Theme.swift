@@ -87,8 +87,65 @@ struct TrackSlider: View {
     }
 }
 
-/// Label + TrackSlider + monospaced value readout. Same call signature as the
-/// old SliderRow so existing call sites keep working.
+/// Monospaced numeric readout that turns into an editable TextField on click
+/// (DaVinci numeric entry). Commits on Return / focus loss; Escape cancels.
+struct NumValue: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var width: CGFloat = 38
+    var reset: Double? = nil
+    var step: Double = 0.01
+    var digits: Int = 2
+    @State private var editing = false
+    @State private var text = ""
+    @FocusState private var focus: Bool
+
+    private var def: Double {
+        reset ?? (range.contains(0) ? 0 : range.lowerBound)
+    }
+
+    var body: some View {
+        Group {
+            if editing {
+                // field starts empty, placeholder shows the current value —
+                // typing a number replaces it outright (DaVinci-style entry)
+                TextField(String(format: "%.\(digits)f", value), text: $text)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(Ara.accent)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: width + 8, alignment: .trailing)
+                    .focused($focus)
+                    .onSubmit(commit)
+                    .onExitCommand { editing = false }
+                    .onChange(of: focus) { _, f in if !f { commit() } }
+                    .onAppear { text = ""; focus = true }
+            } else {
+                Text(String(format: "%.\(digits)f", value))
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(abs(value - def) < 1e-9 ? Ara.text3 : Ara.accent)
+                    // generous hitbox: pads catch taps that would otherwise land
+                    // on the track just left of the number
+                    .frame(minWidth: width, alignment: .trailing)
+                    .padding(.horizontal, 5).padding(.vertical, 3)
+                    .background(Ara.bg3.opacity(0.001))   // invisible grab surface
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 1) { editing = true }
+            }
+        }
+    }
+
+    private func commit() {
+        let t = text.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: ",", with: ".")
+        if !t.isEmpty, let v = Double(t) {
+            value = v.clamped(to: range)
+        }
+        editing = false
+    }
+}
+
+/// Label + TrackSlider + editable monospaced value readout.
 struct SliderRow: View {
     let title: String
     @Binding var value: Double
@@ -105,10 +162,6 @@ struct SliderRow: View {
         self.reset = reset
     }
 
-    private var def: Double {
-        reset ?? (range.contains(0) ? 0 : range.lowerBound)
-    }
-
     var body: some View {
         HStack(spacing: 7) {
             Text(title)
@@ -117,12 +170,68 @@ struct SliderRow: View {
                 .frame(width: 60, alignment: .leading)
                 .lineLimit(1)
             TrackSlider(value: $value, range: range, step: step, reset: reset)
-            Text(String(format: "%.2f", value))
-                .font(.system(size: 10.5).monospacedDigit())
-                .foregroundStyle(abs(value - def) < 1e-9 ? Ara.text3 : Ara.accent)
-                .frame(width: 38, alignment: .trailing)
+            NumValue(value: $value, range: range, reset: reset, step: step)
         }
         .frame(height: 20)
+    }
+}
+
+/// DaVinci qualifier range bar: gradient track with two draggable handles
+/// setting [lo, hi]. `gradient` supplies the strip's colours.
+struct RangeBar: View {
+    let title: String
+    @Binding var lo: Double
+    @Binding var hi: Double
+    let gradient: LinearGradient
+    var height: CGFloat = 14
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Ara.text2)
+                .frame(width: 60, alignment: .leading)
+                .lineLimit(1)
+            GeometryReader { geo in
+                let w = geo.size.width
+                let lx = CGFloat(lo.clamped(to: 0...1)) * w
+                let hx = CGFloat(hi.clamped(to: 0...1)) * w
+                ZStack {
+                    Capsule().fill(gradient).frame(width: w, height: 8)
+                        .overlay(Capsule().stroke(Ara.border, lineWidth: 0.5))
+                    // dim outside the selected range
+                    HStack(spacing: 0) {
+                        Rectangle().fill(Ara.bg0.opacity(0.55)).frame(width: max(lx, 0))
+                        Spacer(minLength: 0)
+                        Rectangle().fill(Ara.bg0.opacity(0.55)).frame(width: max(w - hx, 0))
+                    }
+                    .clipShape(Capsule())
+                    .frame(width: w, height: 8)
+                    barHandle(x: lx, y: geo.size.height / 2, max: w)
+                    barHandle(x: hx, y: geo.size.height / 2, max: w)
+                }
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                    let f = Double(g.location.x / w).clamped(to: 0...1)
+                    if abs(g.startLocation.x - lx) <= abs(g.startLocation.x - hx) {
+                        lo = min(f, hi)
+                    } else {
+                        hi = max(f, lo)
+                    }
+                })
+            }
+            .frame(height: height)
+        }
+        .frame(height: 20)
+    }
+
+    private func barHandle(x: CGFloat, y: CGFloat, max w: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: 2)
+            .fill(Color.white)
+            .frame(width: 5, height: 12)
+            .overlay(RoundedRectangle(cornerRadius: 2).stroke(Ara.accent, lineWidth: 1))
+            .shadow(color: .black.opacity(0.5), radius: 1, y: 0.5)
+            .position(x: x.clamped(to: 2...max(w - 2, 2)), y: y)
     }
 }
 

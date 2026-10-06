@@ -32,6 +32,9 @@ final class LibraryStore: ObservableObject {
     /// work alive when switching photos. Cleared when the folder reloads.
     var unsavedEdits: [String: Recipe] = [:]
 
+    /// Same idea for grade-version lists (they live in the sidecar file).
+    var unsavedVersions: [String: [GradeVersion]] = [:]
+
     var filtered: [Photo] {
         photos.filter {
             $0.rating >= minRating && (labelFilter.isEmpty || $0.label == labelFilter)
@@ -53,6 +56,7 @@ final class LibraryStore: ObservableObject {
     func open(_ url: URL) {
         folder = url
         unsavedEdits.removeAll()
+        unsavedVersions.removeAll()
         scanning = true
         Task.detached { [weak self] in
             let photos = await AraEngine.shared.work { $0.scan(folder: url.path) }

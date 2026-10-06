@@ -90,6 +90,8 @@ struct Uni {
     wins: [[f32; 4]; 16],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
+    /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
+    qf2: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -140,6 +142,7 @@ struct Uni {
     flare: vec4<f32>,
     wins: array<vec4<f32>, 16>,
     clones: array<vec4<f32>, 16>,
+    qf2: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -615,18 +618,25 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
         x = x2;
     }
-    // HSL qualifier
-    if (u.qf.x > 0.5) {
+    // HSL qualifier (also runs for highlight-only preview when u.qf2.w is set)
+    if (u.qf.x > 0.5 || u.qf2.w > 0.5) {
         let hsv = rgb_to_hsv(x);
         let l = luma(x);
-        let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z, 1e-4), hue_dist(hsv.x, u.qh.x));
-        let ms = sstep(u.qs.x - u.qs.z, u.qs.x + u.qs.z, hsv.y)
-            * (1.0 - sstep(u.qs.y - u.qs.z, u.qs.y + u.qs.z, hsv.y));
-        let ml = sstep(u.ql.x - u.ql.z, u.ql.x + u.ql.z, l)
-            * (1.0 - sstep(u.ql.y - u.ql.z, u.ql.y + u.ql.z, l));
+        let qb = u.qf2.z * 0.25;
+        let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z + qb, 1e-4), hue_dist(hsv.x, u.qh.x));
+        let qs2 = u.qs.z + qb;
+        let ms = sstep(u.qs.x - qs2, u.qs.x + qs2, hsv.y)
+            * (1.0 - sstep(u.qs.y - qs2, u.qs.y + qs2, hsv.y));
+        let ql2 = u.ql.z + qb;
+        let ml = sstep(u.ql.x - ql2, u.ql.x + ql2, l)
+            * (1.0 - sstep(u.ql.y - ql2, u.ql.y + ql2, l));
         var mask = mh * ms * ml;
+        if (u.qf2.x > 0.0 || u.qf2.y < 1.0) {
+            mask = clamp((mask - u.qf2.x) / max(u.qf2.y - u.qf2.x, 1e-4), 0.0, 1.0);
+        }
         if (u.qf.y > 0.5) { mask = 1.0 - mask; }
-        if (mask > 0.001) {
+        if (u.qf2.w > 0.5) { x = vec3<f32>(l) + (x - vec3<f32>(l)) * mask; }
+        if (mask > 0.001 && u.qf.x > 0.5) {
             var xq = hsv_to_rgb(hsv.x + u.qadj.x, clamp(hsv.y * (1.0 + u.qadj.y), 0.0, 1.0), hsv.z);
             let lq = luma(xq);
             if (lq > 1e-5) { xq = xq * ((l * (1.0 + u.qadj.z)) / lq); }
@@ -769,6 +779,7 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
             mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
         }
         if (w2.y >= 2.0) { mask = 1.0 - mask; }
+        mask = mask * w2.z;
         if (mask > 0.001) {
             let evg = pow(2.0, w1.z * mask);
             let l = luma(adj);
@@ -1102,7 +1113,7 @@ impl Gpu {
                 for (i, w) in p.wins.iter().take(4).enumerate() {
                     a[i * 4] = [w[1], w[2], w[3], w[4]];
                     a[i * 4 + 1] = [w[5], w[6], w[7], w[8]];
-                    a[i * 4 + 2] = [w[9], w[0], 0.0, 0.0];
+                    a[i * 4 + 2] = [w[9], w[0], w[10], 0.0];
                 }
                 a
             },
@@ -1121,6 +1132,12 @@ impl Gpu {
                 }
                 a
             },
+            qf2: [
+                p.q_clean[0],
+                p.q_clean[1],
+                p.q_blur,
+                if p.q_show { 1.0 } else { 0.0 },
+            ],
         };
 
         let bind = |pipe: &Pipe| {

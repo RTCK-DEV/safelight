@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -6,6 +7,62 @@ let labelColors: [(name: String, color: Color)] = [
     ("red", .red), ("orange", .orange), ("yellow", .yellow),
     ("green", .green), ("blue", .blue), ("purple", .purple),
 ]
+
+enum CompareMode: String, CaseIterable, Identifiable {
+    case off, before, wipeV, wipeH, diff, mix
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .before: return "Before"
+        case .wipeV: return "Wipe Vertical"
+        case .wipeH: return "Wipe Horizontal"
+        case .diff: return "Difference"
+        case .mix: return "50/50 Mix"
+        }
+    }
+}
+
+/// Inspector palettes, DaVinci color-page style: one at a time via the icon strip.
+enum Palette: String, CaseIterable, Identifiable {
+    case meters, light, wheels, curves, zones, qualifier, windows, mixer,
+         retouch, detail, fx, xform, versions
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .meters: return "waveform.path.ecg"
+        case .light: return "sun.max"
+        case .wheels: return "circle.circle"
+        case .curves: return "chart.line.uptrend.xyaxis"
+        case .zones: return "square.split.bottomhalf.filled"
+        case .qualifier: return "eyedropper.halffull"
+        case .windows: return "circle.dashed"
+        case .mixer: return "slider.horizontal.below.square.filled.and.square"
+        case .retouch: return "bandage"
+        case .detail: return "sparkle.magnifyingglass"
+        case .fx: return "sparkles"
+        case .xform: return "crop.rotate"
+        case .versions: return "square.stack"
+        }
+    }
+    var title: String {
+        switch self {
+        case .meters: return "Meters"
+        case .light: return "Light"
+        case .wheels: return "Wheels"
+        case .curves: return "Curves"
+        case .zones: return "HDR Zones"
+        case .qualifier: return "Qualifier"
+        case .windows: return "Windows"
+        case .mixer: return "Mixer"
+        case .retouch: return "Retouch"
+        case .detail: return "Detail"
+        case .fx: return "Effects"
+        case .xform: return "Transform"
+        case .versions: return "Versions"
+        }
+    }
+}
 
 struct EditorView: View {
     let photo: Photo
@@ -24,27 +81,46 @@ struct EditorView: View {
     @State private var baseline = Recipe()
     @State private var status = ""
     @State private var renderTask: Task<Void, Never>?
-    // tool: off|heal|dodge|burn|wbpick|clone|window|grad|flare
+    // tool: off|heal|dodge|burn|wbpick|clone|window|grad|flare|qpick|qadd|qsub
     @State private var retouchMode = "off"
     @State private var spotSize = 0.05
     @State private var lightRadius = 0.25
     @State private var lightEV = 0.5
     @State private var cloneRadius = 0.06
     @State private var pendingClone: [Double]? = nil
-    @State private var compare = false
-    @State private var showScopes = true
+    @State private var cmp: CompareMode = .off
+    @State private var wipePos: Double = 0.5
+    @State private var baselineImg: CGImage?
     @State private var scopeKind = "parade"
     @State private var curveChan = 0
+    // viewer
+    @State private var zoom: CGFloat = 1
+    @State private var pan = CGSize.zero
+    @State private var stageHover = false
+    // undo / redo (recipe snapshots, bursts coalesce at 0.8s)
+    @State private var undoStack: [Recipe] = []
+    @State private var redoStack: [Recipe] = []
+    @State private var lastEditTime = Date.distantPast
+    @State private var applyingHistory = false
+    // palettes
+    @State private var palette: Palette = .light
+    @State private var selWindow: UUID?
+    // grade versions
+    @State private var versions: [GradeVersion] = []
+    @State private var baselineVersions: [GradeVersion] = []
+    @State private var showVersionName = false
+    @State private var versionName = ""
 
-    /// letterboxed image rect inside the preview area
+    /// letterboxed image rect inside the preview area (zoom/pan applied)
     private func imageRect(in size: CGSize) -> CGRect {
         guard let image else { return .zero }
         let iw = CGFloat(image.width), ih = CGFloat(image.height)
         let pad: CGFloat = 10
         let avail = CGSize(width: size.width - pad * 2, height: size.height - pad * 2)
-        let sc = min(avail.width / iw, avail.height / ih)
+        let sc = min(avail.width / iw, avail.height / ih) * zoom
         let w = iw * sc, h = ih * sc
-        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+        return CGRect(x: (size.width - w) / 2 + pan.width,
+                      y: (size.height - h) / 2 + pan.height, width: w, height: h)
     }
 
     /// map a tap (view coords) into frame-normalized coords; crop-adjusted for
@@ -85,14 +161,20 @@ struct EditorView: View {
             w.kind = "circle"
             w.p = [fx, fy, 0.15, 0.15, 0, 0.4]
             recipe.windows.append(w)
+            selWindow = w.id
         case "grad":
             var w = PowerWindow()
             w.kind = "gradient"
             w.p = [0.0, fy, 1.0, fy, 0.5, 0]
             recipe.windows.append(w)
+            selWindow = w.id
         case "flare":
             recipe.flare[0] = nx
             recipe.flare[1] = ny
+        case "qpick", "qadd", "qsub":
+            if let c = samplePixel(nx: nx, ny: ny) {
+                qualifierPick(c, mode: retouchMode)
+            }
         default: break
         }
     }
@@ -105,12 +187,46 @@ struct EditorView: View {
                 .frame(minWidth: 300, idealWidth: 316, maxWidth: 380)
         }
         .background(Ara.bg0)
+        .background(shortcutLayer)
         .task { load() }
-        .onChange(of: recipe) { _, _ in
-            dirty = (recipe != baseline)
-            store.unsavedEdits[photo.path] = dirty ? recipe : nil
+        .onChange(of: recipe) { old, new in
+            dirty = (new != baseline) || versions != baselineVersions
+            store.unsavedEdits[photo.path] = dirty ? new : nil
+            if applyingHistory {
+                // programmatic recipe assignment (undo/redo/version apply)
+                applyingHistory = false
+            } else {
+                recordUndo(old)
+            }
             scheduleRender()
         }
+        .onChange(of: versions) { _, _ in
+            dirty = (recipe != baseline) || versions != baselineVersions
+            store.unsavedVersions[photo.path] = (versions != baselineVersions) ? versions : nil
+        }
+        .onChange(of: cmp) { _, m in
+            if m != .off { ensureBaseline() }
+        }
+        .alert("Save Version", isPresented: $showVersionName) {
+            TextField("Name", text: $versionName)
+            Button("Save") { commitVersion() }
+            Button("Cancel", role: .cancel) { versionName = "" }
+        }
+    }
+
+    /// Global-ish keys via invisible command buttons (Cmd-modified keys only —
+    /// bare digits/arrows go through the NSEvent monitor so text fields work).
+    private var shortcutLayer: some View {
+        Group {
+            Button("") { undo() }.keyboardShortcut("z", modifiers: .command)
+            Button("") { redo() }.keyboardShortcut("z", modifiers: [.command, .shift])
+            Button("") { save() }.keyboardShortcut("s", modifiers: .command)
+            Button("") { export() }.keyboardShortcut("e", modifiers: .command)
+            Button("") { applyPrevRecipe() }.keyboardShortcut("=", modifiers: .command)
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .allowsHitTesting(false)
     }
 
     // MARK: stage (image + filmstrip)
@@ -122,31 +238,60 @@ struct EditorView: View {
                     Ara.bg0
                     if let image {
                         let rect = imageRect(in: geo.size)
-                        Image(image, scale: 1, label: Text(photo.name))
-                            .resizable()
-                            .frame(width: rect.width, height: rect.height)
-                            .position(x: rect.midX, y: rect.midY)
-                            .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
-                            .overlay {
-                                Rectangle()
-                                    .stroke(Ara.border, lineWidth: 0.5)
+                        // compare modes: baseline underneath (or alone)
+                        if cmp != .off && cmp != .before {
+                            if let baselineImg {
+                                Image(baselineImg, scale: 1, label: Text("before"))
+                                    .resizable()
                                     .frame(width: rect.width, height: rect.height)
                                     .position(x: rect.midX, y: rect.midY)
                             }
+                        }
+                        if cmp == .before {
+                            if let baselineImg {
+                                Image(baselineImg, scale: 1, label: Text(photo.name))
+                                    .resizable()
+                                    .frame(width: rect.width, height: rect.height)
+                                    .position(x: rect.midX, y: rect.midY)
+                                    .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
+                            } else {
+                                ProgressView().tint(Ara.accent)
+                            }
+                        } else {
+                            Image(image, scale: 1, label: Text(photo.name))
+                                .resizable()
+                                .frame(width: rect.width, height: rect.height)
+                                .position(x: rect.midX, y: rect.midY)
+                                .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
+                                .mask(wipeMask(in: rect))
+                                .blendMode(cmp == .diff ? .difference : .normal)
+                                .opacity(cmp == .mix ? 0.5 : 1)
+                        }
+                        Rectangle()
+                            .stroke(Ara.border, lineWidth: 0.5)
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
                         retouchMarkers(in: rect)
-                        if compare {
-                            Text("BEFORE")
+                        if cmp == .wipeV || cmp == .wipeH {
+                            wipeDivider(in: rect)
+                        }
+                        if cmp != .off {
+                            Text(cmp.label.uppercased())
                                 .font(.system(size: 10, weight: .bold))
                                 .tracking(1.5)
                                 .padding(.horizontal, 8).padding(.vertical, 3)
                                 .background(Capsule().fill(Ara.accent))
                                 .foregroundStyle(Color.black.opacity(0.85))
-                                .position(x: rect.minX + 42, y: rect.minY + 16)
+                                .position(x: rect.minX + 46, y: rect.minY + 16)
                         }
                         if retouchMode != "off" {
                             toolBanner
                                 .position(x: rect.midX, y: rect.maxY - 20)
                         }
+                        zoomControls
+                            // pinned to the stage edge — the image rect grows
+                            // past the viewport once zoomed in
+                            .position(x: geo.size.width - 96, y: geo.size.height - 24)
                     } else {
                         ProgressView()
                             .tint(Ara.accent)
@@ -156,8 +301,178 @@ struct EditorView: View {
                 .gesture(SpatialTapGesture().onEnded { v in
                     placeAt(v.location, in: geo.size)
                 })
+                .gesture(DragGesture(minimumDistance: 4)
+                    .onChanged { g in stageDrag(g, in: geo.size) }
+                    .onEnded { _ in dragBase = nil })
+                .gesture(MagnifyGesture()
+                    .onChanged { v in
+                        if !pinching { pinching = true; pinchBase = zoom }
+                        zoom = (pinchBase * v.magnification).clamped(to: 0.5...8)
+                        if zoom <= 1 { pan = .zero }
+                    }
+                    .onEnded { _ in pinching = false })
+                .onTapGesture(count: 2) { _ in
+                    // only reached when the spatial tap for tools didn't claim it
+                    if retouchMode == "off" {
+                        zoom = zoom > 1.01 ? 1 : 2
+                        if zoom <= 1 { pan = .zero }
+                    }
+                }
+                .onHover { stageHover = $0 }
             }
             filmstrip
+        }
+        .onAppear {
+            keyMon.handler = { [self] ev in handleKey(ev) }
+            keyMon.install()
+            scrollMon.handler = { [self] ev in
+                guard stageHover else { return true }
+                let nz = (zoom * (1 + ev.scrollingDeltaY * 0.003)).clamped(to: 0.5...8)
+                if nz != zoom { zoom = nz; if zoom <= 1 { pan = .zero } }
+                return true
+            }
+            scrollMon.install()
+        }
+        .onDisappear {
+            keyMon.uninstall()
+            scrollMon.uninstall()
+        }
+    }
+
+    @State private var pinching = false
+    @State private var pinchBase: CGFloat = 1
+    @State private var dragBase: [Double]?
+    @State private var keyMon = KeyMonitor()
+    @State private var scrollMon = ScrollMonitor()
+
+    /// wipe divider line + drag handle
+    private func wipeDivider(in rect: CGRect) -> some View {
+        let isV = cmp == .wipeV
+        let pos = CGFloat(wipePos)
+        let line: Path = isV
+            ? Path { p in p.move(to: .init(x: rect.minX + pos * rect.width, y: rect.minY))
+                          p.addLine(to: .init(x: rect.minX + pos * rect.width, y: rect.maxY)) }
+            : Path { p in p.move(to: .init(x: rect.minX, y: rect.minY + pos * rect.height))
+                          p.addLine(to: .init(x: rect.maxX, y: rect.minY + pos * rect.height)) }
+        return ZStack {
+            line.stroke(.white.opacity(0.85), lineWidth: 1.5)
+            // invisible fat handle along the divider for dragging
+            if isV {
+                Rectangle().fill(.white.opacity(0.001))
+                    .frame(width: 18, height: rect.height)
+                    .position(x: rect.minX + pos * rect.width, y: rect.midY)
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                        wipePos = Double((g.location.x - rect.minX) / rect.width).clamped(to: 0.02...0.98)
+                    })
+            } else {
+                Rectangle().fill(.white.opacity(0.001))
+                    .frame(width: rect.width, height: 18)
+                    .position(x: rect.midX, y: rect.minY + pos * rect.height)
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                        wipePos = Double((g.location.y - rect.minY) / rect.height).clamped(to: 0.02...0.98)
+                    })
+            }
+        }
+    }
+
+    /// mask for the edited image, in the image's own layout space: the
+    /// divider's "before" half is knocked out so the baseline shows through.
+    private func wipeMask(in rect: CGRect) -> some View {
+        GeometryReader { g in
+            ZStack(alignment: .topLeading) {
+                Color.white
+                if cmp == .wipeV {
+                    Color.black
+                        .frame(width: g.size.width * CGFloat(wipePos), height: g.size.height)
+                } else if cmp == .wipeH {
+                    Color.black
+                        .frame(width: g.size.width, height: g.size.height * CGFloat(wipePos))
+                }
+            }
+        }
+    }
+
+    private var zoomControls: some View {
+        HStack(spacing: 4) {
+            IconAction(icon: "arrow.down.right.and.arrow.up.left") { zoom = 1; pan = .zero }
+            IconAction(icon: "minus") { zoom = max(0.5, zoom - 0.25); if zoom <= 1 { pan = .zero } }
+            Text(String(format: "%.0f%%", zoom * 100))
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundStyle(Ara.text1)
+                .frame(width: 34)
+            IconAction(icon: "plus") { zoom = min(8, zoom + 0.25) }
+            IconAction(icon: "1.magnifyingglass") { zoom = min(8, 1400 / CGFloat(image?.width ?? 1400)) }
+        }
+        .padding(.horizontal, 6).padding(.vertical, 4)
+        .background(Capsule().fill(.black.opacity(0.6))
+            .overlay(Capsule().stroke(Ara.hairline, lineWidth: 0.5)))
+    }
+
+    /// Stage drag routing: window move / gradient draw / pan when zoomed.
+    private func stageDrag(_ g: DragGesture.Value, in size: CGSize) {
+        if retouchMode == "window" || retouchMode == "grad" {
+            guard let (_, _, sfx, sfy) = frameCoord(g.startLocation, in: size),
+                  let (_, _, fx, fy) = frameCoord(g.location, in: size) else { return }
+            if retouchMode == "grad" {
+                // drag defines the gradient line start→current
+                if let i = recipe.windows.lastIndex(where: { $0.id == selWindow })
+                    ?? recipe.windows.indices.last {
+                    recipe.windows[i].kind = "gradient"
+                    recipe.windows[i].p = [sfx, sfy, fx, fy, 0.35, 0]
+                    selWindow = recipe.windows[i].id
+                }
+                return
+            }
+            // move the selected (or newest) window
+            guard let i = recipe.windows.lastIndex(where: { $0.id == selWindow })
+                ?? recipe.windows.indices.last else { return }
+            if dragBase == nil { dragBase = recipe.windows[i].p }
+            guard let base = dragBase else { return }
+            var p = base
+            let dfx = fx - sfx, dfy = fy - sfy
+            if recipe.windows[i].kind == "gradient" {
+                p[0] = base[0] + dfx; p[1] = base[1] + dfy
+                p[2] = base[2] + dfx; p[3] = base[3] + dfy
+            } else {
+                p[0] = (base[0] + dfx).clamped(to: 0...1)
+                p[1] = (base[1] + dfy).clamped(to: 0...1)
+            }
+            recipe.windows[i].p = p
+        } else if retouchMode == "off" && zoom > 1.001 {
+            if dragBase == nil { dragBase = [Double(pan.width), Double(pan.height)] }
+            guard let base = dragBase, base.count == 2 else { return }
+            pan = CGSize(width: base[0] + g.translation.width,
+                         height: base[1] + g.translation.height)
+        }
+    }
+
+    /// Bare-key shortcuts. Returns true when the key was consumed.
+    private func handleKey(_ ev: NSEvent) -> Bool {
+        // let text fields own the keyboard
+        if let fr = ev.window?.firstResponder, fr is NSTextView || fr is NSTextField {
+            return false
+        }
+        guard ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .isDisjoint(with: [.command, .control, .option]) else { return false }
+        if let c = ev.charactersIgnoringModifiers?.lowercased().first {
+            switch c {
+            case "0": setRating(0); return true
+            case "1"..."5": setRating(Int(String(c))!); return true
+            case "b": cmp = (cmp == .before ? .off : .before); return true
+            case "w":
+                cmp = cmp == .wipeV ? .wipeH : cmp == .wipeH ? .off : .wipeV
+                return true
+            default: break
+            }
+        }
+        switch ev.keyCode {
+        case 123: stepPhoto(-1); return true    // ←
+        case 124: stepPhoto(1); return true     // →
+        case 53:                                // esc
+            if retouchMode != "off" { retouchMode = "off"; return true }
+            if cmp != .off { cmp = .off; return true }
+            return false
+        default: return false
         }
     }
 
@@ -166,8 +481,11 @@ struct EditorView: View {
         let names: [String: String] = [
             "heal": "Heal — tap blemishes", "clone": pendingClone == nil ? "Clone — tap source" : "Clone — tap destination",
             "dodge": "Dodge — tap to lighten", "burn": "Burn — tap to darken",
-            "wbpick": "Pick WB — tap a neutral point", "window": "Window — tap centre",
-            "grad": "Gradient — tap edge line", "flare": "Flare — tap light position",
+            "wbpick": "Pick WB — tap a neutral point", "window": "Window — tap to add, drag to move",
+            "grad": "Gradient — drag to draw the line", "flare": "Flare — tap light position",
+            "qpick": "Qualifier — tap a colour to key it",
+            "qadd": "Qualifier + — tap to add to the key",
+            "qsub": "Qualifier − — tap to remove from the key",
         ]
         Text(names[retouchMode] ?? retouchMode)
             .font(.system(size: 10.5, weight: .medium))
@@ -184,7 +502,8 @@ struct EditorView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(store.filtered) { p in
-                            FilmCell(photo: p, selected: p == store.selection)
+                            FilmCell(photo: p, selected: p == store.selection,
+                                     dirty: store.unsavedEdits[p.path] != nil)
                                 .onTapGesture { store.selection = p }
                                 .id(p.id)
                         }
@@ -202,7 +521,7 @@ struct EditorView: View {
 
     private var inspector: some View {
         VStack(spacing: 0) {
-            // header: filename, stars, labels, compare
+            // header: filename, stars, labels, undo, compare
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Text(photo.name)
@@ -218,262 +537,77 @@ struct EditorView: View {
                             AraEngine.shared.setRating(path: photo.path, r)
                         }
                 }
-                HStack {
+                HStack(spacing: 6) {
                     LabelPicker(label: $label)
                         .onChange(of: label) { _, l in
                             AraEngine.shared.setLabel(path: photo.path, l)
                         }
                     Spacer()
-                    IconAction(icon: "eye", label: "Before", active: compare) {
-                        compare.toggle()
-                        rerender()
+                    IconAction(icon: "arrow.uturn.backward") { undo() }
+                        .opacity(undoStack.isEmpty ? 0.35 : 1)
+                    IconAction(icon: "arrow.uturn.forward") { redo() }
+                        .opacity(redoStack.isEmpty ? 0.35 : 1)
+                    Menu {
+                        ForEach(CompareMode.allCases) { m in
+                            Button {
+                                cmp = m
+                                if m != .off { ensureBaseline() }
+                            } label: {
+                                if cmp == m {
+                                    Label(m.label, systemImage: "checkmark")
+                                } else {
+                                    Text(m.label)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "rectangle.split.2x1")
+                                .font(.system(size: 11, weight: .medium))
+                            Text(cmp == .off ? "Compare" : cmp.label)
+                                .font(.system(size: 10.5, weight: .medium))
+                        }
+                        .foregroundStyle(cmp == .off ? Ara.text2 : Ara.accent)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(cmp == .off ? Ara.bg3 : Ara.accentSoft)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(
+                                cmp == .off ? Ara.hairline : Ara.accent.opacity(0.4), lineWidth: 0.5)))
                     }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
             .background(Ara.bg1)
             .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
 
+            paletteStrip
+
+            // palette header: title + per-palette reset (DaVinci palette reset)
+            HStack {
+                Text(palette.title.uppercased())
+                    .font(.system(size: 9.5, weight: .semibold)).tracking(1.2)
+                    .foregroundStyle(Ara.text2)
+                Spacer()
+                if paletteDirty(palette) {
+                    Button {
+                        resetPalette(palette)
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(Ara.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset this palette")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(Ara.bg1)
+            .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    Panel("Histogram") {
-                        if !hist.isEmpty {
-                            HistogramView(hist: hist).frame(height: 84)
-                        } else {
-                            Rectangle().fill(Ara.bg3).frame(height: 84)
-                                .overlay(ProgressView().tint(Ara.text3))
-                        }
-                    }
-                    Panel("Scopes", expanded: $showScopes) {
-                        SegPicker([("parade", "Parade"), ("vector", "Vector"), ("cie", "CIE")],
-                                  selection: $scopeKind)
-                        ScopesView(wave: wave, vec: vec, cie: cie, kind: scopeKind)
-                            .frame(height: 128)
-                    }
-                    Panel("Light", trailing: {
-                        HStack(spacing: 4) {
-                            ToolChip(label: "Auto", icon: "wand.and.stars") {
-                                recipe.wb_mode = .auto
-                                recipe.auto_exposure = true
-                                recipe.auto_contrast = true
-                            }
-                        }
-                    }) {
-                        HStack(spacing: 6) {
-                            Toggle("Auto Exp", isOn: $recipe.auto_exposure)
-                                .font(.system(size: 10)).foregroundStyle(Ara.text2)
-                                .controlSize(.mini)
-                            Toggle("Auto Contrast", isOn: $recipe.auto_contrast)
-                                .font(.system(size: 10)).foregroundStyle(Ara.text2)
-                                .controlSize(.mini)
-                        }
-                        SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
-                        SliderRow("Contrast", $recipe.contrast, -1...1)
-                        SliderRow("Pivot", $recipe.pivot, 0.05...0.5, reset: 0.18)
-                        SliderRow("Highlights", $recipe.highlights, -1...1)
-                        SliderRow("Shadows", $recipe.shadows, -1...1)
-                        SliderRow("Whites", $recipe.whites, -1...1)
-                        SliderRow("Blacks", $recipe.blacks, -1...1)
-                        SliderRow("HL Roll", $recipe.highlight_rolloff, 0.5...2, reset: 1.0)
-                        SliderRow("SH Roll", $recipe.shadow_rolloff, 0.5...2, reset: 1.0)
-                    }
-                    Panel("Color", trailing: {
-                        ToolChip(label: "Pick WB", icon: "eyedropper", active: retouchMode == "wbpick") {
-                            retouchMode = retouchMode == "wbpick" ? "off" : "wbpick"
-                        }
-                    }) {
-                        SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
-                                   (.manual, "Manual"), (.pick, "Pick")],
-                                  selection: $recipe.wb_mode)
-                        SliderRow("Temp", $recipe.temperature, -1...1)
-                        SliderRow("Tint", $recipe.tint, -1...1)
-                        SliderRow("Saturation", $recipe.saturation, -1...1)
-                        SliderRow("Vibrance", $recipe.vibrance, -1...1)
-                    }
-                    Panel("Wheels", trailing: { LookPicker(look: $recipe.look) }) {
-                        HStack(spacing: 6) {
-                            ColorWheel(title: "Lift", v: $recipe.lift, center: 0)
-                            ColorWheel(title: "Gamma", v: $recipe.gamma, center: 1)
-                            ColorWheel(title: "Gain", v: $recipe.gain, center: 1)
-                            ColorWheel(title: "Offset", v: $recipe.offset, center: 0)
-                        }
-                        Text("SPLIT TONE")
-                            .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
-                            .foregroundStyle(Ara.text3)
-                        SliderRow("Shd Hue", $recipe.shadow_hue, 0...1, reset: 0.55)
-                        SliderRow("Shd Sat", $recipe.shadow_sat, 0...1)
-                        SliderRow("Mid Hue", $recipe.midtone_hue, 0...1, reset: 0.55)
-                        SliderRow("Mid Sat", $recipe.midtone_sat, 0...1)
-                        SliderRow("Hi Hue", $recipe.highlight_hue, 0...1, reset: 0.08)
-                        SliderRow("Hi Sat", $recipe.highlight_sat, 0...1)
-                    }
-                    Panel("Zones") {
-                        ZoneRow("Dark", $recipe.z_dark)
-                        ZoneRow("Shadow", $recipe.z_shadow)
-                        ZoneRow("Light", $recipe.z_light)
-                        ZoneRow("Global", $recipe.z_global)
-                    }
-                    Panel("Curves") {
-                        SegPicker([(0, "Y"), (1, "R"), (2, "G"), (3, "B"),
-                                   (4, "H·H"), (5, "H·S"), (6, "H·L"), (7, "L·S"), (8, "S·S")],
-                                  selection: $curveChan)
-                        CurveEditor(points: curveBinding(curveChan),
-                                    tint: curveTint(curveChan))
-                            .frame(height: 132)
-                        HStack {
-                            ToolChip(label: "Clear", icon: "xmark") {
-                                curveBinding(curveChan).wrappedValue = []
-                            }
-                            Spacer()
-                            Text(curveName(curveChan))
-                                .font(.system(size: 9.5)).foregroundStyle(Ara.text3)
-                        }
-                    }
-                    Panel("Qualifier") {
-                        HStack {
-                            Text("Enable").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
-                            Spacer()
-                            Toggle("", isOn: $recipe.q_enabled)
-                                .labelsHidden().controlSize(.mini).tint(Ara.accent)
-                                .onChange(of: recipe.q_enabled) { _, on in
-                                    if !on { recipe.qh[1] = 0 }
-                                    else if recipe.qh[1] == 0 { recipe.qh[1] = 0.1 }
-                                }
-                        }
-                        if recipe.q_enabled {
-                            SliderRow("Hue Ctr", $recipe.qh[0], 0...1)
-                            SliderRow("Hue Wid", $recipe.qh[1], 0...0.5, reset: 0.1)
-                            SliderRow("Hue Soft", $recipe.qh[2], 0.01...0.4, reset: 0.1)
-                            SliderRow("Sat Lo", $recipe.qs[0], 0...1)
-                            SliderRow("Sat Hi", $recipe.qs[1], 0...1, reset: 1)
-                            SliderRow("Lum Lo", $recipe.ql[0], 0...1)
-                            SliderRow("Lum Hi", $recipe.ql[1], 0...1, reset: 1)
-                            Divider().overlay(Ara.hairline)
-                            SliderRow("Hue Δ", $recipe.qadj[0], -0.5...0.5)
-                            SliderRow("Sat Δ", $recipe.qadj[1], -1...1)
-                            SliderRow("Lum Δ", $recipe.qadj[2], -1...1)
-                            SliderRow("Temp Δ", $recipe.qadj[3], -1...1)
-                            HStack {
-                                Text("Invert mask").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
-                                Spacer()
-                                Toggle("", isOn: $recipe.q_invert)
-                                    .labelsHidden().controlSize(.mini).tint(Ara.accent)
-                            }
-                        }
-                    }
-                    Panel("Windows", trailing: {
-                        HStack(spacing: 4) {
-                            ToolChip(label: "Circle", icon: "plus.circle", active: retouchMode == "window") {
-                                retouchMode = retouchMode == "window" ? "off" : "window"
-                            }
-                            ToolChip(label: "Grad", icon: "plus.rectangle", active: retouchMode == "grad") {
-                                retouchMode = retouchMode == "grad" ? "off" : "grad"
-                            }
-                        }
-                    }) {
-                        if recipe.windows.isEmpty {
-                            Text("Add a circle or gradient window, then tap the image to place it.")
-                                .font(.system(size: 10)).foregroundStyle(Ara.text3)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        ForEach(recipe.windows) { w in
-                            if let i = recipe.windows.firstIndex(where: { $0.id == w.id }) {
-                                WindowRow(w: $recipe.windows[i]) {
-                                    recipe.windows.remove(at: i)
-                                }
-                            }
-                        }
-                    }
-                    Panel("Mixer") {
-                        VStack(spacing: 5) {
-                            ForEach(0..<3, id: \.self) { row in
-                                HStack(spacing: 5) {
-                                    Text(["R′", "G′", "B′"][row])
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundStyle([Color.red.opacity(0.9), .green.opacity(0.9), .blue.opacity(0.9)][row])
-                                        .frame(width: 14, alignment: .leading)
-                                    MixRow($recipe.mixer, row: row)
-                                }
-                            }
-                        }
-                        HStack {
-                            Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { recipe.mono != [0, 0, 0] },
-                                set: { recipe.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0] }
-                            ))
-                            .labelsHidden().controlSize(.mini).tint(Ara.accent)
-                        }
-                        if recipe.mono != [0, 0, 0] {
-                            TriRow("Mono", $recipe.mono, 0...1)
-                        }
-                    }
-                    Panel("Retouch") {
-                        SegPicker([("off", "Off"), ("heal", "Heal"), ("clone", "Clone"),
-                                   ("dodge", "Dodge"), ("burn", "Burn")],
-                                  selection: $retouchMode)
-                        if retouchMode == "heal" {
-                            SliderRow("Size", $spotSize, 0.01...0.15, reset: 0.05)
-                        } else if retouchMode == "clone" {
-                            SliderRow("Radius", $cloneRadius, 0.02...0.2, reset: 0.06)
-                            if pendingClone != nil {
-                                Text("Tap destination")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(Ara.accent)
-                            }
-                        } else if retouchMode == "dodge" || retouchMode == "burn" {
-                            SliderRow("Radius", $lightRadius, 0.05...0.6, reset: 0.25)
-                            SliderRow("EV", $lightEV, 0...2, reset: 0.5)
-                        }
-                        if !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty {
-                            ForEach(recipe.spots.indices, id: \.self) { i in
-                                MarkRow("Spot \(i + 1)", icon: "bandage") { recipe.spots.remove(at: i) }
-                            }
-                            ForEach(recipe.clones.indices, id: \.self) { i in
-                                MarkRow("Clone \(i + 1)", icon: "point.topleft.down.to.point.bottomright.curvepath") {
-                                    recipe.clones.remove(at: i)
-                                }
-                            }
-                            ForEach(recipe.lights.indices, id: \.self) { i in
-                                MarkRow("Light \(i + 1)  \(recipe.lights[i][3] >= 0 ? "+" : "")\(String(format: "%.1f", recipe.lights[i][3]))EV",
-                                        icon: "sun.max") {
-                                    recipe.lights.remove(at: i)
-                                }
-                            }
-                        }
-                        Text("CROP")
-                            .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
-                            .foregroundStyle(Ara.text3)
-                            .padding(.top, 2)
-                        SliderRow("Left", $recipe.crop[0], 0...0.45)
-                        SliderRow("Top", $recipe.crop[1], 0...0.45)
-                        SliderRow("Right", $recipe.crop[2], 0...0.45)
-                        SliderRow("Bottom", $recipe.crop[3], 0...0.45)
-                    }
-                    Panel("Detail") {
-                        SliderRow("Sharpen", $recipe.sharpen, 0...1)
-                        SliderRow("Noise", $recipe.noise_luma, 0...1)
-                        SliderRow("NR Chroma", $recipe.noise_chroma, 0...1)
-                        SliderRow("Deband", $recipe.deband, 0...1)
-                        SliderRow("CA Fix", $recipe.ca_fix, 0...1)
-                        SliderRow("Beauty", $recipe.beauty, 0...1)
-                    }
-                    Panel("Effects", trailing: {
-                        ToolChip(label: "Place", icon: "plus", active: retouchMode == "flare") {
-                            retouchMode = retouchMode == "flare" ? "off" : "flare"
-                        }
-                    }) {
-                        SliderRow("Clarity", $recipe.clarity, -1...1)
-                        SliderRow("Vignette", $recipe.vignette, -1...1)
-                        SliderRow("Grain", $recipe.grain, 0...1)
-                        SliderRow("Glow", $recipe.glow, 0...1)
-                        SliderRow("Flare", $recipe.flare[2], 0...1)
-                        SliderRow("Fl Hue", $recipe.flare[3], 0...1)
-                    }
-                    Panel("Transform") {
-                        SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
-                    }
+                    paletteContent
                     Color.clear.frame(height: 4)
                 }
                 .padding(10)
@@ -484,6 +618,439 @@ struct EditorView: View {
         }
         .background(Ara.bg1)
         .overlay(alignment: .leading) { Ara.hairline.frame(width: 1) }
+    }
+
+    /// DaVinci palette tab strip: icon per palette, underline when active,
+    /// amber dot top-right when that section has non-default values.
+    private var paletteStrip: some View {
+        HStack(spacing: 0) {
+            ForEach(Palette.allCases) { p in
+                Button {
+                    palette = p
+                    if p == .windows || p == .qualifier { /* keep tool context */ }
+                } label: {
+                    VStack(spacing: 2) {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: p.icon)
+                                .font(.system(size: 12))
+                                .foregroundStyle(palette == p ? Ara.accent : Ara.text2)
+                                .frame(width: 18, height: 16)
+                            if paletteDirty(p) {
+                                Circle().fill(Ara.accent)
+                                    .frame(width: 4, height: 4)
+                                    .offset(x: 3, y: -2)
+                            }
+                        }
+                        Rectangle()
+                            .fill(palette == p ? Ara.accent : .clear)
+                            .frame(height: 2)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 5)
+                    .background(palette == p ? Ara.bg2 : .clear)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(p.title)
+            }
+        }
+        .padding(.horizontal, 4)
+        .background(Ara.bg1)
+        .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+    }
+
+    @ViewBuilder
+    private var paletteContent: some View {
+        switch palette {
+        case .meters: metersPalette
+        case .light: lightPalette
+        case .wheels: wheelsPalette
+        case .curves: curvesPalette
+        case .zones: zonesPalette
+        case .qualifier: qualifierPalette
+        case .windows: windowsPalette
+        case .mixer: mixerPalette
+        case .retouch: retouchPalette
+        case .detail: detailPalette
+        case .fx: fxPalette
+        case .xform: xformPalette
+        case .versions: versionsPalette
+        }
+    }
+
+    private var metersPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Histogram") {
+                if !hist.isEmpty {
+                    HistogramView(hist: hist).frame(height: 84)
+                } else {
+                    Rectangle().fill(Ara.bg3).frame(height: 84)
+                        .overlay(ProgressView().tint(Ara.text3))
+                }
+            }
+            Panel("Scopes") {
+                SegPicker([("parade", "Parade"), ("vector", "Vector"), ("cie", "CIE")],
+                          selection: $scopeKind)
+                ScopesView(wave: wave, vec: vec, cie: cie, kind: scopeKind)
+                    .frame(height: 128)
+            }
+        }
+    }
+
+    private var lightPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("White Balance", trailing: {
+                ToolChip(label: "Pick", icon: "eyedropper", active: retouchMode == "wbpick") {
+                    retouchMode = retouchMode == "wbpick" ? "off" : "wbpick"
+                }
+            }) {
+                SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
+                           (.manual, "Manual"), (.pick, "Pick")],
+                          selection: $recipe.wb_mode)
+                SliderRow("Temp", $recipe.temperature, -1...1)
+                SliderRow("Tint", $recipe.tint, -1...1)
+            }
+            Panel("Tone", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") {
+                    recipe.wb_mode = .auto
+                    recipe.auto_exposure = true
+                    recipe.auto_contrast = true
+                }
+            }) {
+                HStack(spacing: 6) {
+                    Toggle("Auto Exp", isOn: $recipe.auto_exposure)
+                        .font(.system(size: 10)).foregroundStyle(Ara.text2)
+                        .controlSize(.mini)
+                    Toggle("Auto Contrast", isOn: $recipe.auto_contrast)
+                        .font(.system(size: 10)).foregroundStyle(Ara.text2)
+                        .controlSize(.mini)
+                }
+                SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
+                SliderRow("Contrast", $recipe.contrast, -1...1)
+                SliderRow("Pivot", $recipe.pivot, 0.05...0.5, reset: 0.18)
+                SliderRow("Highlights", $recipe.highlights, -1...1)
+                SliderRow("Shadows", $recipe.shadows, -1...1)
+                SliderRow("Whites", $recipe.whites, -1...1)
+                SliderRow("Blacks", $recipe.blacks, -1...1)
+                SliderRow("HL Roll", $recipe.highlight_rolloff, 0.5...2, reset: 1.0)
+                SliderRow("SH Roll", $recipe.shadow_rolloff, 0.5...2, reset: 1.0)
+            }
+            Panel("Color") {
+                SliderRow("Saturation", $recipe.saturation, -1...1)
+                SliderRow("Vibrance", $recipe.vibrance, -1...1)
+            }
+        }
+    }
+
+    private var wheelsPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Primaries", trailing: { LookPicker(look: $recipe.look) }) {
+                HStack(spacing: 6) {
+                    ColorWheel(title: "Lift", v: $recipe.lift, center: 0)
+                    ColorWheel(title: "Gamma", v: $recipe.gamma, center: 1)
+                    ColorWheel(title: "Gain", v: $recipe.gain, center: 1)
+                    ColorWheel(title: "Offset", v: $recipe.offset, center: 0)
+                }
+            }
+            Panel("Split Tone") {
+                SliderRow("Shd Hue", $recipe.shadow_hue, 0...1, reset: 0.55)
+                SliderRow("Shd Sat", $recipe.shadow_sat, 0...1)
+                SliderRow("Mid Hue", $recipe.midtone_hue, 0...1, reset: 0.55)
+                SliderRow("Mid Sat", $recipe.midtone_sat, 0...1)
+                SliderRow("Hi Hue", $recipe.highlight_hue, 0...1, reset: 0.08)
+                SliderRow("Hi Sat", $recipe.highlight_sat, 0...1)
+            }
+        }
+    }
+
+    private var curvesPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Curves") {
+                SegPicker([(0, "Y"), (1, "R"), (2, "G"), (3, "B"),
+                           (4, "H·H"), (5, "H·S"), (6, "H·L"), (7, "L·S"), (8, "S·S")],
+                          selection: $curveChan)
+                CurveEditor(points: curveBinding(curveChan),
+                            tint: curveTint(curveChan), hist: hist.count > 3 ? hist[3] : [])
+                    .frame(height: 132)
+                HStack {
+                    ToolChip(label: "Clear", icon: "xmark") {
+                        curveBinding(curveChan).wrappedValue = []
+                    }
+                    Spacer()
+                    Text(curveName(curveChan))
+                        .font(.system(size: 9.5)).foregroundStyle(Ara.text3)
+                }
+            }
+        }
+    }
+
+    private var zonesPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("HDR Zones") {
+                ZoneRow("Dark", $recipe.z_dark)
+                ZoneRow("Shadow", $recipe.z_shadow)
+                ZoneRow("Light", $recipe.z_light)
+                ZoneRow("Global", $recipe.z_global)
+            }
+        }
+    }
+
+    /// DaVinci qualifier: eyedroppers + HSL gradient range bars + finesse.
+    private var qualifierPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Qualifier", trailing: {
+                Toggle("", isOn: $recipe.q_enabled)
+                    .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                    .onChange(of: recipe.q_enabled) { _, on in
+                        if !on { recipe.qh[1] = 0; recipe.q_show = false }
+                        else if recipe.qh[1] == 0 { recipe.qh[1] = 0.1 }
+                    }
+            }) {
+                // eyedropper row: pick / add / subtract
+                HStack(spacing: 6) {
+                    Text("Pick").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                    ToolChip(label: "New", icon: "eyedropper",
+                             active: retouchMode == "qpick") {
+                        retouchMode = retouchMode == "qpick" ? "off" : "qpick"
+                    }
+                    ToolChip(label: "+", icon: "plus.circle",
+                             active: retouchMode == "qadd") {
+                        retouchMode = retouchMode == "qadd" ? "off" : "qadd"
+                    }
+                    ToolChip(label: "−", icon: "minus.circle",
+                             active: retouchMode == "qsub") {
+                        retouchMode = retouchMode == "qsub" ? "off" : "qsub"
+                    }
+                    Spacer()
+                    ToolChip(label: "View", icon: "eye", active: recipe.q_show) {
+                        recipe.q_show.toggle()
+                    }
+                    .help("Highlight: show the matte — keyed area in colour, rest grey")
+                }
+                if recipe.q_enabled {
+                    // HSL gradient bars
+                    RangeBar(title: "Hue",
+                             lo: Binding(
+                                 get: { (recipe.qh[0] - recipe.qh[1]).clamped(to: 0...1) },
+                                 set: { v in
+                                     let hi = (recipe.qh[0] + recipe.qh[1]).clamped(to: 0...1)
+                                     recipe.qh[0] = (v + hi) / 2
+                                     recipe.qh[1] = max(0.002, (hi - v) / 2)
+                                 }),
+                             hi: Binding(
+                                 get: { (recipe.qh[0] + recipe.qh[1]).clamped(to: 0...1) },
+                                 set: { v in
+                                     let lo = (recipe.qh[0] - recipe.qh[1]).clamped(to: 0...1)
+                                     recipe.qh[0] = (lo + v) / 2
+                                     recipe.qh[1] = max(0.002, (v - lo) / 2)
+                                 }),
+                             gradient: LinearGradient(
+                                 colors: (0...12).map { Color(hue: Double($0) / 12, saturation: 0.8, brightness: 0.9) },
+                                 startPoint: .leading, endPoint: .trailing))
+                    RangeBar(title: "Sat",
+                             lo: $recipe.qs[0], hi: $recipe.qs[1],
+                             gradient: LinearGradient(colors: [.gray.opacity(0.4), .orange],
+                                                      startPoint: .leading, endPoint: .trailing))
+                    RangeBar(title: "Lum",
+                             lo: $recipe.ql[0], hi: $recipe.ql[1],
+                             gradient: LinearGradient(colors: [.black, .white],
+                                                      startPoint: .leading, endPoint: .trailing))
+                    SliderRow("Hue Soft", $recipe.qh[2], 0.01...0.4, reset: 0.1)
+                    SliderRow("Sat Soft", $recipe.qs[2], 0.01...0.4, reset: 0.1)
+                    SliderRow("Lum Soft", $recipe.ql[2], 0.01...0.4, reset: 0.1)
+                    Text("MATTE FINESSE")
+                        .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
+                        .foregroundStyle(Ara.text3)
+                    SliderRow("Clean Blk", $recipe.q_clean[0], 0...1)
+                    SliderRow("Clean Wht", $recipe.q_clean[1], 0...1, reset: 1)
+                    SliderRow("Blur", $recipe.q_blur, 0...1)
+                    HStack {
+                        Text("Invert mask").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                        Spacer()
+                        Toggle("", isOn: $recipe.q_invert)
+                            .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                    }
+                    Text("ADJUST INSIDE KEY")
+                        .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
+                        .foregroundStyle(Ara.text3)
+                    SliderRow("Hue Δ", $recipe.qadj[0], -0.5...0.5)
+                    SliderRow("Sat Δ", $recipe.qadj[1], -1...1)
+                    SliderRow("Lum Δ", $recipe.qadj[2], -1...1)
+                    SliderRow("Temp Δ", $recipe.qadj[3], -1...1)
+                }
+            }
+        }
+    }
+
+    private var windowsPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Power Windows", trailing: {
+                HStack(spacing: 4) {
+                    ToolChip(label: "Circle", icon: "plus.circle", active: retouchMode == "window") {
+                        retouchMode = retouchMode == "window" ? "off" : "window"
+                        if retouchMode == "window" { palette = .windows }
+                    }
+                    ToolChip(label: "Grad", icon: "plus.rectangle", active: retouchMode == "grad") {
+                        retouchMode = retouchMode == "grad" ? "off" : "grad"
+                    }
+                }
+            }) {
+                if recipe.windows.isEmpty {
+                    Text("Add a circle or gradient window, then tap or drag on the image. " +
+                         "Select a window row, then drag on the image to move it.")
+                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(recipe.windows) { w in
+                    if let i = recipe.windows.firstIndex(where: { $0.id == w.id }) {
+                        WindowRow(w: $recipe.windows[i],
+                                  selected: selWindow == w.id,
+                                  onSelect: { selWindow = w.id }) {
+                            if selWindow == w.id { selWindow = nil }
+                            recipe.windows.remove(at: i)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var mixerPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("RGB Mixer") {
+                VStack(spacing: 5) {
+                    ForEach(0..<3, id: \.self) { row in
+                        HStack(spacing: 5) {
+                            Text(["R′", "G′", "B′"][row])
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle([Color.red.opacity(0.9), .green.opacity(0.9), .blue.opacity(0.9)][row])
+                                .frame(width: 14, alignment: .leading)
+                            MixRow($recipe.mixer, row: row)
+                        }
+                    }
+                }
+                HStack {
+                    Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { recipe.mono != [0, 0, 0] },
+                        set: { recipe.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0] }
+                    ))
+                    .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                }
+                if recipe.mono != [0, 0, 0] {
+                    TriRow("Mono", $recipe.mono, 0...1)
+                }
+            }
+        }
+    }
+
+    private var retouchPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Retouch") {
+                SegPicker([("off", "Off"), ("heal", "Heal"), ("clone", "Clone"),
+                           ("dodge", "Dodge"), ("burn", "Burn")],
+                          selection: $retouchMode)
+                if retouchMode == "heal" {
+                    SliderRow("Size", $spotSize, 0.01...0.15, reset: 0.05)
+                } else if retouchMode == "clone" {
+                    SliderRow("Radius", $cloneRadius, 0.02...0.2, reset: 0.06)
+                    if pendingClone != nil {
+                        Text("Tap destination")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Ara.accent)
+                    }
+                } else if retouchMode == "dodge" || retouchMode == "burn" {
+                    SliderRow("Radius", $lightRadius, 0.05...0.6, reset: 0.25)
+                    SliderRow("EV", $lightEV, 0...2, reset: 0.5)
+                }
+                if !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty {
+                    ForEach(recipe.spots.indices, id: \.self) { i in
+                        MarkRow("Spot \(i + 1)", icon: "bandage") { recipe.spots.remove(at: i) }
+                    }
+                    ForEach(recipe.clones.indices, id: \.self) { i in
+                        MarkRow("Clone \(i + 1)", icon: "point.topleft.down.to.point.bottomright.curvepath") {
+                            recipe.clones.remove(at: i)
+                        }
+                    }
+                    ForEach(recipe.lights.indices, id: \.self) { i in
+                        MarkRow("Light \(i + 1)  \(recipe.lights[i][3] >= 0 ? "+" : "")\(String(format: "%.1f", recipe.lights[i][3]))EV",
+                                icon: "sun.max") {
+                            recipe.lights.remove(at: i)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var detailPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Detail") {
+                SliderRow("Sharpen", $recipe.sharpen, 0...1)
+                SliderRow("Noise", $recipe.noise_luma, 0...1)
+                SliderRow("NR Chroma", $recipe.noise_chroma, 0...1)
+                SliderRow("Deband", $recipe.deband, 0...1)
+                SliderRow("CA Fix", $recipe.ca_fix, 0...1)
+                SliderRow("Beauty", $recipe.beauty, 0...1)
+            }
+        }
+    }
+
+    private var fxPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Effects", trailing: {
+                ToolChip(label: "Place", icon: "plus", active: retouchMode == "flare") {
+                    retouchMode = retouchMode == "flare" ? "off" : "flare"
+                }
+            }) {
+                SliderRow("Clarity", $recipe.clarity, -1...1)
+                SliderRow("Vignette", $recipe.vignette, -1...1)
+                SliderRow("Grain", $recipe.grain, 0...1)
+                SliderRow("Glow", $recipe.glow, 0...1)
+                SliderRow("Flare", $recipe.flare[2], 0...1)
+                SliderRow("Fl Hue", $recipe.flare[3], 0...1)
+            }
+        }
+    }
+
+    private var xformPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Transform") {
+                SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
+            }
+            Panel("Crop") {
+                SliderRow("Left", $recipe.crop[0], 0...0.45)
+                SliderRow("Top", $recipe.crop[1], 0...0.45)
+                SliderRow("Right", $recipe.crop[2], 0...0.45)
+                SliderRow("Bottom", $recipe.crop[3], 0...0.45)
+            }
+        }
+    }
+
+    /// DaVinci grade versions / stills: named snapshots of the current recipe,
+    /// persisted inside the sidecar file on Save.
+    private var versionsPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Versions", trailing: {
+                ToolChip(label: "Save", icon: "plus") {
+                    versionName = ""
+                    showVersionName = true
+                }
+            }) {
+                if versions.isEmpty {
+                    Text("Save a named snapshot of the current grade, then click it " +
+                         "to jump back. Versions persist inside the .araware.json sidecar.")
+                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(versions) { v in
+                    VersionRow(v: v, active: v.recipe == recipe,
+                               onApply: { recipe = v.recipe },
+                               onDelete: { versions.removeAll { $0.id == v.id } })
+                }
+            }
+        }
     }
 
     private var actionBar: some View {
@@ -539,9 +1106,18 @@ struct EditorView: View {
     private func load() {
         let sc = AraEngine.shared.sidecar(path: photo.path)
         baseline = sc.recipe
+        baselineVersions = sc.versions
+        versions = store.unsavedVersions[photo.path] ?? sc.versions
         recipe = store.unsavedEdits[photo.path] ?? sc.recipe
         rating = sc.rating
         label = sc.label
+        image = nil
+        baselineImg = nil
+        undoStack.removeAll()
+        redoStack.removeAll()
+        cmp = .off
+        zoom = 1
+        pan = .zero
         rerender()
     }
 
@@ -550,15 +1126,298 @@ struct EditorView: View {
         sc.rating = rating
         sc.label = label
         sc.recipe = recipe
+        sc.versions = versions
         let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
         let ok = AraEngine.shared.writeSidecar(path: photo.path, sc)
         status = ok ? "Saved \(stem).araware.json"
                     : "Save failed: \(AraEngine.shared.lastError)"
         if ok {
             baseline = recipe
+            baselineVersions = versions
+            baselineImg = nil   // re-render compare base with the saved recipe
             store.unsavedEdits.removeValue(forKey: photo.path)
+            store.unsavedVersions.removeValue(forKey: photo.path)
             dirty = false
         }
+    }
+
+    // MARK: undo / redo
+
+    /// Called from the recipe onChange with the pre-edit value. Edits within
+    /// 0.8s of the previous change coalesce into one undo step (slider drags).
+    private func recordUndo(_ old: Recipe) {
+        if applyingHistory { return }
+        let now = Date()
+        if now.timeIntervalSince(lastEditTime) > 0.8 {
+            undoStack.append(old)
+            if undoStack.count > 80 { undoStack.removeFirst() }
+        }
+        lastEditTime = now
+        redoStack.removeAll()
+    }
+
+    private func undo() {
+        guard let prev = undoStack.popLast() else { status = "Nothing to undo"; return }
+        applyingHistory = true   // cleared by the next recipe onChange
+        redoStack.append(recipe)
+        recipe = prev
+        status = "Undo"
+    }
+
+    private func redo() {
+        guard let next = redoStack.popLast() else { status = "Nothing to redo"; return }
+        applyingHistory = true
+        undoStack.append(recipe)
+        recipe = next
+        status = "Redo"
+    }
+
+    // MARK: compare baseline render
+
+    /// Render the saved-state image once for wipe/before/diff modes.
+    private func ensureBaseline() {
+        if baselineImg != nil { return }
+        let r = baseline
+        Task.detached { [path = photo.path] in
+            let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1400).0 }
+            await MainActor.run { baselineImg = img }
+        }
+    }
+
+    // MARK: qualifier picking
+
+    /// Read a 5×5 mean pixel from the displayed render at dst-normalized coords.
+    private func samplePixel(nx: Double, ny: Double) -> (r: Double, g: Double, b: Double)? {
+        guard let image, let provider = image.dataProvider,
+              let cf = provider.data else { return nil }
+        let data = cf as Data
+        let w = image.width, h = image.height
+        let px = min(max(Int(nx * Double(w)), 0), w - 1)
+        let py = min(max(Int(ny * Double(h)), 0), h - 1)
+        var r = 0.0, g = 0.0, b = 0.0, n = 0
+        for dy in -2...2 {
+            for dx in -2...2 {
+                let x = px + dx, y = py + dy
+                guard x >= 0, x < w, y >= 0, y < h else { continue }
+                let o = (y * w + x) * 4
+                if o + 2 < data.count {
+                    r += Double(data[o]); g += Double(data[o + 1]); b += Double(data[o + 2]); n += 1
+                }
+            }
+        }
+        guard n > 0 else { return nil }
+        return (r / Double(n) / 255, g / Double(n) / 255, b / Double(n) / 255)
+    }
+
+    private func rgbHsv(_ c: (Double, Double, Double)) -> (h: Double, s: Double, v: Double) {
+        let (r, g, b) = c
+        let mx = max(r, g, b), mn = min(r, g, b), d = mx - mn
+        var h = 0.0
+        if d > 1e-6 {
+            if mx == r { h = ((g - b) / d).truncatingRemainder(dividingBy: 6) }
+            else if mx == g { h = (b - r) / d + 2 }
+            else { h = (r - g) / d + 4 }
+            h /= 6
+            if h < 0 { h += 1 }
+        }
+        return (h, mx > 1e-6 ? d / mx : 0, mx)
+    }
+
+    private func hueDist(_ a: Double, _ b: Double) -> Double {
+        let d = abs(a - b)
+        return min(d, 1 - d)
+    }
+
+    /// Apply an eyedropper sample to the qualifier ranges.
+    private func qualifierPick(_ c: (Double, Double, Double), mode: String) {
+        let (hh, ss, _) = rgbHsv(c)
+        let l = 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
+        switch mode {
+        case "qpick":
+            recipe.qh = [hh, 0.08, 0.08]
+            recipe.qs = [max(0, ss - 0.18), min(1, ss + 0.18), 0.12]
+            recipe.ql = [max(0, l - 0.28), min(1, l + 0.28), 0.18]
+            recipe.q_enabled = true
+            status = String(format: "Keyed h=%.2f s=%.2f l=%.2f", hh, ss, l)
+        case "qadd":
+            recipe.qh[1] = max(recipe.qh[1], hueDist(hh, recipe.qh[0]) + 0.03)
+            recipe.qs[0] = min(recipe.qs[0], ss)
+            recipe.qs[1] = max(recipe.qs[1], ss)
+            recipe.ql[0] = min(recipe.ql[0], l)
+            recipe.ql[1] = max(recipe.ql[1], l)
+        case "qsub":
+            if hueDist(hh, recipe.qh[0]) < recipe.qh[1] {
+                recipe.qh[1] = max(0.004, hueDist(hh, recipe.qh[0]) - 0.02)
+            }
+            if ss > recipe.qs[0] && ss < recipe.qs[1] {
+                if ss - recipe.qs[0] < recipe.qs[1] - ss {
+                    recipe.qs[0] = min(1, ss + 0.02)
+                } else {
+                    recipe.qs[1] = max(0, ss - 0.02)
+                }
+            }
+            if l > recipe.ql[0] && l < recipe.ql[1] {
+                if l - recipe.ql[0] < recipe.ql[1] - l {
+                    recipe.ql[0] = min(1, l + 0.02)
+                } else {
+                    recipe.ql[1] = max(0, l - 0.02)
+                }
+            }
+        default: break
+        }
+        recipe.q_enabled = true
+    }
+
+    // MARK: palette bookkeeping
+
+    /// Amber-dot indicator: does this palette hold non-default values?
+    private func paletteDirty(_ p: Palette) -> Bool {
+        let d = Recipe()
+        switch p {
+        case .light:
+            return recipe.exposure != d.exposure || recipe.contrast != d.contrast
+                || recipe.highlights != d.highlights || recipe.shadows != d.shadows
+                || recipe.whites != d.whites || recipe.blacks != d.blacks
+                || recipe.temperature != d.temperature || recipe.tint != d.tint
+                || recipe.wb_mode != d.wb_mode || recipe.wb_pick != d.wb_pick
+                || recipe.saturation != d.saturation || recipe.vibrance != d.vibrance
+                || recipe.auto_exposure || recipe.auto_contrast
+                || recipe.pivot != d.pivot
+                || recipe.highlight_rolloff != d.highlight_rolloff
+                || recipe.shadow_rolloff != d.shadow_rolloff
+        case .wheels:
+            return recipe.lift != d.lift || recipe.gamma != d.gamma
+                || recipe.gain != d.gain || recipe.offset != d.offset
+                || recipe.shadow_sat != d.shadow_sat || recipe.midtone_sat != d.midtone_sat
+                || recipe.highlight_sat != d.highlight_sat
+                || recipe.shadow_hue != d.shadow_hue || recipe.midtone_hue != d.midtone_hue
+                || recipe.highlight_hue != d.highlight_hue || !recipe.look.isEmpty
+        case .curves:
+            return !recipe.curve.isEmpty || !recipe.curve_r.isEmpty
+                || !recipe.curve_g.isEmpty || !recipe.curve_b.isEmpty
+                || !recipe.hue_hue.isEmpty || !recipe.hue_sat.isEmpty
+                || !recipe.hue_lum.isEmpty || !recipe.lum_sat.isEmpty
+                || !recipe.sat_sat.isEmpty
+        case .zones:
+            return recipe.z_dark != d.z_dark || recipe.z_shadow != d.z_shadow
+                || recipe.z_light != d.z_light || recipe.z_global != d.z_global
+        case .qualifier:
+            return recipe.q_enabled || recipe.q_show
+        case .windows:
+            return !recipe.windows.isEmpty
+        case .mixer:
+            return recipe.mixer != d.mixer || recipe.mono != d.mono
+        case .retouch:
+            return !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty
+        case .detail:
+            return recipe.sharpen != 0 || recipe.noise_luma != 0 || recipe.noise_chroma != 0
+                || recipe.deband != 0 || recipe.ca_fix != 0 || recipe.beauty != 0
+        case .fx:
+            return recipe.clarity != 0 || recipe.vignette != 0 || recipe.grain != 0
+                || recipe.glow != 0 || recipe.flare[2] != 0
+        case .xform:
+            return recipe.rotation_deg != 0 || recipe.crop != d.crop
+        case .meters, .versions:
+            return false
+        }
+    }
+
+    /// Reset every field owned by a palette (DaVinci palette reset).
+    private func resetPalette(_ p: Palette) {
+        let d = Recipe()
+        switch p {
+        case .light:
+            recipe.exposure = d.exposure; recipe.contrast = d.contrast
+            recipe.highlights = d.highlights; recipe.shadows = d.shadows
+            recipe.whites = d.whites; recipe.blacks = d.blacks
+            recipe.temperature = d.temperature; recipe.tint = d.tint
+            recipe.wb_mode = d.wb_mode; recipe.wb_pick = d.wb_pick
+            recipe.saturation = d.saturation; recipe.vibrance = d.vibrance
+            recipe.auto_exposure = false; recipe.auto_contrast = false
+            recipe.pivot = d.pivot
+            recipe.highlight_rolloff = d.highlight_rolloff
+            recipe.shadow_rolloff = d.shadow_rolloff
+        case .wheels:
+            recipe.lift = d.lift; recipe.gamma = d.gamma; recipe.gain = d.gain
+            recipe.offset = d.offset
+            recipe.shadow_hue = d.shadow_hue; recipe.shadow_sat = d.shadow_sat
+            recipe.midtone_hue = d.midtone_hue; recipe.midtone_sat = d.midtone_sat
+            recipe.highlight_hue = d.highlight_hue; recipe.highlight_sat = d.highlight_sat
+            recipe.look = ""
+        case .curves:
+            recipe.curve = []; recipe.curve_r = []; recipe.curve_g = []; recipe.curve_b = []
+            recipe.hue_hue = []; recipe.hue_sat = []; recipe.hue_lum = []
+            recipe.lum_sat = []; recipe.sat_sat = []
+        case .zones:
+            recipe.z_dark = d.z_dark; recipe.z_shadow = d.z_shadow
+            recipe.z_light = d.z_light; recipe.z_global = d.z_global
+        case .qualifier:
+            recipe.qh = d.qh; recipe.qs = d.qs; recipe.ql = d.ql; recipe.qadj = d.qadj
+            recipe.q_invert = false; recipe.q_clean = d.q_clean; recipe.q_blur = 0
+            recipe.q_show = false; recipe.q_enabled = false
+        case .windows:
+            recipe.windows = []
+            selWindow = nil
+        case .mixer:
+            recipe.mixer = d.mixer; recipe.mono = d.mono
+        case .retouch:
+            recipe.spots = []; recipe.lights = []; recipe.clones = []
+            pendingClone = nil
+        case .detail:
+            recipe.sharpen = 0; recipe.noise_luma = 0; recipe.noise_chroma = 0
+            recipe.deband = 0; recipe.ca_fix = 0; recipe.beauty = 0
+        case .fx:
+            recipe.clarity = 0; recipe.vignette = 0; recipe.grain = 0
+            recipe.glow = 0; recipe.flare = d.flare
+        case .xform:
+            recipe.rotation_deg = 0; recipe.crop = d.crop
+        case .meters, .versions:
+            break
+        }
+        status = "Reset \(p.title)"
+    }
+
+    // MARK: navigation / ratings / versions
+
+    private func stepPhoto(_ dir: Int) {
+        guard let i = store.filtered.firstIndex(of: photo) else { return }
+        let j = i + dir
+        guard store.filtered.indices.contains(j) else { return }
+        store.selection = store.filtered[j]
+    }
+
+    private func setRating(_ r: Int) {
+        rating = (rating == r) ? 0 : r
+        AraEngine.shared.setRating(path: photo.path, rating)
+        status = "Rating \(rating)"
+    }
+
+    /// DaVinci "Apply Grade from One Clip Prior" (Cmd+=): copy the previous
+    /// photo's recipe (its unsaved edits win over its sidecar).
+    private func applyPrevRecipe() {
+        guard let i = store.filtered.firstIndex(of: photo), i > 0 else {
+            status = "No previous photo"
+            return
+        }
+        let prev = store.filtered[i - 1]
+        let r = store.unsavedEdits[prev.path] ?? AraEngine.shared.sidecar(path: prev.path).recipe
+        recipe = r
+        status = "Applied grade from \(prev.name)"
+    }
+
+    private func commitVersion() {
+        let name = versionName.trimmingCharacters(in: .whitespaces)
+        versions.append(GradeVersion(
+            name: name.isEmpty ? "Version \(versions.count + 1)" : name,
+            recipe: recipe))
+        versionName = ""
+        dirty = true
+    }
+
+    /// apply a saved version — goes through undo history like any edit
+    private func applyVersion(_ v: GradeVersion) {
+        recipe = v.recipe
+        status = "Applied \(v.name)"
     }
 
     private func copyRecipe() {
@@ -591,7 +1450,7 @@ struct EditorView: View {
 
     private func rerender() {
         rendering = true
-        let r = compare ? Recipe() : recipe
+        let r = recipe
         Task.detached { [path = photo.path] in
             let (img, bins, wv, vc, ce) = await AraEngine.shared.work {
                 $0.renderScopes(path: path, recipe: r, maxPx: 1400)
@@ -638,6 +1497,7 @@ struct EditorView: View {
 struct FilmCell: View {
     let photo: Photo
     let selected: Bool
+    var dirty: Bool = false
     @State private var image: CGImage?
 
     var body: some View {
@@ -649,6 +1509,19 @@ struct FilmCell: View {
             }
             if let c = labelColors.first(where: { $0.name == photo.label })?.color {
                 Circle().fill(c).frame(width: 6, height: 6).padding(4)
+            }
+            if dirty {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Circle()
+                            .fill(Ara.accent)
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle().stroke(.black.opacity(0.6), lineWidth: 0.75))
+                            .padding(4)
+                    }
+                }
             }
         }
         .frame(width: 84, height: 56)
@@ -776,6 +1649,11 @@ struct ColorWheel: View {
             Text(title.uppercased())
                 .font(.system(size: 8, weight: .semibold)).tracking(1)
                 .foregroundStyle(Ara.text3)
+            Text(String(format: "%.2f  %.2f  %.2f", v[0], v[1], v[2]))
+                .font(.system(size: 7.5).monospacedDigit())
+                .foregroundStyle(
+                    v == [center, center, center] ? Ara.text3 : Ara.accent.opacity(0.8))
+                .lineLimit(1).minimumScaleFactor(0.8)
         }
     }
 }
@@ -823,10 +1701,12 @@ struct ZoneRow: View {
     }
 }
 
-/// curve editor: click to add, drag to move, double-click a point to delete
+/// curve editor: click to add, drag to move, double-click a point to delete.
+/// `hist` (luma histogram, 256 bins) is drawn as a faint backdrop like DaVinci.
 struct CurveEditor: View {
     @Binding var points: [[Double]]
     var tint: Color = .white
+    var hist: [UInt32] = []
 
     var body: some View {
         GeometryReader { geo in
@@ -834,6 +1714,20 @@ struct CurveEditor: View {
             ZStack {
                 Rectangle().fill(Color(red: 0.05, green: 0.05, blue: 0.065))
                 Canvas { ctx, size in
+                    // luma histogram backdrop
+                    if hist.count == 256 {
+                        let maxv = Double(hist.max() ?? 1)
+                        var hp = Path()
+                        hp.move(to: .init(x: 0, y: size.height))
+                        for x in 0..<256 {
+                            let v = min(log1p(Double(hist[x])) / log1p(maxv + 1), 1)
+                            hp.addLine(to: .init(x: CGFloat(x) / 255 * size.width,
+                                                 y: size.height - v * size.height))
+                        }
+                        hp.addLine(to: .init(x: size.width, y: size.height))
+                        hp.closeSubpath()
+                        ctx.fill(hp, with: .color(.white.opacity(0.07)))
+                    }
                     // grid
                     for i in 1..<4 {
                         let f = CGFloat(i) / 4
@@ -1193,18 +2087,41 @@ extension EditorView {
             ctx.stroke(path, with: .color(col.opacity(0.9)), lineWidth: 1.5)
         }
         for w in recipe.windows {
+            // DaVinci overlay: white-ish outline; the selected window is amber
+            // and thicker; a disabled window is dimmed to a hairline.
+            let sel = w.id == selWindow
+            let col: Color = sel ? Ara.accent : .cyan
+            let alpha: Double = w.enabled ? (sel ? 1.0 : 0.85) : 0.25
+            let lw: CGFloat = sel ? 2.5 : 1.5
             if w.kind == "gradient" {
                 var ln = Path()
                 ln.move(to: .init(x: rect.minX + w.p[0] * rect.width, y: rect.minY + w.p[1] * rect.height))
                 ln.addLine(to: .init(x: rect.minX + w.p[2] * rect.width, y: rect.minY + w.p[3] * rect.height))
-                ctx.stroke(ln, with: .color(.cyan.opacity(0.9)), lineWidth: 1.5)
+                ctx.stroke(ln, with: .color(col.opacity(alpha)), lineWidth: lw)
+                // direction tick: short perpendicular at midpoint
+                let mx = (w.p[0] + w.p[2]) / 2, my = (w.p[1] + w.p[3]) / 2
+                let dx = w.p[2] - w.p[0], dy = w.p[3] - w.p[1]
+                let len = max((dx * dx + dy * dy).squareRoot(), 1e-4)
+                let nx2 = -dy / len, ny2 = dx / len
+                var tick = Path()
+                tick.move(to: .init(x: rect.minX + mx * rect.width, y: rect.minY + my * rect.height))
+                tick.addLine(to: .init(x: rect.minX + (mx + nx2 * 0.04) * rect.width,
+                                       y: rect.minY + (my + ny2 * 0.04) * rect.height))
+                ctx.stroke(tick, with: .color(col.opacity(alpha)), lineWidth: lw)
             } else {
                 let cx = fx2sx(w.p[0])
                 let cy = fy2sy(w.p[1])
                 let rx = w.p[2] * rect.width / max(sw, 0.01)
                 let ry = w.p[3] * rect.height / max(sh, 0.01)
                 ctx.stroke(Ellipse().path(in: CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2)),
-                           with: .color(.cyan.opacity(0.9)), lineWidth: 1.5)
+                           with: .color(col.opacity(alpha)), lineWidth: lw)
+                if sel {
+                    // centre cross for the selected window
+                    var cr = Path()
+                    cr.move(to: .init(x: cx - 6, y: cy)); cr.addLine(to: .init(x: cx + 6, y: cy))
+                    cr.move(to: .init(x: cx, y: cy - 6)); cr.addLine(to: .init(x: cx, y: cy + 6))
+                    ctx.stroke(cr, with: .color(Ara.accent.opacity(0.9)), lineWidth: 1)
+                }
             }
         }
         if recipe.wb_mode == .pick {
@@ -1298,19 +2215,31 @@ struct MixRow: View {
     }
 }
 
-/// per-window editor rows
+/// per-window editor rows: visibility eye (DaVinci power-window on/off),
+/// invert, per-window opacity, geometry sliders. Selecting a row arms it
+/// for dragging on the stage.
 struct WindowRow: View {
     @Binding var w: PowerWindow
+    var selected = false
+    var onSelect: () -> Void = {}
     let onDelete: () -> Void
     var body: some View {
         VStack(spacing: 5) {
             HStack {
                 Image(systemName: w.kind == "gradient" ? "rectangle.lefthalf.filled" : "circle")
                     .font(.system(size: 9))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(selected ? Ara.accent : .cyan)
                 Text(w.kind == "gradient" ? "Gradient" : "Circle")
                     .font(.system(size: 10.5, weight: .medium)).foregroundStyle(Ara.text1)
                 Spacer()
+                // on/off eye (DaVinci per-window visibility)
+                Button { w.enabled.toggle() } label: {
+                    Image(systemName: w.enabled ? "eye" : "eye.slash")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(w.enabled ? Ara.text2 : Ara.text3)
+                }
+                .buttonStyle(.plain)
+                .help("Window on/off")
                 Text("Inv").font(.system(size: 9.5)).foregroundStyle(Ara.text2)
                 Toggle("", isOn: $w.invert).labelsHidden().controlSize(.mini).tint(Ara.accent)
                 Button { onDelete() } label: {
@@ -1322,6 +2251,7 @@ struct WindowRow: View {
             SliderRow("EV", $w.ev, -2...2)
             SliderRow("Sat", $w.sat, -1...1)
             SliderRow("Temp", $w.temp, -1...1)
+            SliderRow("Opacity", $w.opacity, 0...1, reset: 1)
             if w.kind == "circle" {
                 SliderRow("Size", $w.p[2], 0.02...0.6, reset: 0.15)
                 SliderRow("Ratio", $w.p[3], 0.02...0.6, reset: 0.15)
@@ -1330,9 +2260,78 @@ struct WindowRow: View {
             SliderRow("Soft", $w.p[w.kind == "circle" ? 5 : 4], 0.02...1, reset: 0.4)
         }
         .padding(8)
-        .background(Ara.bg3)
+        .background(selected ? Ara.accentSoft.opacity(0.5) : Ara.bg3)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Ara.hairline, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 6)
+            .stroke(selected ? Ara.accent.opacity(0.6) : Ara.hairline, lineWidth: 1))
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+        .opacity(w.enabled ? 1 : 0.65)
+    }
+}
+
+/// DaVinci "stills"/versions row: click to apply that snapshot.
+struct VersionRow: View {
+    let v: GradeVersion
+    var active = false
+    var onApply: () -> Void = {}
+    var onDelete: () -> Void = {}
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "photo.stack")
+                .font(.system(size: 9))
+                .foregroundStyle(active ? Ara.accent : Ara.text3)
+            Text(v.name.isEmpty ? "Version" : v.name)
+                .font(.system(size: 10.5, weight: active ? .semibold : .regular))
+                .foregroundStyle(active ? Ara.accent : Ara.text1)
+                .lineLimit(1)
+            Spacer()
+            Button { onDelete() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Ara.text3)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .fill(active ? Ara.accentSoft : Ara.bg3))
+        .contentShape(Rectangle())
+        .onTapGesture { onApply() }
+    }
+}
+
+/// Installs a local NSEvent monitor for bare-key shortcuts (digits, arrows,
+/// B, W, Esc). Handler returns true when the key was consumed.
+final class KeyMonitor {
+    private var monitor: Any?
+    var handler: (NSEvent) -> Bool = { _ in false }
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard let self else { return ev }
+            return self.handler(ev) ? nil : ev
+        }
+    }
+    func uninstall() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+    }
+}
+
+/// Scroll-wheel zoom on the stage (hover-gated in the handler).
+/// Handler returns true to let the event pass through untouched.
+final class ScrollMonitor {
+    private var monitor: Any?
+    var handler: (NSEvent) -> Bool = { _ in true }
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] ev in
+            guard let self else { return ev }
+            return self.handler(ev) ? ev : nil
+        }
+    }
+    func uninstall() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
 }
 

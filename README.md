@@ -19,7 +19,7 @@ at a directory of RAW files, no Lightroom-style import step.
 |---|---|---|
 | engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto/pick, cam→sRGB, tone + custom/hue curves, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma+chroma NR, clarity, straighten, vignette, grain, DaVinci-style grading, retouch, light effects), embedded-thumbnail extraction, EXIF, scopes |
 | GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→heal/clone→NR→soft→glow→sharpen/clarity→finish (crop+resize+straighten+flip+CA-fix+adjust+windows+flare+dodge/burn+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
-| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + recipe) |
+| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + label + recipe + versions) |
 | C ABI | `core/src/capi.rs` | opaque engine handle, images as `{data,len,w,h}` RGBA8, JSON in/out |
 | CLI | `cli/` | `render`, `thumb`, `reference`, `scan`, `meta`, `rate` — test harness + batch tool |
 | macOS app | `mac/` | SwiftUI library grid + editor; builds a self-contained `.app` with libraw bundled |
@@ -79,7 +79,9 @@ araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sani
   "mono": [0,0,0],        // monochrome weights (all zero = off)
   "qh": [0.5,0.1,0.1], "qs": [0,1,0.1], "ql": [0,1,0.1],  // HSL qualifier
   "qadj": [0.1,0.4,0,0], "q_invert": false,     // [hue,sat,lum,temp] on masked px
-  "windows": [{"kind":"circle","p":[0.5,0.5,0.2,0.2,0,0.4],"ev":0.5,"sat":0.1,"temp":0.2,"invert":false}],
+  "q_clean": [0,1], "q_blur": 0.0, "q_show": false,  // matte finesse + highlight view
+  "windows": [{"kind":"circle","p":[0.5,0.5,0.2,0.2,0,0.4],"ev":0.5,"sat":0.1,"temp":0.2,
+              "invert":false,"enabled":true,"opacity":1.0}],
 
   // auto correction (sparse scene stats drive all three)
   "wb_mode": "auto", "auto_exposure": true, "auto_contrast": true,
@@ -95,8 +97,38 @@ araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sani
 }
 ```
 
-All edits are non-destructive: ratings and recipes live in
-`<stem>.araware.json` next to the source file.
+All edits are non-destructive: ratings, recipes and grade versions live in
+`<stem>.araware.json` next to the source file. Named snapshots:
+
+```json
+"versions": [{"name": "Teal look", "recipe": { ... }}]
+```
+
+## Editor interaction (DaVinci-derived)
+
+- **Palettes**: 13 icon tabs (Light / Wheels / Curves / Zones / Qualifier /
+  Windows / Mixer / Retouch / Detail / FX / Transform / Meters / Versions);
+  an amber dot marks any palette holding non-default values; the header reset
+  arrow clears only the active palette.
+- **Compare**: Before / Wipe V / Wipe H / Difference / Mix — the wipe divider
+  drags. `B` toggles Before, `W` cycles the wipe modes.
+- **Zoom/pan**: scroll wheel or pinch zooms under the cursor zone, drag pans
+  when zoomed, double-click toggles 1×/2×, overlay controls for fit/−/%/＋/1:1.
+- **History**: unlimited undo/redo (Cmd+Z / Cmd+Shift+Z); slider drags
+  coalesce into one step. Undo also reverts a version apply.
+- **Keys**: `0`–`5` rating, `←`/`→` photo nav, `Esc` exits tool/compare,
+  `Cmd+S` save, `Cmd+E` export, `Cmd+=` apply the previous photo's grade.
+- **Qualifier pickers**: New / + / − eyedroppers sample a 5×5 area under the
+  cursor; the View toggle highlights the matte; Hue/Sat/Lum gradient range
+  bars + Matte Finesse (Clean Black/White/Blur) refine the key.
+- **Power windows**: per-window eye toggle and opacity, amber selection
+  outline, drag on the stage to move the selected shape, drag in Grad mode
+  draws the gradient line.
+- **Numeric entry**: every slider value is tappable — type a number, Enter
+  commits, Esc cancels.
+- **Versions**: named recipe snapshots stored in the sidecar; click to apply
+  (undo-able), × to delete. Filmstrip thumbnails show an amber dot on photos
+  with unsaved edits.
 
 ## Licensing notes
 
