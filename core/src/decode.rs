@@ -288,12 +288,12 @@ fn process8(h: &RawHandle) -> Result<Decoded> {
 
 fn decode_raster(path: &Path) -> Result<Decoded> {
     let img = image::open(path).with_context(|| format!("open {}", path.display()))?;
-    let rgba8 = img.to_rgba8();
-    let (w, h) = (rgba8.width() as usize, rgba8.height() as usize);
+    // keep 16-bit sources at full depth (to_rgba16 expands 8-bit inputs
+    // identically to the old (v<<8)|v path)
+    let rgba16 = img.to_rgba16();
+    let (w, h) = (rgba16.width() as usize, rgba16.height() as usize);
     let mut rgba = Vec::with_capacity(w * h * 4);
-    for &v in rgba8.as_raw() {
-        rgba.push((v as u16) << 8 | v as u16);
-    }
+    rgba.extend_from_slice(rgba16.as_raw());
     Ok(Decoded::Raster {
         rgba,
         w,
@@ -319,10 +319,13 @@ pub struct Thumb {
     pub h: usize,
     /// rgba8 pixels
     pub rgba: Vec<u8>,
+    /// dcraw flip code for the source frame — most cameras embed the
+    /// thumbnail unrotated, so the caller applies it
+    pub flip: i32,
 }
 
 pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
-    let (h, _info) = open_raw(path)?;
+    let (h, info) = open_raw(path)?;
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);
     let rc = unsafe { ffi::ara_thumb(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
@@ -361,5 +364,6 @@ pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
         w: w as usize,
         h: hgt as usize,
         rgba,
+        flip: info.flip,
     }))
 }

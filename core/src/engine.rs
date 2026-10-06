@@ -13,7 +13,21 @@ use crate::recipe::{sidecar_path_for, Recipe, Sidecar};
 
 struct State {
     path: Option<PathBuf>,
+    /// (mtime_ns, byte_len) of the file when it was decoded — a file that
+    /// changed on disk invalidates the cached decode.
+    stamp: Option<(u128, u64)>,
     decoded: Option<Decoded>,
+}
+
+fn file_stamp(path: &Path) -> Option<(u128, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let t = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((t, m.len()))
 }
 
 pub struct Engine {
@@ -28,6 +42,7 @@ impl Engine {
         Ok(Engine {
             state: Mutex::new(State {
                 path: None,
+                stamp: None,
                 decoded: None,
             }),
             catalog: Catalog::open()?,
@@ -40,6 +55,7 @@ impl Engine {
         Ok(Engine {
             state: Mutex::new(State {
                 path: None,
+                stamp: None,
                 decoded: None,
             }),
             catalog: Catalog::open_mem()?,
@@ -49,9 +65,11 @@ impl Engine {
 
     fn with_decoded<R>(&self, path: &Path, f: impl FnOnce(&Decoded) -> Result<R>) -> Result<R> {
         let mut st = self.state.lock().unwrap();
-        if st.path.as_deref() != Some(path) || st.decoded.is_none() {
+        let stamp = file_stamp(path);
+        if st.path.as_deref() != Some(path) || st.decoded.is_none() || st.stamp != stamp {
             st.decoded = Some(decode::decode(path)?);
             st.path = Some(path.to_path_buf());
+            st.stamp = stamp;
         }
         f(st.decoded.as_ref().unwrap())
     }
@@ -88,6 +106,14 @@ impl Engine {
             if let Ok(Some(t)) = decode::embedded_thumb(path) {
                 let img = image::RgbaImage::from_raw(t.w as u32, t.h as u32, t.rgba);
                 if let Some(img) = img {
+                    // embedded thumbs are stored unrotated — match the develop
+                    // path's orientation (dcraw flip codes)
+                    let img = match t.flip {
+                        3 => image::imageops::rotate180(&img),
+                        5 => image::imageops::rotate270(&img),
+                        6 => image::imageops::rotate90(&img),
+                        _ => img,
+                    };
                     let out = if max_px > 0 && t.w.max(t.h) as u32 > max_px {
                         let s = max_px as f32 / t.w.max(t.h) as f32;
                         image::imageops::resize(

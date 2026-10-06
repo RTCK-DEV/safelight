@@ -77,6 +77,8 @@ struct EditorView: View {
     @State private var vec: [UInt32] = []
     @State private var cie: [UInt32] = []
     @State private var rendering = false
+    /// monotonically increasing render id — stale detached results are dropped
+    @State private var renderGen = 0
     @State private var dirty = false
     @State private var baseline = Recipe()
     @State private var status = ""
@@ -165,7 +167,7 @@ struct EditorView: View {
         case "grad":
             var w = PowerWindow()
             w.kind = "gradient"
-            w.p = [0.0, fy, 1.0, fy, 0.5, 0]
+            w.p = [0.0, fy, 1.0, fy, 0, 0.5]
             recipe.windows.append(w)
             selWindow = w.id
         case "flare":
@@ -418,7 +420,7 @@ struct EditorView: View {
                 if let i = recipe.windows.lastIndex(where: { $0.id == selWindow })
                     ?? recipe.windows.indices.last {
                     recipe.windows[i].kind = "gradient"
-                    recipe.windows[i].p = [sfx, sfy, fx, fy, 0.35, 0]
+                    recipe.windows[i].p = [sfx, sfy, fx, fy, 0, 0.35]
                     selWindow = recipe.windows[i].id
                 }
                 return
@@ -502,7 +504,7 @@ struct EditorView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(store.filtered) { p in
-                            FilmCell(photo: p, selected: p == store.selection,
+                            FilmCell(photo: p, selected: p.path == store.selection?.path,
                                      dirty: store.unsavedEdits[p.path] != nil)
                                 .onTapGesture { store.selection = p }
                                 .id(p.id)
@@ -535,12 +537,18 @@ struct EditorView: View {
                     Stars(rating: $rating)
                         .onChange(of: rating) { _, r in
                             AraEngine.shared.setRating(path: photo.path, r)
+                            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
+                                store.photos[i].rating = r
+                            }
                         }
                 }
                 HStack(spacing: 6) {
                     LabelPicker(label: $label)
                         .onChange(of: label) { _, l in
                             AraEngine.shared.setLabel(path: photo.path, l)
+                            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
+                                store.photos[i].label = l
+                            }
                         }
                     Spacer()
                     IconAction(icon: "arrow.uturn.backward") { undo() }
@@ -1380,7 +1388,9 @@ struct EditorView: View {
     // MARK: navigation / ratings / versions
 
     private func stepPhoto(_ dir: Int) {
-        guard let i = store.filtered.firstIndex(of: photo) else { return }
+        // match by path — rating/label edits mutate Photo values and would
+        // break a Hashable-equality lookup
+        guard let i = store.filtered.firstIndex(where: { $0.path == photo.path }) else { return }
         let j = i + dir
         guard store.filtered.indices.contains(j) else { return }
         store.selection = store.filtered[j]
@@ -1389,13 +1399,16 @@ struct EditorView: View {
     private func setRating(_ r: Int) {
         rating = (rating == r) ? 0 : r
         AraEngine.shared.setRating(path: photo.path, rating)
+        if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
+            store.photos[i].rating = rating
+        }
         status = "Rating \(rating)"
     }
 
     /// DaVinci "Apply Grade from One Clip Prior" (Cmd+=): copy the previous
     /// photo's recipe (its unsaved edits win over its sidecar).
     private func applyPrevRecipe() {
-        guard let i = store.filtered.firstIndex(of: photo), i > 0 else {
+        guard let i = store.filtered.firstIndex(where: { $0.path == photo.path }), i > 0 else {
             status = "No previous photo"
             return
         }
@@ -1450,12 +1463,16 @@ struct EditorView: View {
 
     private func rerender() {
         rendering = true
+        renderGen += 1
+        let gen = renderGen
         let r = recipe
         Task.detached { [path = photo.path] in
             let (img, bins, wv, vc, ce) = await AraEngine.shared.work {
                 $0.renderScopes(path: path, recipe: r, maxPx: 1400)
             }
             await MainActor.run {
+                // drop stale results — a newer render already started
+                guard gen == renderGen else { return }
                 if let img { image = img }
                 hist = (0..<4).map { ch in Array(bins[(ch * 256)..<(ch * 256 + 256)]) }
                 wave = wv
@@ -2257,7 +2274,7 @@ struct WindowRow: View {
                 SliderRow("Ratio", $w.p[3], 0.02...0.6, reset: 0.15)
                 SliderRow("Rot", $w.p[4], -90...90)
             }
-            SliderRow("Soft", $w.p[w.kind == "circle" ? 5 : 4], 0.02...1, reset: 0.4)
+            SliderRow("Soft", $w.p[5], 0.02...1, reset: 0.4)
         }
         .padding(8)
         .background(selected ? Ara.accentSoft.opacity(0.5) : Ara.bg3)

@@ -45,7 +45,7 @@ struct LibraryView: View {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 148), spacing: 10)], spacing: 10) {
                                 ForEach(store.filtered) { photo in
                                     ThumbCell(photo: photo,
-                                              selected: store.selection == photo)
+                                              selected: store.selection?.path == photo.path)
                                         .onTapGesture { store.selection = photo }
                                 }
                             }

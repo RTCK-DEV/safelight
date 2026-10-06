@@ -24,11 +24,17 @@ fn main() -> Result<()> {
         "render" => {
             let path = Path::new(&args[2]);
             let out = args.get(3).map(String::as_str).unwrap_or("out.png");
-            let recipe = args
-                .get(4)
-                .and_then(|s| std::fs::read_to_string(s).ok())
-                .and_then(|s| Recipe::from_json(&s))
-                .unwrap_or_default();
+            // a recipe path argument must read + parse — silent fallback would
+            // render with the wrong settings and look like success
+            let recipe = match args.get(4) {
+                Some(p) => {
+                    let s = std::fs::read_to_string(p)
+                        .with_context(|| format!("read recipe {p}"))?;
+                    Recipe::from_json(&s)
+                        .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
+                }
+                None => Recipe::default(),
+            };
             let max_px: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
             let t = std::time::Instant::now();
             let img = eng.render(path, &recipe, max_px)?;

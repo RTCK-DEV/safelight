@@ -54,15 +54,28 @@ final class LibraryStore: ObservableObject {
     }
 
     func open(_ url: URL) {
+        let switching = folder != url
         folder = url
-        unsavedEdits.removeAll()
-        unsavedVersions.removeAll()
+        if switching {
+            // a different folder: drafts and selection belong to the old list
+            unsavedEdits.removeAll()
+            unsavedVersions.removeAll()
+            selection = nil
+        }
+        // a rescan of the same folder keeps unsaved edits + selection alive
         scanning = true
         Task.detached { [weak self] in
             let photos = await AraEngine.shared.work { $0.scan(folder: url.path) }
             await MainActor.run {
                 self?.photos = photos
                 self?.scanning = false
+                if let sel = self?.selection,
+                   photos.contains(where: { $0.path == sel.path }) {
+                    // keep the selection on rescan (fresh object for equality)
+                    self?.selection = photos.first { $0.path == sel.path }
+                } else {
+                    self?.selection = photos.first
+                }
             }
         }
     }

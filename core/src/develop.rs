@@ -205,6 +205,14 @@ fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
 /// `default` supplies the endpoint values (and the whole curve when `points`
 /// is empty), so identity/gain/remap curves share this path.
 fn curve_lut(points: &[[f32; 2]], default: impl Fn(f32) -> f32, maxy: f32) -> Vec<f32> {
+    // no user points: the curve is exactly the default mapping. (Degenerate
+    // endpoint-only Catmull-Rom is NOT the identity — it bows ~20% dark at
+    // x=0.25 — so the empty case must not go through the spline.)
+    if points.is_empty() {
+        return (0..256)
+            .map(|i| default(i as f32 / 255.0).clamp(0.0, maxy))
+            .collect();
+    }
     // build a sorted point list incl. endpoints
     let mut pts: Vec<[f32; 2]> = Vec::new();
     pts.push([0.0, default(0.0)]);
@@ -495,15 +503,37 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     };
 
     // power windows → packed [kind, p0..p5, ev, sat, temp, strength]
-    // strength = opacity × enabled (folded so disabled windows are free)
+    // strength = opacity × enabled (folded so disabled windows are free).
+    // windows are stored frame-normalized (pre-crop, matching the UI markers);
+    // window_mask runs in dst-normalized post-crop space, so translate here.
+    let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
+    let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
     let mut wins = [[0.0; 12]; 4];
     for (i, w) in r.windows.iter().take(4).enumerate() {
+        let grad = w.kind == "gradient";
+        let (p0, p1, p2, p3) = if grad {
+            // [x1,y1,x2,y2]: both endpoints move through the same map
+            (
+                (w.p[0] - r.crop[0]) / sw,
+                (w.p[1] - r.crop[1]) / sh,
+                (w.p[2] - r.crop[0]) / sw,
+                (w.p[3] - r.crop[1]) / sh,
+            )
+        } else {
+            // circle/ellipse: centre + radii rescale into crop space
+            (
+                (w.p[0] - r.crop[0]) / sw,
+                (w.p[1] - r.crop[1]) / sh,
+                w.p[2] / sw,
+                w.p[3] / sh,
+            )
+        };
         wins[i] = [
-            (if w.kind == "gradient" { 1.0 } else { 0.0 }) + (if w.invert { 2.0 } else { 0.0 }),
-            w.p[0],
-            w.p[1],
-            w.p[2],
-            w.p[3],
+            (if grad { 1.0 } else { 0.0 }) + (if w.invert { 2.0 } else { 0.0 }),
+            p0,
+            p1,
+            p2,
+            p3,
             w.p[4],
             w.p[5],
             w.ev.clamp(-4.0, 4.0),
@@ -1600,6 +1630,10 @@ pub fn histogram(rgba8: &[u8]) -> [u32; 1024] {
 }
 
 fn fit(w: u32, h: u32, max_px: u32) -> (u32, u32) {
+    // cap, not target: small inputs keep their size
+    if w.max(h) <= max_px {
+        return (w.max(1), h.max(1));
+    }
     let s = max_px as f32 / w.max(h) as f32;
     (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
 }
