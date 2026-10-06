@@ -189,6 +189,47 @@ pub unsafe extern "C" fn araware_render_h(
     img
 }
 
+/// render preview + fill caller buffers: wave 3*256*256, vec 256*256,
+/// cie 256*256, hist 1024 (each nullable, skipped when null)
+#[no_mangle]
+pub unsafe extern "C" fn araware_scopes(
+    e: *mut c_void,
+    path: *const c_char,
+    recipe_json: *const c_char,
+    max_px: u32,
+    wave: *mut u32,
+    vec: *mut u32,
+    cie: *mut u32,
+    hist: *mut u32,
+) -> AraImage {
+    let img = araware_render(e, path, recipe_json, max_px);
+    if !img.data.is_null() {
+        let data = std::slice::from_raw_parts(img.data as *const u8, img.len);
+        // heap: these exceed a dispatch-queue worker's ~512KB stack
+        let mut wv = vec![0u32; 196608];
+        let mut vc = vec![0u32; 65536];
+        let mut ce = vec![0u32; 65536];
+        crate::develop::scopes(data, img.width, img.height, &mut wv, &mut vc, &mut ce);
+        if !wave.is_null() {
+            std::ptr::copy_nonoverlapping(wv.as_ptr(), wave, wv.len());
+        }
+        if !vec.is_null() {
+            std::ptr::copy_nonoverlapping(vc.as_ptr(), vec, vc.len());
+        }
+        if !cie.is_null() {
+            std::ptr::copy_nonoverlapping(ce.as_ptr(), cie, ce.len());
+        }
+        if !hist.is_null() {
+            std::ptr::copy_nonoverlapping(
+                crate::develop::histogram(data).as_ptr(),
+                hist,
+                1024,
+            );
+        }
+    }
+    img
+}
+
 /// full-res render for export; RGBA8 out
 #[no_mangle]
 pub unsafe extern "C" fn araware_export(

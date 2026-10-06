@@ -59,6 +59,41 @@ pub struct Params {
     pub lights: [[f32; 4]; 8],
     pub n_lights: u32,
     pub crop: [f32; 4],
+    // DaVinci extras
+    pub offset: [f32; 3],
+    pub mid_col: [f32; 3],
+    pub mid_sat: f32,
+    pub pivot: f32,
+    pub hl_roll: f32,
+    pub sh_roll: f32,
+    /// per-channel curve LUTs, 768 floats (r|g|b); empty = identity
+    pub chan_luts: Vec<f32>,
+    /// hue-domain curve LUTs, 1280 floats (hh|hs|hl|ls|ss); empty = identity
+    pub hue_luts: Vec<f32>,
+    pub qh: [f32; 3],
+    pub qs: [f32; 3],
+    pub ql: [f32; 3],
+    pub qadj: [f32; 4],
+    pub q_invert: bool,
+    pub has_qual: bool,
+    /// power windows [kind, a,b,c,d, soft, ev, sat, temp, invert] (circle: a..d=cx,cy,rx,ry + rot in kind-sign? see pack)
+    /// packed: [kind, p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, invert]
+    pub wins: [[f32; 10]; 4],
+    pub n_wins: u32,
+    /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
+    pub zones: [[f32; 4]; 4],
+    pub mixer: [f32; 9],
+    pub mono: [f32; 3],
+    /// clone stamps in virtual-px [sx,sy,dx,dy,r,_] (max 8)
+    pub clones: [[f32; 6]; 8],
+    pub n_clones: u32,
+    pub beauty: f32,
+    pub noise_chroma: f32,
+    pub ca_fix: f32,
+    pub deband: f32,
+    pub glow: f32,
+    /// lens flare [cx, cy, strength, hue] in dst-normalized coords
+    pub flare: [f32; 4],
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -68,6 +103,9 @@ pub struct Stats {
     pub luma_mean: f32,
     pub luma_hist: [u32; 256],
     pub count: u64,
+    /// mean raw level inside the WB-pick rectangle (camera space)
+    pub pick_means: [f32; 3],
+    pub pick_count: u64,
 }
 
 impl Default for Stats {
@@ -77,6 +115,8 @@ impl Default for Stats {
             luma_mean: 0.0,
             luma_hist: [0; 256],
             count: 0,
+            pick_means: [0.0; 3],
+            pick_count: 0,
         }
     }
 }
@@ -84,7 +124,10 @@ impl Default for Stats {
 impl Stats {
     /// 256-bin luma histogram (linear 0..1 domain)
     pub fn needs(r: &Recipe) -> bool {
-        r.wb_mode == WbMode::Auto || r.auto_exposure || r.auto_contrast
+        r.wb_mode == WbMode::Auto
+            || r.wb_mode == WbMode::Pick
+            || r.auto_exposure
+            || r.auto_contrast
     }
     fn luma_percentile(&self, p: f32) -> f32 {
         let target = (self.count as f64 * p as f64) as u64;
@@ -150,9 +193,16 @@ fn norm_rows(mut m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 }
 
 fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
+    curve_lut(points, |x| x, 1.0)
+}
+
+/// catmull-rom LUT with caller-chosen endpoints/default and output ceiling.
+/// `default` supplies the endpoint values (and the whole curve when `points`
+/// is empty), so identity/gain/remap curves share this path.
+fn curve_lut(points: &[[f32; 2]], default: impl Fn(f32) -> f32, maxy: f32) -> Vec<f32> {
     // build a sorted point list incl. endpoints
     let mut pts: Vec<[f32; 2]> = Vec::new();
-    pts.push([0.0, 0.0]);
+    pts.push([0.0, default(0.0)]);
     let mut mid: Vec<[f32; 2]> = points
         .iter()
         .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
@@ -160,7 +210,7 @@ fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     mid.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
     mid.retain(|p| p[0] > 0.0 && p[0] < 1.0);
     pts.extend(mid);
-    pts.push([1.0, 1.0]);
+    pts.push([1.0, default(1.0)]);
     let n = pts.len();
     let mut lut = Vec::with_capacity(256);
     for i in 0..256 {
@@ -183,9 +233,64 @@ fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
                 + (-p0[1] + p2[1]) * t
                 + (2.0 * p0[1] - 5.0 * p1[1] + 4.0 * p2[1] - p3[1]) * t2
                 + (-p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1]) * t3);
-        lut.push(y.clamp(0.0, 1.0));
+        lut.push(y.clamp(0.0, maxy));
     }
     lut
+}
+
+/// linear-interp sample of a packed 256-entry lut
+fn lut_at(lut: &[f32], x: f32) -> f32 {
+    let idx = (x.clamp(0.0, 1.0) * 255.0) as usize;
+    lut[idx.min(255)]
+}
+
+/// rgb -> (hue 0..1, sat, v=max) — mirrored in the WGSL adjust
+fn rgb_to_hsv(x: [f32; 3]) -> (f32, f32, f32) {
+    let mx = x[0].max(x[1]).max(x[2]);
+    let mn = x[0].min(x[1]).min(x[2]);
+    let d = mx - mn;
+    let s = if mx > 1e-6 { d / mx } else { 0.0 };
+    let h = if d < 1e-6 {
+        0.0
+    } else if mx == x[0] {
+        (x[1] - x[2]) / d / 6.0
+    } else if mx == x[1] {
+        (2.0 + (x[2] - x[0]) / d) / 6.0
+    } else {
+        (4.0 + (x[0] - x[1]) / d) / 6.0
+    };
+    (h - h.floor(), s, mx)
+}
+
+/// (hue 0..1, sat, v) -> rgb — standard HSV sector interpolation
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let h6 = (h - h.floor()) * 6.0;
+    let i = h6 as u32 % 6;
+    let f = h6 - h6.floor();
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match i {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+/// cyclic distance between two hues in 0..1
+fn hue_dist(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs() - (a - b).abs().floor();
+    d.min(1.0 - d)
+}
+
+/// skin-tone proximity for the beauty/smoothing mask
+fn skin_mask(x: [f32; 3]) -> f32 {
+    let (h, s, v) = rgb_to_hsv(x);
+    let hw = 1.0 - sstep(0.02, 0.12, hue_dist(h, 0.075));
+    let sw = sstep(0.05, 0.25, s);
+    let lw = sstep(0.15, 0.35, v);
+    hw * sw * lw
 }
 
 /// hue (0..1, 0=red) -> rgb for split-toning targets
@@ -273,6 +378,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             wb = [gm / s.means[0].max(1e-4), 1.0, gm / s.means[2].max(1e-4)];
         }
     }
+    if r.wb_mode == WbMode::Pick {
+        if let Some(s) = stats {
+            if s.pick_count > 0 {
+                let gm = s.pick_means[1].max(1e-4);
+                wb = [
+                    gm / s.pick_means[0].max(1e-4),
+                    1.0,
+                    gm / s.pick_means[2].max(1e-4),
+                ];
+            }
+        }
+    }
     // relative temperature/tint shift (v1 approximation)
     let t = r.temperature.clamp(-1.0, 1.0);
     let ti = r.tint.clamp(-1.0, 1.0);
@@ -346,6 +463,74 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         r.crop[3].clamp(0.0, 0.9),
     ];
 
+    // per-channel custom curves: 768-float packed luts, empty when unused
+    let chan_luts = if r.curve_r.is_empty() && r.curve_g.is_empty() && r.curve_b.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = curve_lut(&r.curve_r, |x| x, 1.0);
+        v.extend(curve_lut(&r.curve_g, |x| x, 1.0));
+        v.extend(curve_lut(&r.curve_b, |x| x, 1.0));
+        v
+    };
+    // hue-domain curves: hh/ss are remaps (default x), hs/hl/ls are gains (1)
+    let hue_luts = if r.hue_hue.is_empty()
+        && r.hue_sat.is_empty()
+        && r.hue_lum.is_empty()
+        && r.lum_sat.is_empty()
+        && r.sat_sat.is_empty()
+    {
+        Vec::new()
+    } else {
+        let mut v = curve_lut(&r.hue_hue, |x| x, 1.0);
+        v.extend(curve_lut(&r.hue_sat, |_| 1.0, 2.0));
+        v.extend(curve_lut(&r.hue_lum, |_| 1.0, 2.0));
+        v.extend(curve_lut(&r.lum_sat, |_| 1.0, 2.0));
+        v.extend(curve_lut(&r.sat_sat, |x| x, 1.0));
+        v
+    };
+
+    // power windows → packed [kind, p0..p5, ev, sat, temp, invert]
+    let mut wins = [[0.0; 10]; 4];
+    for (i, w) in r.windows.iter().take(4).enumerate() {
+        wins[i] = [
+            (if w.kind == "gradient" { 1.0 } else { 0.0 }) + (if w.invert { 2.0 } else { 0.0 }),
+            w.p[0],
+            w.p[1],
+            w.p[2],
+            w.p[3],
+            w.p[4],
+            w.p[5],
+            w.ev.clamp(-4.0, 4.0),
+            w.sat.clamp(-1.0, 1.0),
+            w.temp.clamp(-1.0, 1.0),
+        ];
+    }
+
+    let mut clones = [[0.0; 6]; 8];
+    for (i, c) in r.clones.iter().take(8).enumerate() {
+        clones[i] = [
+            c[0].clamp(0.0, 1.0),
+            c[1].clamp(0.0, 1.0),
+            c[2].clamp(0.0, 1.0),
+            c[3].clamp(0.0, 1.0),
+            c[4].clamp(0.001, 0.3),
+            0.0,
+        ];
+    }
+
+    let zone_pack = |z: [f32; 4]| -> [f32; 4] {
+        [
+            z[0] - z[0].floor(),
+            z[1].clamp(0.0, 1.0),
+            z[2].clamp(-4.0, 4.0),
+            z[3].clamp(-1.0, 1.0),
+        ]
+    };
+    let mut mixer = r.mixer;
+    for c in &mut mixer {
+        *c = c.clamp(-2.0, 2.0);
+    }
+
     let mut p = Params {
         wb,
         m: cam2srgb,
@@ -390,6 +575,64 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         lights,
         n_lights: r.lights.len().min(8) as u32,
         crop,
+        offset: [
+            r.offset[0].clamp(-0.25, 0.25),
+            r.offset[1].clamp(-0.25, 0.25),
+            r.offset[2].clamp(-0.25, 0.25),
+        ],
+        mid_col: hue_to_rgb(r.midtone_hue),
+        mid_sat: r.midtone_sat.clamp(0.0, 1.0),
+        pivot: r.pivot.clamp(0.02, 0.8),
+        hl_roll: r.highlight_rolloff.clamp(0.0, 2.0),
+        sh_roll: r.shadow_rolloff.clamp(0.0, 2.0),
+        chan_luts,
+        hue_luts,
+        qh: [
+            r.qh[0] - r.qh[0].floor(),
+            r.qh[1].clamp(0.0, 0.5),
+            r.qh[2].clamp(0.0, 0.5),
+        ],
+        qs: [
+            r.qs[0].clamp(0.0, 1.0),
+            r.qs[1].clamp(0.0, 1.0),
+            r.qs[2].clamp(0.0, 0.5),
+        ],
+        ql: [
+            r.ql[0].clamp(0.0, 1.0),
+            r.ql[1].clamp(0.0, 1.0),
+            r.ql[2].clamp(0.0, 0.5),
+        ],
+        qadj: [
+            r.qadj[0].clamp(-0.5, 0.5),
+            r.qadj[1].clamp(-1.0, 1.0),
+            r.qadj[2].clamp(-1.0, 1.0),
+            r.qadj[3].clamp(-1.0, 1.0),
+        ],
+        q_invert: r.q_invert,
+        has_qual: r.qh[1] > 0.0,
+        wins,
+        n_wins: r.windows.len().min(4) as u32,
+        zones: [
+            zone_pack(r.z_dark),
+            zone_pack(r.z_shadow),
+            zone_pack(r.z_light),
+            zone_pack(r.z_global),
+        ],
+        mixer,
+        mono: r.mono,
+        clones,
+        n_clones: r.clones.len().min(8) as u32,
+        beauty: r.beauty.clamp(0.0, 1.0),
+        noise_chroma: r.noise_chroma.clamp(0.0, 1.0),
+        ca_fix: r.ca_fix.clamp(-0.5, 0.5),
+        deband: r.deband.clamp(0.0, 1.0),
+        glow: r.glow.clamp(0.0, 1.0),
+        flare: [
+            r.flare[0].clamp(0.0, 1.0),
+            r.flare[1].clamp(0.0, 1.0),
+            r.flare[2].clamp(0.0, 1.0),
+            r.flare[3] - r.flare[3].floor(),
+        ],
     };
     apply_look(&mut p, &r.look);
     p
@@ -431,6 +674,10 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             x[c] = p.gain[c] * (x[c] + p.lift[c]).max(0.0).powf(1.0 / p.gamma[c]);
         }
     }
+    // global offset wheel
+    for c in 0..3 {
+        x[c] += p.offset[c];
+    }
     // blacks / whites remap
     for c in &mut x {
         if p.blacks > 0.0 {
@@ -440,9 +687,9 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         }
         *c *= 1.0 + p.whites * 0.20;
     }
-    // contrast around 18% pivot
+    // contrast around adjustable pivot
     for c in &mut x {
-        *c = (*c - 0.18) * (1.0 + p.contrast * 0.9) + 0.18;
+        *c = (*c - p.pivot) * (1.0 + p.contrast * 0.9) + p.pivot;
     }
     // shadows lift / highlights recovery in upper/lower bands
     for c in &mut x {
@@ -453,6 +700,23 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         if p.highlights != 0.0 {
             let w = sstep(0.45, 1.2, *c);
             *c += -p.highlights * w * 0.5 * *c;
+        }
+    }
+    // highlight/shadow rolloff shaping (camera-raw style)
+    if p.hl_roll != 1.0 {
+        for c in &mut x {
+            if p.hl_roll > 1.0 {
+                *c = *c / (1.0 + (p.hl_roll - 1.0) * sstep(0.8, 1.6, *c));
+            } else {
+                *c *= 1.0 + (1.0 - p.hl_roll) * 0.5 * sstep(0.8, 1.6, *c);
+            }
+        }
+    }
+    if p.sh_roll != 1.0 {
+        for c in &mut x {
+            let w = 1.0 - sstep(0.0, 0.35, *c);
+            *c *= 1.0 + (1.0 - p.sh_roll) * 0.4 * w;
+            *c *= 1.0 - (p.sh_roll - 1.0).max(0.0) * 0.3 * w;
         }
     }
     // saturation / vibrance
@@ -467,19 +731,115 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             *c = luma + (*c - luma) * s.max(0.0);
         }
     }
-    // split toning: pull shadows/highlights toward their tint colors
-    if p.shadow_sat > 0.0 || p.high_sat > 0.0 {
+    // split toning: pull shadows/midtones/highlights toward their tint colors
+    if p.shadow_sat > 0.0 || p.high_sat > 0.0 || p.mid_sat > 0.0 {
         let luma = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
         let ws = (1.0 - sstep(0.0, 0.55, luma)) * p.shadow_sat;
         let wh = sstep(0.45, 1.0, luma) * p.high_sat;
+        let wm = (1.0 - (luma - 0.5).abs() * 2.0).max(0.0) * p.mid_sat;
         for c in 0..3 {
-            x[c] += ws * (p.shadow_col[c] - luma) * 0.5 + wh * (p.high_col[c] - luma) * 0.5;
+            x[c] += ws * (p.shadow_col[c] - luma) * 0.5
+                + wh * (p.high_col[c] - luma) * 0.5
+                + wm * (p.mid_col[c] - luma) * 0.5;
         }
+    }
+    // HDR zone wheels: per-band [hue, amt, ev, sat]
+    for (i, z) in p.zones.iter().enumerate() {
+        if z[1] == 0.0 && z[2] == 0.0 && z[3] == 0.0 {
+            continue;
+        }
+        let luma = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.0);
+        let w = match i {
+            0 => 1.0 - sstep(0.0, 0.18, luma),
+            1 => sstep(0.05, 0.25, luma) * (1.0 - sstep(0.25, 0.55, luma)),
+            2 => sstep(0.45, 0.75, luma),
+            _ => 1.0,
+        };
+        if w <= 0.0 {
+            continue;
+        }
+        let zc = hue_to_rgb(z[0]);
+        let evg = (2.0f32).powf(z[2] * w);
+        for c in 0..3 {
+            x[c] = x[c] * evg + w * z[1] * (zc[c] - luma) * 0.4;
+        }
+        if z[3] != 0.0 {
+            let l2 = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+            for c in 0..3 {
+                x[c] = l2 + (x[c] - l2) * (1.0 + z[3] * w);
+            }
+        }
+    }
+    // RGB channel mixer (3x3, row-major)
+    if p.mixer != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
+        x = [
+            p.mixer[0] * x[0] + p.mixer[1] * x[1] + p.mixer[2] * x[2],
+            p.mixer[3] * x[0] + p.mixer[4] * x[1] + p.mixer[5] * x[2],
+            p.mixer[6] * x[0] + p.mixer[7] * x[1] + p.mixer[8] * x[2],
+        ];
+    }
+    // monochrome conversion (mixer-style luma weights)
+    if p.mono[0] != 0.0 || p.mono[1] != 0.0 || p.mono[2] != 0.0 {
+        let g = p.mono[0] * x[0] + p.mono[1] * x[1] + p.mono[2] * x[2];
+        x = [g, g, g];
     }
     // tone curve lut
     for c in &mut x {
         let idx = (c.clamp(0.0, 1.0) * 255.0) as usize;
         *c = p.lut[idx.min(255)];
+    }
+    // per-channel custom curves
+    if !p.chan_luts.is_empty() {
+        for c in 0..3 {
+            x[c] = lut_at(&p.chan_luts[c * 256..], x[c]);
+        }
+    }
+    // hue-domain curves (DaVinci Hue-vs-* and Lum/Sat-vs-Sat)
+    if !p.hue_luts.is_empty() {
+        let (h, s, v) = rgb_to_hsv(x);
+        let lum = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        let h2 = lut_at(&p.hue_luts[0..], h);
+        let mut s2 = s * lut_at(&p.hue_luts[256..], h) * lut_at(&p.hue_luts[768..], lum);
+        s2 = lut_at(&p.hue_luts[1024..], s2.clamp(0.0, 1.0));
+        let l2 = lum * lut_at(&p.hue_luts[512..], lum);
+        let mut x2 = hsv_to_rgb(h2, s2.clamp(0.0, 1.0), v);
+        let l3 = 0.2126 * x2[0] + 0.7152 * x2[1] + 0.0722 * x2[2];
+        if l3 > 1e-5 {
+            for c in 0..3 {
+                x2[c] *= l2 / l3;
+            }
+        }
+        x = x2;
+    }
+    // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask
+    if p.has_qual {
+        let (h, s, _v) = rgb_to_hsv(x);
+        let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        let mh = 1.0 - sstep(p.qh[1], p.qh[1] + p.qh[2].max(1e-4), hue_dist(h, p.qh[0]));
+        let ms = sstep(p.qs[0] - p.qs[2], p.qs[0] + p.qs[2], s)
+            * (1.0 - sstep(p.qs[1] - p.qs[2], p.qs[1] + p.qs[2], s));
+        let ml = sstep(p.ql[0] - p.ql[2], p.ql[0] + p.ql[2], l)
+            * (1.0 - sstep(p.ql[1] - p.ql[2], p.ql[1] + p.ql[2], l));
+        let mut mask = mh * ms * ml;
+        if p.q_invert {
+            mask = 1.0 - mask;
+        }
+        if mask > 0.001 {
+            let h2 = h + p.qadj[0];
+            let s2 = (s * (1.0 + p.qadj[1])).clamp(0.0, 1.0);
+            let mut xq = hsv_to_rgb(h2, s2, _v);
+            let lq = 0.2126 * xq[0] + 0.7152 * xq[1] + 0.0722 * xq[2];
+            if lq > 1e-5 {
+                for c in 0..3 {
+                    xq[c] *= (l * (1.0 + p.qadj[2])) / lq;
+                }
+            }
+            xq[0] += p.qadj[3] * 0.06;
+            xq[2] -= p.qadj[3] * 0.06;
+            for c in 0..3 {
+                x[c] += (xq[c] - x[c]) * mask;
+            }
+        }
     }
     x
 }
@@ -574,6 +934,14 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
         let mut acc = [0.0f64; 3];
         let mut luma = 0.0f64;
         let step = 4usize; // sparse sample
+        // WB pick rectangle (virtual src px); empty when not picking
+        let pr = if r.wb_mode == WbMode::Pick {
+            pick_rect(r.wb_pick, vw, vh, m.info.flip)
+        } else {
+            [-1.0; 4]
+        };
+        let mut pacc = [0.0f64; 3];
+        let mut pcnt = 0u64;
         for vy in (0..vh).step_by(step) {
             for vx in (0..vw).step_by(step) {
                 let c = demosaic_pixel(m, vx, vy, stride, &norm);
@@ -584,7 +952,21 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
                 luma += l as f64;
                 s.luma_hist[(l * 255.0) as usize] += 1;
                 s.count += 1;
+                if vx as f32 >= pr[0] && vx as f32 <= pr[2] && vy as f32 >= pr[1] && vy as f32 <= pr[3] {
+                    for ch in 0..3 {
+                        pacc[ch] += c[ch] as f64;
+                    }
+                    pcnt += 1;
+                }
             }
+        }
+        if pcnt > 0 {
+            s.pick_means = [
+                (pacc[0] / pcnt as f64) as f32,
+                (pacc[1] / pcnt as f64) as f32,
+                (pacc[2] / pcnt as f64) as f32,
+            ];
+            s.pick_count = pcnt;
         }
         s.means = [
             (acc[0] / s.count as f64) as f32,
@@ -728,20 +1110,79 @@ pub(crate) fn frame_geometry(
 /// spots are [cx,cy,r] in normalized POST-FLIP frame coords.
 /// convert a normalized post-flip-frame spot [cx,cy,r] to virtual-src px
 /// (sx, sy, radius_px) — shared by CPU heal and the GPU uniform builder.
-pub fn spot_to_src(s: [f32; 4], w: usize, h: usize, flip: i32) -> (f32, f32, f32) {
+/// normalized post-flip frame point → virtual-src px (shared by spots/clones/pick)
+pub fn frame_to_src(nx: f32, ny: f32, w: usize, h: usize, flip: i32) -> (f32, f32) {
     let (fw, fh) = match flip {
         5 | 6 => (h, w),
         _ => (w, h),
     };
-    let fx = s[0] * fw as f32;
-    let fy = s[1] * fh as f32;
-    let (sx, sy) = match flip {
+    let fx = nx * fw as f32;
+    let fy = ny * fh as f32;
+    match flip {
         3 => (w as f32 - 1.0 - fx, h as f32 - 1.0 - fy),
         6 => (fy, h as f32 - 1.0 - fx),
         5 => (w as f32 - 1.0 - fy, fx),
         _ => (fx, fy),
+    }
+}
+
+pub fn spot_to_src(s: [f32; 4], w: usize, h: usize, flip: i32) -> (f32, f32, f32) {
+    let (sx, sy) = frame_to_src(s[0], s[1], w, h, flip);
+    let (fw, fh) = match flip {
+        5 | 6 => (h, w),
+        _ => (w, h),
     };
     (sx, sy, (s[2] * fw.max(fh) as f32).max(2.0))
+}
+
+/// WB pick rectangle in virtual-src px: ~5% box around the tapped point
+pub fn pick_rect(pick: [f32; 2], w: usize, h: usize, flip: i32) -> [f32; 4] {
+    let (cx, cy) = frame_to_src(pick[0], pick[1], w, h, flip);
+    let (fw, fh) = match flip {
+        5 | 6 => (h, w),
+        _ => (w, h),
+    };
+    let r = 0.025 * fw.max(fh) as f32;
+    [cx - r, cy - r, cx + r, cy + r]
+}
+
+/// clone stamps: copy a source patch into the destination circle (patch replacer)
+fn clone_lin(lin: &mut [[f32; 3]], w: usize, h: usize, clones: &[[f32; 6]; 8], n: u32, flip: i32) {
+    if n == 0 {
+        return;
+    }
+    let orig = lin.to_vec();
+    let sample = |x: f32, y: f32| -> [f32; 3] {
+        let xi = (x.round() as i32).clamp(0, w as i32 - 1) as usize;
+        let yi = (y.round() as i32).clamp(0, h as i32 - 1) as usize;
+        orig[yi * w + xi]
+    };
+    for c in clones.iter().take(n as usize) {
+        let (sx, sy) = frame_to_src(c[0], c[1], w, h, flip);
+        let (dx, dy) = frame_to_src(c[2], c[3], w, h, flip);
+        let (fw, fh) = match flip {
+            5 | 6 => (h, w),
+            _ => (w, h),
+        };
+        let r = (c[4] * fw.max(fh) as f32).max(2.0);
+        let x0 = (dx - r).max(0.0) as i32;
+        let x1 = (dx + r).min(w as f32 - 1.0) as i32;
+        let y0 = (dy - r).max(0.0) as i32;
+        let y1 = (dy + r).min(h as f32 - 1.0) as i32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let d = ((x as f32 - dx).hypot(y as f32 - dy)) / r;
+                if d < 1.0 {
+                    let src = sample(x as f32 + sx - dx, y as f32 + sy - dy);
+                    let blend = 1.0 - sstep(0.7, 1.0, d);
+                    let i = y as usize * w + x as usize;
+                    for ch in 0..3 {
+                        lin[i][ch] = lin[i][ch] * (1.0 - blend) + src[ch] * blend;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: u32, flip: i32) {
@@ -798,8 +1239,16 @@ fn finish_linear(
     max_px: u32,
 ) -> RgbaImage {
     heal_lin(&mut lin, w, h, &p.spots, p.n_spots, flip);
-    if p.noise_luma > 0.0 {
-        lin = chroma_smooth(&lin, w, h, p.noise_luma);
+    clone_lin(&mut lin, w, h, &p.clones, p.n_clones, flip);
+    let nr = p.noise_luma.max(p.noise_chroma);
+    if nr > 0.0 {
+        lin = chroma_smooth(&lin, w, h, nr);
+    }
+    if p.beauty > 0.0 || p.deband > 0.0 {
+        lin = beauty_deband(&lin, w, h, p.beauty, p.deband);
+    }
+    if p.glow > 0.0 {
+        lin = glow_lin(&lin, w, h, p.glow);
     }
     if p.sharpen > 0.0 || p.clarity != 0.0 {
         lin = sharpen_clarity(&lin, w, h, p.sharpen, p.clarity);
@@ -827,7 +1276,21 @@ fn finish_linear(
                 5 => (w as f32 - 1.0 - fy, fx),
                 _ => (fx, fy),
             };
-            let col = bilinear(&lin, w, h, sx, sy);
+            // chromatic-aberration fix: radial per-channel sample offsets
+            let col = if p.ca_fix != 0.0 {
+                let wcx = w as f32 * 0.5;
+                let wcy = h as f32 * 0.5;
+                let rn = ((sx - wcx).hypot(sy - wcy) / w.max(h) as f32) * 2.0;
+                let fr = 1.0 - p.ca_fix * 0.05 * rn;
+                let fb = 1.0 + p.ca_fix * 0.05 * rn;
+                [
+                    bilin_ch(&lin, w, h, wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0),
+                    bilin_ch(&lin, w, h, sx, sy, 1),
+                    bilin_ch(&lin, w, h, wcx + (sx - wcx) * fb, wcy + (sy - wcy) * fb, 2),
+                ]
+            } else {
+                bilinear(&lin, w, h, sx, sy)
+            };
             let mut adj = adjust(col, p);
             // dodge/burn radial lights (dst-normalized coords)
             for l in p.lights.iter().take(p.n_lights as usize) {
@@ -836,6 +1299,39 @@ fn finish_linear(
                 adj[0] *= 1.0 + l[3] * f * 0.5;
                 adj[1] *= 1.0 + l[3] * f * 0.5;
                 adj[2] *= 1.0 + l[3] * f * 0.5;
+            }
+            // power windows: local ev/sat/temp inside the mask
+            for win in p.wins.iter().take(p.n_wins as usize) {
+                let mask = window_mask(win, nx, ny);
+                if mask <= 0.001 {
+                    continue;
+                }
+                let evg = (2.0f32).powf(win[7] * mask);
+                let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
+                for c in 0..3 {
+                    adj[c] = adj[c] * evg;
+                    adj[c] = l + (adj[c] - l) * (1.0 + win[8] * mask);
+                }
+                adj[0] += win[9] * mask * 0.08;
+                adj[2] -= win[9] * mask * 0.08;
+            }
+            // lens flare: core glow + horizontal streak + mirrored ghost ring
+            if p.flare[2] > 0.0 {
+                let (fx0, fy0, fs) = (p.flare[0], p.flare[1], p.flare[2]);
+                let dx = nx - fx0;
+                let dy = ny - fy0;
+                let d2 = dx * dx + dy * dy;
+                let core = (-d2 / 0.004).exp();
+                let streak = (-dy * dy / (0.0004 + 0.02 * fs)).exp() * (-dx.abs() / 0.35).exp();
+                let gx = 1.0 - fx0;
+                let gy = 1.0 - fy0;
+                let gd = ((nx - gx).hypot(ny - gy) - 0.10).abs();
+                let ghost = (-gd * gd / 0.0008).exp();
+                let colf = hue_to_rgb(p.flare[3]);
+                let f = fs * (0.5 * core + 0.7 * streak + 0.35 * ghost);
+                for c in 0..3 {
+                    adj[c] += f * colf[c];
+                }
             }
             if p.grain > 0.0 {
                 for (c, seed) in adj.iter_mut().zip([0.0f32, 17.0, 43.0]) {
@@ -865,6 +1361,122 @@ fn finish_linear(
     }
 }
 
+/// power-window mask value at dst-normalized (nx,ny)
+/// packed [kind(+2=invert), a,b,c,d, rot, soft, ev, sat, temp]
+fn window_mask(w: &[f32; 10], nx: f32, ny: f32) -> f32 {
+    let kind = w[0] as i32 % 2;
+    let inv = w[0] >= 2.0;
+    let mask = if kind == 1 {
+        // gradient: [x1,y1,x2,y2,*,soft] — full cover before the p1..p2 span
+        let (ax, ay, bx, by) = (w[1], w[2], w[3], w[4]);
+        let soft = w[6].max(0.02);
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len2 = (dx * dx + dy * dy).max(1e-6);
+        let t = ((nx - ax) * dx + (ny - ay) * dy) / len2;
+        1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t)
+    } else {
+        // circle/ellipse: [cx,cy,rx,ry,rot,soft]
+        let rot = w[5].to_radians();
+        let dx = nx - w[1];
+        let dy = ny - w[2];
+        let rx = w[3].max(0.005);
+        let ry = w[4].max(0.005);
+        let ux = (dx * rot.cos() + dy * rot.sin()) / rx;
+        let uy = (-dx * rot.sin() + dy * rot.cos()) / ry;
+        let d = (ux * ux + uy * uy).sqrt();
+        1.0 - sstep(1.0 - w[6].clamp(0.0, 0.95), 1.0, d)
+    };
+    if inv {
+        1.0 - mask
+    } else {
+        mask
+    }
+}
+
+/// single-channel bilinear sample (for CA-corrected per-channel taps)
+fn bilin_ch(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize) -> f32 {
+    let x0 = sx.floor() as i32;
+    let y0 = sy.floor() as i32;
+    if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
+        if x0 >= 0 && y0 >= 0 && (x0 as usize) < w && (y0 as usize) < h {
+            return lin[y0 as usize * w + x0 as usize][ch];
+        }
+        return 0.0;
+    }
+    let tx = sx - x0 as f32;
+    let ty = sy - y0 as f32;
+    let (x0, y0) = (x0 as usize, y0 as usize);
+    let a = lin[y0 * w + x0][ch] * (1.0 - tx) + lin[y0 * w + x0 + 1][ch] * tx;
+    let b = lin[(y0 + 1) * w + x0][ch] * (1.0 - tx) + lin[(y0 + 1) * w + x0 + 1][ch] * tx;
+    a * (1.0 - ty) + b * ty
+}
+
+/// beauty (skin-masked smoothing) + deband (flat-gradient smoothing)
+fn beauty_deband(lin: &[[f32; 3]], w: usize, h: usize, beauty: f32, deband: f32) -> Vec<[f32; 3]> {
+    let chans: Vec<Vec<f32>> = (0..3)
+        .map(|c| lin.iter().map(|p| p[c]).collect())
+        .collect();
+    let mut out = vec![[0.0f32; 3]; lin.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let c = lin[i];
+            let m = [box3(&chans[0], w, h, x, y), box3(&chans[1], w, h, x, y), box3(&chans[2], w, h, x, y)];
+            let skin = if beauty > 0.0 { skin_mask(c) } else { 0.0 };
+            let flat = {
+                let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let lm = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+                1.0 - sstep(0.004, 0.03, (l - lm).abs())
+            };
+            let wgt = (beauty * skin + deband * flat).min(1.0);
+            for ch in 0..3 {
+                out[i][ch] = c[ch] * (1.0 - wgt) + m[ch] * wgt;
+            }
+        }
+    }
+    out
+}
+
+/// lens glow: extract highlights, wide box blur, add back
+fn glow_lin(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> Vec<[f32; 3]> {
+    let hi: Vec<f32> = lin
+        .iter()
+        .map(|c| {
+            let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            sstep(0.55, 0.9, l)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(lin.len());
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut m = [0.0f32; 3];
+            let mut n = 0u32;
+            for dy in -4i32..=4 {
+                for dx in -4i32..=4 {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        let j = ny as usize * w + nx as usize;
+                        for c in 0..3 {
+                            m[c] += lin[j][c] * hi[j];
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            let f = amt * 0.8 / n.max(1) as f32;
+            out.push([
+                lin[i][0] + m[0] * f,
+                lin[i][1] + m[1] * f,
+                lin[i][2] + m[2] * f,
+            ]);
+        }
+    }
+    out
+}
+
 fn bilinear(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32) -> [f32; 3] {
     let x0 = sx.floor() as i32;
     let y0 = sy.floor() as i32;
@@ -888,8 +1500,61 @@ fn bilinear(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32) -> [f32; 3] 
 }
 
 fn hash_px(x: usize, y: usize, seed: f32) -> f32 {
-    let v = (x as f32 * (12.9898 + seed) + y as f32 * (78.233 + seed * 1.7)).sin() * 43758.5453;
-    v - v.floor()
+    // same integer hash as gpu.rs `hash` so grain is identical on both paths
+    let mut h = (x as u32)
+        .wrapping_mul(2654435761)
+        .wrapping_add((y as u32).wrapping_mul(2246822519))
+        .wrapping_add(((seed + 1.0) as u32).wrapping_mul(3266489917));
+    h = (h ^ (h >> 13)).wrapping_mul(1103515245);
+    h ^= h >> 16;
+    h as f32 * (1.0 / 4294967296.0)
+}
+
+/// Video-style scopes computed from rendered rgba8.
+/// `wave`: per-channel column histograms, wave[c*65536 + v*256 + col]
+/// `vec`: YCbCr chroma plane, vec[cr*256 + cb]
+/// `cie`: CIE xy chromaticity plane, cie[yi*256 + xi]
+pub fn scopes(rgba8: &[u8], w: u32, h: u32, wave: &mut [u32], vec: &mut [u32], cie: &mut [u32]) {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    // stride so we touch at most ~512K pixels regardless of input size
+    let step = ((w * h) as f64 / 524288.0).sqrt().ceil().max(1.0) as usize;
+    for y in (0..h).step_by(step) {
+        for x in (0..w).step_by(step) {
+            let i = (y * w + x) * 4;
+            let (r, g, b) = (
+                rgba8[i] as f32 / 255.0,
+                rgba8[i + 1] as f32 / 255.0,
+                rgba8[i + 2] as f32 / 255.0,
+            );
+            let col = x * 255 / w;
+            for (c, v) in [r, g, b].iter().enumerate() {
+                let bin = (v.clamp(0.0, 1.0) * 255.0) as usize;
+                wave[c * 65536 + bin * 256 + col] += 1;
+            }
+            // BT.601 chroma for the vectorscope
+            let cb = (-0.168736 * r - 0.331264 * g + 0.5 * b) * 255.0 + 128.0;
+            let cr = (0.5 * r - 0.418688 * g - 0.081312 * b) * 255.0 + 128.0;
+            let cbi = cb.clamp(0.0, 255.0) as usize;
+            let cri = cr.clamp(0.0, 255.0) as usize;
+            vec[cri * 256 + cbi] += 1;
+            // sRGB -> CIE XYZ -> xy chromaticity
+            let lr = if r <= 0.04045 { r / 12.92 } else { ((r + 0.055) / 1.055).powf(2.4) };
+            let lg = if g <= 0.04045 { g / 12.92 } else { ((g + 0.055) / 1.055).powf(2.4) };
+            let lb = if b <= 0.04045 { b / 12.92 } else { ((b + 0.055) / 1.055).powf(2.4) };
+            let xx = 0.4124 * lr + 0.3576 * lg + 0.1805 * lb;
+            let yy = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+            let zz = 0.0193 * lr + 0.1192 * lg + 0.9505 * lb;
+            let s = xx + yy + zz;
+            if s > 1e-6 {
+                let xi = (xx / s * 255.0).clamp(0.0, 255.0) as usize;
+                let yi = (yy / s * 255.0).clamp(0.0, 255.0) as usize;
+                cie[yi * 256 + xi] += 1;
+            }
+        }
+    }
 }
 
 /// 256-bin histogram of rendered rgba8 pixels: [R,G,B,luma] * 256.

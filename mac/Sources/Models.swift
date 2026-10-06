@@ -17,6 +17,20 @@ enum WbMode: String, Codable, CaseIterable {
     case asShot = "as_shot"
     case auto = "auto"
     case manual = "manual"
+    case pick = "pick"
+}
+
+/// Mirrors araware_core::recipe::PowerWindow (serde).
+struct PowerWindow: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var kind: String = "circle"      // "circle" [cx,cy,rx,ry,rot_deg,soft] | "gradient" [x1,y1,x2,y2,soft,0]
+    var p: [Double] = [0.5, 0.5, 0.2, 0.2, 0, 0.4]
+    var ev: Double = 0
+    var sat: Double = 0
+    var temp: Double = 0
+    var invert: Bool = false
+
+    enum CodingKeys: String, CodingKey { case kind, p, ev, sat, temp, invert }
 }
 
 /// Mirrors araware_core::recipe::Recipe (serde snake_case).
@@ -55,6 +69,144 @@ struct Recipe: Codable, Equatable {
     var crop: [Double] = [0, 0, 0, 0]
     var spots: [[Double]] = []
     var lights: [[Double]] = []
+    // WB eyedropper
+    var wb_pick: [Double] = [0.5, 0.5]
+    // color page
+    var offset: [Double] = [0, 0, 0]
+    var midtone_hue: Double = 0.55
+    var midtone_sat: Double = 0
+    var curve_r: [[Double]] = []
+    var curve_g: [[Double]] = []
+    var curve_b: [[Double]] = []
+    var hue_hue: [[Double]] = []
+    var hue_sat: [[Double]] = []
+    var hue_lum: [[Double]] = []
+    var lum_sat: [[Double]] = []
+    var sat_sat: [[Double]] = []
+    // HSL qualifier: [center/lo, width/hi, softness]
+    var qh: [Double] = [0.5, 0.1, 0.1]
+    var qs: [Double] = [0.0, 1.0, 0.1]
+    var ql: [Double] = [0.0, 1.0, 0.1]
+    var qadj: [Double] = [0, 0, 0, 0]  // hue shift, sat, lum, temp
+    var q_invert: Bool = false
+    var q_enabled: Bool = false        // UI-side gate; cleared qualifiers are no-ops
+    var windows: [PowerWindow] = []
+    // HDR zone wheels [hue, amount, ev, sat]
+    var z_dark: [Double] = [0, 0, 0, 0]
+    var z_shadow: [Double] = [0, 0, 0, 0]
+    var z_light: [Double] = [0, 0, 0, 0]
+    var z_global: [Double] = [0, 0, 0, 0]
+    var pivot: Double = 0.18
+    var highlight_rolloff: Double = 1.0
+    var shadow_rolloff: Double = 1.0
+    // RGB mixer (identity) + monochrome weights (all zero = off)
+    var mixer: [Double] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    var mono: [Double] = [0, 0, 0]
+    // clone stamp [sx,sy,dx,dy,r,0] frame-normalized
+    var clones: [[Double]] = []
+    // restoration & light effects
+    var beauty: Double = 0
+    var noise_chroma: Double = 0
+    var ca_fix: Double = 0
+    var deband: Double = 0
+    var glow: Double = 0
+    var flare: [Double] = [0, 0, 0, 0]  // cx, cy, strength, hue
+
+}
+
+extension Recipe {
+    /// Persisted fields mirror the Rust Recipe. `q_enabled` is intentionally
+    /// absent — it's a UI-only gate derived from qh[1] > 0, and the Rust struct
+    /// has no such field (its presence used to break sidecar decode).
+    enum CodingKeys: String, CodingKey {
+        case exposure, contrast, highlights, shadows, whites, blacks
+        case saturation, vibrance, temperature, tint, wb_mode, curve
+        case sharpen, noise_luma, rotation_deg, clarity, vignette, grain
+        case lift, gamma, gain, shadow_hue, shadow_sat
+        case highlight_hue, highlight_sat, look
+        case auto_exposure, auto_contrast
+        case crop, spots, lights, wb_pick
+        case offset, midtone_hue, midtone_sat
+        case curve_r, curve_g, curve_b
+        case hue_hue, hue_sat, hue_lum, lum_sat, sat_sat
+        case qh, qs, ql, qadj, q_invert, windows
+        case z_dark, z_shadow, z_light, z_global
+        case pivot, highlight_rolloff, shadow_rolloff
+        case mixer, mono, clones
+        case beauty, noise_chroma, ca_fix, deband, glow, flare
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        func opt<T: Decodable>(_ k: CodingKeys, _ t: T.Type) -> T? { try? c.decode(T.self, forKey: k) }
+        exposure = opt(.exposure, Double.self) ?? 0
+        contrast = opt(.contrast, Double.self) ?? 0
+        highlights = opt(.highlights, Double.self) ?? 0
+        shadows = opt(.shadows, Double.self) ?? 0
+        whites = opt(.whites, Double.self) ?? 0
+        blacks = opt(.blacks, Double.self) ?? 0
+        saturation = opt(.saturation, Double.self) ?? 0
+        vibrance = opt(.vibrance, Double.self) ?? 0
+        temperature = opt(.temperature, Double.self) ?? 0
+        tint = opt(.tint, Double.self) ?? 0
+        wb_mode = opt(.wb_mode, WbMode.self) ?? .asShot
+        curve = opt(.curve, [[Double]].self) ?? []
+        sharpen = opt(.sharpen, Double.self) ?? 0
+        noise_luma = opt(.noise_luma, Double.self) ?? 0
+        rotation_deg = opt(.rotation_deg, Double.self) ?? 0
+        clarity = opt(.clarity, Double.self) ?? 0
+        vignette = opt(.vignette, Double.self) ?? 0
+        grain = opt(.grain, Double.self) ?? 0
+        lift = opt(.lift, [Double].self) ?? [0, 0, 0]
+        gamma = opt(.gamma, [Double].self) ?? [1, 1, 1]
+        gain = opt(.gain, [Double].self) ?? [1, 1, 1]
+        shadow_hue = opt(.shadow_hue, Double.self) ?? 0.55
+        shadow_sat = opt(.shadow_sat, Double.self) ?? 0
+        highlight_hue = opt(.highlight_hue, Double.self) ?? 0.08
+        highlight_sat = opt(.highlight_sat, Double.self) ?? 0
+        look = opt(.look, String.self) ?? ""
+        auto_exposure = opt(.auto_exposure, Bool.self) ?? false
+        auto_contrast = opt(.auto_contrast, Bool.self) ?? false
+        crop = opt(.crop, [Double].self) ?? [0, 0, 0, 0]
+        spots = opt(.spots, [[Double]].self) ?? []
+        lights = opt(.lights, [[Double]].self) ?? []
+        wb_pick = opt(.wb_pick, [Double].self) ?? [0.5, 0.5]
+        offset = opt(.offset, [Double].self) ?? [0, 0, 0]
+        midtone_hue = opt(.midtone_hue, Double.self) ?? 0.55
+        midtone_sat = opt(.midtone_sat, Double.self) ?? 0
+        curve_r = opt(.curve_r, [[Double]].self) ?? []
+        curve_g = opt(.curve_g, [[Double]].self) ?? []
+        curve_b = opt(.curve_b, [[Double]].self) ?? []
+        hue_hue = opt(.hue_hue, [[Double]].self) ?? []
+        hue_sat = opt(.hue_sat, [[Double]].self) ?? []
+        hue_lum = opt(.hue_lum, [[Double]].self) ?? []
+        lum_sat = opt(.lum_sat, [[Double]].self) ?? []
+        sat_sat = opt(.sat_sat, [[Double]].self) ?? []
+        qh = opt(.qh, [Double].self) ?? [0.5, 0.1, 0.1]
+        qs = opt(.qs, [Double].self) ?? [0.0, 1.0, 0.1]
+        ql = opt(.ql, [Double].self) ?? [0.0, 1.0, 0.1]
+        qadj = opt(.qadj, [Double].self) ?? [0, 0, 0, 0]
+        q_invert = opt(.q_invert, Bool.self) ?? false
+        windows = opt(.windows, [PowerWindow].self) ?? []
+        z_dark = opt(.z_dark, [Double].self) ?? [0, 0, 0, 0]
+        z_shadow = opt(.z_shadow, [Double].self) ?? [0, 0, 0, 0]
+        z_light = opt(.z_light, [Double].self) ?? [0, 0, 0, 0]
+        z_global = opt(.z_global, [Double].self) ?? [0, 0, 0, 0]
+        pivot = opt(.pivot, Double.self) ?? 0.18
+        highlight_rolloff = opt(.highlight_rolloff, Double.self) ?? 1.0
+        shadow_rolloff = opt(.shadow_rolloff, Double.self) ?? 1.0
+        mixer = opt(.mixer, [Double].self) ?? [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        mono = opt(.mono, [Double].self) ?? [0, 0, 0]
+        clones = opt(.clones, [[Double]].self) ?? []
+        beauty = opt(.beauty, Double.self) ?? 0
+        noise_chroma = opt(.noise_chroma, Double.self) ?? 0
+        ca_fix = opt(.ca_fix, Double.self) ?? 0
+        deband = opt(.deband, Double.self) ?? 0
+        glow = opt(.glow, Double.self) ?? 0
+        flare = opt(.flare, [Double].self) ?? [0, 0, 0, 0]
+        q_enabled = qh[1] > 0
+    }
 }
 
 /// Mirrors araware_core::recipe::Sidecar.

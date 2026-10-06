@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 
 use crate::decode::Mosaic;
-use crate::develop::{build_params, frame_geometry, spot_to_src, Params, RgbaImage, Stats};
+use crate::develop::{build_params, frame_geometry, frame_to_src, pick_rect, spot_to_src, Params, RgbaImage, Stats};
 use crate::recipe::Recipe;
 
 #[repr(C)]
@@ -53,6 +53,43 @@ struct Uni {
     heal: [[f32; 4]; 8],
     /// dodge/burn lights in dst-normalized coords: x, y, radius, ev
     lts: [[f32; 4]; 8],
+    /// offset wheel rgb
+    off0: [f32; 4],
+    /// midtone split-tone rgb + sat
+    mt0: [f32; 4],
+    /// HDR zone wheels dark/shadow/light/global: [hue, amt, ev, sat]
+    z0: [f32; 4],
+    z1: [f32; 4],
+    z2: [f32; 4],
+    z3: [f32; 4],
+    /// pivot, highlight_rolloff, shadow_rolloff, has_chan_luts
+    pv: [f32; 4],
+    /// qualifier hue [center,width,soft,0], sat [lo,hi,soft,0], lum [lo,hi,soft,0]
+    qh: [f32; 4],
+    qs: [f32; 4],
+    ql: [f32; 4],
+    /// qualifier adjustment [hue_shift, sat_gain, lum_gain, temp]
+    qadj: [f32; 4],
+    /// has_qual, q_invert, 0, 0
+    qf: [f32; 4],
+    /// RGB mixer rows
+    mx0: [f32; 4],
+    mx1: [f32; 4],
+    mx2: [f32; 4],
+    /// mono weights rgb + beauty
+    mono0: [f32; 4],
+    /// WB pick rect in virtual src px: x0,y0,x1,y1 (-1 = disabled)
+    pick0: [f32; 4],
+    /// n_wins, n_clones, has_hue_luts, deband
+    misc2: [f32; 4],
+    /// ca_fix, glow, noise_chroma, 0
+    fx0: [f32; 4],
+    /// lens flare: cx, cy, strength, hue
+    flare: [f32; 4],
+    /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
+    wins: [[f32; 4]; 16],
+    /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
+    clones: [[f32; 4]; 16],
 }
 
 const WGSL: &str = r#"
@@ -81,6 +118,28 @@ struct Uni {
     misc: vec4<f32>,
     heal: array<vec4<f32>, 8>,
     lts: array<vec4<f32>, 8>,
+    off0: vec4<f32>,
+    mt0: vec4<f32>,
+    z0: vec4<f32>,
+    z1: vec4<f32>,
+    z2: vec4<f32>,
+    z3: vec4<f32>,
+    pv: vec4<f32>,
+    qh: vec4<f32>,
+    qs: vec4<f32>,
+    ql: vec4<f32>,
+    qadj: vec4<f32>,
+    qf: vec4<f32>,
+    mx0: vec4<f32>,
+    mx1: vec4<f32>,
+    mx2: vec4<f32>,
+    mono0: vec4<f32>,
+    pick0: vec4<f32>,
+    misc2: vec4<f32>,
+    fx0: vec4<f32>,
+    flare: vec4<f32>,
+    wins: array<vec4<f32>, 16>,
+    clones: array<vec4<f32>, 16>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -162,6 +221,15 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let l = clamp(luma(c), 0.0, 1.0);
     atomicAdd(&stats[4], u32(l * 1000.0));
     atomicAdd(&stats[5u + u32(l * 255.0)], 1u);
+    // WB pick region accumulation (stats[261..264] = rgb sums, [264] = count)
+    let px = f32((i % nx) * step);
+    let py = f32((i / nx) * step);
+    if (px >= u.pick0.x && px <= u.pick0.z && py >= u.pick0.y && py <= u.pick0.w) {
+        atomicAdd(&stats[261u], u32(clamp(c.x, 0.0, 4.0) * 1000.0));
+        atomicAdd(&stats[262u], u32(clamp(c.y, 0.0, 4.0) * 1000.0));
+        atomicAdd(&stats[263u], u32(clamp(c.z, 0.0, 4.0) * 1000.0));
+        atomicAdd(&stats[264u], 1u);
+    }
 }
 
 @compute @workgroup_size(256)
@@ -205,8 +273,9 @@ fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
             }
         }
     }
-    let nr = mix(cr0, sr / n, u.a3.y);
-    let nb = mix(cb0, sb / n, u.a3.y);
+    let amt = max(u.a3.y, u.fx0.z);
+    let nr = mix(cr0, sr / n, amt);
+    let nb = mix(cb0, sb / n, amt);
     io_b[i] = vec4<f32>(
         l + nr,
         l - 0.2126 / 0.7152 * nr - 0.0722 / 0.7152 * nb,
@@ -265,7 +334,126 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
             c = mix(c, ring, blend);
         }
     }
+    // clone stamps: copy the source patch into the destination circle
+    let nc = u32(u.misc2.y);
+    for (var s = 0u; s < nc; s = s + 1u) {
+        let csrc = u.clones[s * 2u];
+        let cdst = u.clones[s * 2u + 1u];
+        let d = distance(vec2<f32>(f32(i % w), f32(i / w)), cdst.xy) / max(csrc.z, 1.0);
+        if (d < 1.0) {
+            let src = px_at(
+                i32(f32(i % w) + csrc.x - cdst.x + 0.5),
+                i32(f32(i / w) + csrc.y - cdst.y + 0.5),
+            );
+            let blend = 1.0 - sstep(0.7, 1.0, d);
+            c = mix(c, src, blend);
+        }
+    }
     io_b[i] = vec4<f32>(c, 0.0);
+}
+
+fn hue_to_rgb(h: f32) -> vec3<f32> {
+    let h6 = fract(h) * 6.0;
+    let i = u32(h6) % 6u;
+    let f = h6 - floor(h6);
+    let seg_a = array<vec3<f32>, 6>(
+        vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(0.0, 1.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 1.0),
+    );
+    let a = seg_a[i];
+    let b = seg_a[(i + 1u) % 6u];
+    return a + (b - a) * f;
+}
+
+fn rgb_to_hsv(x: vec3<f32>) -> vec3<f32> {
+    let mx = max(x.x, max(x.y, x.z));
+    let mn = min(x.x, min(x.y, x.z));
+    let d = mx - mn;
+    var s = 0.0;
+    if (mx > 1e-6) { s = d / mx; }
+    var h = 0.0;
+    if (d >= 1e-6) {
+        if (mx == x.x) { h = (x.y - x.z) / d / 6.0; }
+        else if (mx == x.y) { h = (2.0 + (x.z - x.x) / d) / 6.0; }
+        else { h = (4.0 + (x.x - x.y) / d) / 6.0; }
+    }
+    return vec3<f32>(h - floor(h), s, mx);
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let h6 = fract(h) * 6.0;
+    let i = u32(h6) % 6u;
+    let f = h6 - floor(h6);
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    switch i {
+        case 0u: { return vec3<f32>(v, t, p); }
+        case 1u: { return vec3<f32>(q, v, p); }
+        case 2u: { return vec3<f32>(p, v, t); }
+        case 3u: { return vec3<f32>(p, q, v); }
+        case 4u: { return vec3<f32>(t, p, v); }
+        default: { return vec3<f32>(v, p, q); }
+    }
+}
+
+fn hue_dist(a: f32, b: f32) -> f32 {
+    let d = fract(abs(a - b));
+    return min(d, 1.0 - d);
+}
+
+fn skin_mask(x: vec3<f32>) -> f32 {
+    let hsv = rgb_to_hsv(x);
+    let hw = 1.0 - sstep(0.02, 0.12, hue_dist(hsv.x, 0.075));
+    let sw = sstep(0.05, 0.25, hsv.y);
+    let lw = sstep(0.15, 0.35, hsv.z);
+    return hw * sw * lw;
+}
+
+// beauty (skin-masked smoothing) + deband (flat-area smoothing)
+@compute @workgroup_size(256)
+fn soft_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    let w = u.g2.x;
+    let h = u.g2.y;
+    if (i >= w * h) { return; }
+    let x = i % w;
+    let y = i / w;
+    let c = io_a[i].xyz;
+    let m = box_at(x, y, 1);
+    var wgt = 0.0;
+    if (u.mono0.w > 0.0) { wgt = wgt + u.mono0.w * skin_mask(c); }
+    if (u.misc2.w > 0.0) {
+        let flat = 1.0 - sstep(0.004, 0.03, abs(luma(c) - luma(m)));
+        wgt = wgt + u.misc2.w * flat;
+    }
+    wgt = min(wgt, 1.0);
+    io_b[i] = vec4<f32>(mix(c, m, wgt), 0.0);
+}
+
+// lens glow: highlight-extract + 9x9 blur added back
+@compute @workgroup_size(256)
+fn glow_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    let w = u.g2.x;
+    let h = u.g2.y;
+    if (i >= w * h) { return; }
+    let x = i % w;
+    let y = i / w;
+    var m = vec3<f32>(0.0);
+    var n = 0.0;
+    for (var dy = -4; dy <= 4; dy = dy + 1) {
+        for (var dx = -4; dx <= 4; dx = dx + 1) {
+            let nx = i32(x) + dx;
+            let ny = i32(y) + dy;
+            if (nx >= 0 && ny >= 0 && nx < i32(w) && ny < i32(h)) {
+                let cc = io_a[u32(ny) * w + u32(nx)].xyz;
+                m = m + cc * sstep(0.55, 0.9, luma(cc));
+                n = n + 1.0;
+            }
+        }
+    }
+    io_b[i] = vec4<f32>(io_a[i].xyz + m * (u.fx0.y * 0.8 / n), 0.0);
 }
 
 // unsharp (3x3) + clarity (5x5 midtone-weighted local contrast)
@@ -309,13 +497,15 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     }
     // lift/gamma/gain
     x = u.lgg2.xyz * pow(max(x + u.lgg0.xyz, vec3<f32>(0.0)), 1.0 / u.lgg1.xyz);
+    // offset wheel
+    x = x + u.off0.xyz;
     if (u.a2.y > 0.0) {
         x = x + u.a2.y * 0.15 * (vec3<f32>(1.0) - x);
     } else {
         x = x * (1.0 + u.a2.y * 0.20);
     }
     x = x * (1.0 + u.a2.x * 0.20);
-    x = (x - vec3<f32>(0.18)) * (1.0 + u.a1.y * 0.9) + vec3<f32>(0.18);
+    x = (x - vec3<f32>(u.pv.x)) * (1.0 + u.a1.y * 0.9) + vec3<f32>(u.pv.x);
     if (u.a1.w != 0.0) {
         let w = (vec3<f32>(1.0) - vec3<f32>(
             sstep(0.0, 0.45, x.x), sstep(0.0, 0.45, x.y), sstep(0.0, 0.45, x.z),
@@ -330,6 +520,24 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         );
         x = x - u.a1.z * w * 0.5 * x;
     }
+    // highlight/shadow rolloff
+    if (u.pv.y != 1.0) {
+        let sw = vec3<f32>(
+            sstep(0.8, 1.6, x.x), sstep(0.8, 1.6, x.y), sstep(0.8, 1.6, x.z),
+        );
+        if (u.pv.y > 1.0) {
+            x = x / (vec3<f32>(1.0) + (u.pv.y - 1.0) * sw);
+        } else {
+            x = x * (vec3<f32>(1.0) + (1.0 - u.pv.y) * 0.5 * sw);
+        }
+    }
+    if (u.pv.z != 1.0) {
+        let wv = vec3<f32>(1.0) - vec3<f32>(
+            sstep(0.0, 0.35, x.x), sstep(0.0, 0.35, x.y), sstep(0.0, 0.35, x.z),
+        );
+        x = x * (vec3<f32>(1.0) + (1.0 - u.pv.z) * 0.4 * wv);
+        x = x * (vec3<f32>(1.0) - max(u.pv.z - 1.0, 0.0) * 0.3 * wv);
+    }
     if (u.a2.z != 0.0 || u.a2.w != 0.0) {
         let luma2 = luma(x);
         let mx = max(x.x, max(x.y, x.z));
@@ -339,23 +547,121 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let s = max(1.0 + u.a2.z + u.a2.w * (1.0 - sat_now), 0.0);
         x = vec3<f32>(luma2) + (x - vec3<f32>(luma2)) * s;
     }
-    // split toning
-    if (u.st0.w > 0.0 || u.st1.w > 0.0) {
+    // split toning (shadow / midtone / highlight)
+    if (u.st0.w > 0.0 || u.st1.w > 0.0 || u.mt0.w > 0.0) {
         let lum = luma(x);
         let ws = (1.0 - sstep(0.0, 0.55, lum)) * u.st0.w;
         let wh = sstep(0.45, 1.0, lum) * u.st1.w;
-        x = x + ws * (u.st0.xyz - vec3<f32>(lum)) * 0.5 + wh * (u.st1.xyz - vec3<f32>(lum)) * 0.5;
+        let wm = max(1.0 - abs(lum - 0.5) * 2.0, 0.0) * u.mt0.w;
+        x = x + ws * (u.st0.xyz - vec3<f32>(lum)) * 0.5
+            + wh * (u.st1.xyz - vec3<f32>(lum)) * 0.5
+            + wm * (u.mt0.xyz - vec3<f32>(lum)) * 0.5;
+    }
+    // HDR zone wheels
+    let zones = array<vec4<f32>, 4>(u.z0, u.z1, u.z2, u.z3);
+    for (var zi = 0u; zi < 4u; zi = zi + 1u) {
+        let z = zones[zi];
+        if (z.y == 0.0 && z.z == 0.0 && z.w == 0.0) { continue; }
+        let lum = clamp(luma(x), 0.0, 1.0);
+        var zw = 1.0;
+        if (zi == 0u) { zw = 1.0 - sstep(0.0, 0.18, lum); }
+        else if (zi == 1u) { zw = sstep(0.05, 0.25, lum) * (1.0 - sstep(0.25, 0.55, lum)); }
+        else if (zi == 2u) { zw = sstep(0.45, 0.75, lum); }
+        if (zw <= 0.0) { continue; }
+        let zc = hue_to_rgb(z.x);
+        x = x * pow(2.0, z.z * zw) + zw * z.y * (zc - vec3<f32>(lum)) * 0.4;
+        if (z.w != 0.0) {
+            let l2 = luma(x);
+            x = vec3<f32>(l2) + (x - vec3<f32>(l2)) * (1.0 + z.w * zw);
+        }
+    }
+    // RGB channel mixer
+    if (u.qf.z > 0.5) {
+        x = vec3<f32>(
+            dot(u.mx0.xyz, x),
+            dot(u.mx1.xyz, x),
+            dot(u.mx2.xyz, x),
+        );
+    }
+    // monochrome
+    if (u.mono0.x != 0.0 || u.mono0.y != 0.0 || u.mono0.z != 0.0) {
+        let g = dot(u.mono0.xyz, x);
+        x = vec3<f32>(g);
     }
     x = vec3<f32>(
         lut[u32(clamp(x.x, 0.0, 1.0) * 255.0)],
         lut[u32(clamp(x.y, 0.0, 1.0) * 255.0)],
         lut[u32(clamp(x.z, 0.0, 1.0) * 255.0)],
     );
+    // per-channel custom curves (lut offsets 256/512/768)
+    if (u.fx0.w > 0.5) {
+        x = vec3<f32>(
+            lut[256u + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
+            lut[512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
+            lut[768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
+        );
+    }
+    // hue-domain curves (lut offsets 1024 hh | 1280 hs | 1536 hl | 1792 ls | 2048 ss)
+    if (u.misc2.z > 0.5) {
+        let hsv = rgb_to_hsv(x);
+        let lum = luma(x);
+        let h2 = lut[1024u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)];
+        var s2 = hsv.y * lut[1280u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)]
+            * lut[1792u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        s2 = lut[2048u + u32(clamp(s2, 0.0, 1.0) * 255.0)];
+        let l2 = lum * lut[1536u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        var x2 = hsv_to_rgb(h2, clamp(s2, 0.0, 1.0), hsv.z);
+        let l3 = luma(x2);
+        if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
+        x = x2;
+    }
+    // HSL qualifier
+    if (u.qf.x > 0.5) {
+        let hsv = rgb_to_hsv(x);
+        let l = luma(x);
+        let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z, 1e-4), hue_dist(hsv.x, u.qh.x));
+        let ms = sstep(u.qs.x - u.qs.z, u.qs.x + u.qs.z, hsv.y)
+            * (1.0 - sstep(u.qs.y - u.qs.z, u.qs.y + u.qs.z, hsv.y));
+        let ml = sstep(u.ql.x - u.ql.z, u.ql.x + u.ql.z, l)
+            * (1.0 - sstep(u.ql.y - u.ql.z, u.ql.y + u.ql.z, l));
+        var mask = mh * ms * ml;
+        if (u.qf.y > 0.5) { mask = 1.0 - mask; }
+        if (mask > 0.001) {
+            var xq = hsv_to_rgb(hsv.x + u.qadj.x, clamp(hsv.y * (1.0 + u.qadj.y), 0.0, 1.0), hsv.z);
+            let lq = luma(xq);
+            if (lq > 1e-5) { xq = xq * ((l * (1.0 + u.qadj.z)) / lq); }
+            xq = xq + vec3<f32>(u.qadj.w * 0.06, 0.0, -u.qadj.w * 0.06);
+            x = mix(x, xq, mask);
+        }
+    }
     return x;
 }
 
+fn bil_ch(sx: f32, sy: f32, ch: u32) -> f32 {
+    let sw = u.g2.x;
+    let sh = u.g2.y;
+    let x0 = i32(floor(sx));
+    let y0 = i32(floor(sy));
+    if (x0 < 0 || y0 < 0 || x0 + 1 >= i32(sw) || y0 + 1 >= i32(sh)) {
+        if (x0 >= 0 && y0 >= 0 && x0 < i32(sw) && y0 < i32(sh)) {
+            return io_a[u32(y0) * sw + u32(x0)][ch];
+        }
+        return 0.0;
+    }
+    let tx = sx - floor(sx);
+    let ty = sy - floor(sy);
+    let i00 = u32(y0) * sw + u32(x0);
+    let a = mix(io_a[i00][ch], io_a[i00 + 1u][ch], tx);
+    let b = mix(io_a[i00 + sw][ch], io_a[i00 + sw + 1u][ch], tx);
+    return mix(a, b, ty);
+}
+
 fn hash(p: vec2<f32>, seed: f32) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(12.9898 + seed, 78.233 + seed * 1.7))) * 43758.5453);
+    // integer hash: bit-identical between Metal and CPU f32 sin is not
+    var h = u32(p.x) * 2654435761u + u32(p.y) * 2246822519u + u32(seed + 1.0) * 3266489917u;
+    h = (h ^ (h >> 13u)) * 1103515245u;
+    h = h ^ (h >> 16u);
+    return f32(h) * (1.0 / 4294967296.0);
 }
 
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
@@ -399,21 +705,34 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         }
         default: {}
     }
-    // bilinear sample (black outside)
+    // bilinear sample (black outside); ca_fix splits the R/B taps radially
     var col = vec3<f32>(0.0);
-    let x0 = i32(floor(sx));
-    let y0 = i32(floor(sy));
-    if (x0 >= 0 && y0 >= 0 && x0 + 1 < i32(sw) && y0 + 1 < i32(sh)) {
-        let tx = sx - floor(sx);
-        let ty = sy - floor(sy);
-        let i00 = u32(y0) * sw + u32(x0);
-        let c00 = io_a[i00].xyz;
-        let c10 = io_a[i00 + 1u].xyz;
-        let c01 = io_a[i00 + sw].xyz;
-        let c11 = io_a[i00 + sw + 1u].xyz;
-        col = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
-    } else if (x0 >= 0 && y0 >= 0 && x0 < i32(sw) && y0 < i32(sh)) {
-        col = io_a[u32(y0) * sw + u32(x0)].xyz;
+    if (u.fx0.x != 0.0) {
+        let wcx = f32(sw) * 0.5;
+        let wcy = f32(sh) * 0.5;
+        let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
+        let fr = 1.0 - u.fx0.x * 0.05 * rn;
+        let fb = 1.0 + u.fx0.x * 0.05 * rn;
+        col = vec3<f32>(
+            bil_ch(wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0u),
+            bil_ch(sx, sy, 1u),
+            bil_ch(wcx + (sx - wcx) * fb, wcy + (sy - wcy) * fb, 2u),
+        );
+    } else {
+        let x0 = i32(floor(sx));
+        let y0 = i32(floor(sy));
+        if (x0 >= 0 && y0 >= 0 && x0 + 1 < i32(sw) && y0 + 1 < i32(sh)) {
+            let tx = sx - floor(sx);
+            let ty = sy - floor(sy);
+            let i00 = u32(y0) * sw + u32(x0);
+            let c00 = io_a[i00].xyz;
+            let c10 = io_a[i00 + 1u].xyz;
+            let c01 = io_a[i00 + sw].xyz;
+            let c11 = io_a[i00 + sw + 1u].xyz;
+            col = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+        } else if (x0 >= 0 && y0 >= 0 && x0 < i32(sw) && y0 < i32(sh)) {
+            col = io_a[u32(y0) * sw + u32(x0)].xyz;
+        }
     }
     var adj = adjust(col);
     // dodge/burn radial lights (dst-normalized coords)
@@ -423,6 +742,49 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let d = distance(vec2<f32>(nx, ny), lt.xy) / max(lt.z, 1e-3);
         let f = exp(-d * d * 2.77);
         adj = adj * (1.0 + lt.w * f * 0.5);
+    }
+    // power windows
+    let nw = u32(u.misc2.x);
+    for (var wi = 0u; wi < nw; wi = wi + 1u) {
+        let w0 = u.wins[wi * 4u];
+        let w1 = u.wins[wi * 4u + 1u];
+        let w2 = u.wins[wi * 4u + 2u];
+        let kind = u32(w2.y) % 2u;
+        var mask = 0.0;
+        if (kind == 1u) {
+            // gradient: full cover before the p1..p2 span, soft ramp across
+            let dvec = w0.zw - w0.xy;
+            let len2 = max(dot(dvec, dvec), 1e-6);
+            let t = dot(vec2<f32>(nx, ny) - w0.xy, dvec) / len2;
+            let soft = max(w1.y, 0.02);
+            mask = 1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t);
+        } else {
+            // circle/ellipse
+            let rot = w1.x * 0.0174533;
+            let dd = vec2<f32>(nx, ny) - w0.xy;
+            let rr = max(w0.zw, vec2<f32>(0.005));
+            let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
+            let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
+            let d = length(vec2<f32>(ux, uy));
+            mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
+        }
+        if (w2.y >= 2.0) { mask = 1.0 - mask; }
+        if (mask > 0.001) {
+            let evg = pow(2.0, w1.z * mask);
+            let l = luma(adj);
+            adj = adj * evg;
+            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + w1.w * mask);
+            adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
+        }
+    }
+    // lens flare: core + horizontal streak + mirrored ghost ring
+    if (u.flare.z > 0.0) {
+        let dvec = vec2<f32>(nx, ny) - u.flare.xy;
+        let core = exp(-dot(dvec, dvec) / 0.004);
+        let streak = exp(-dvec.y * dvec.y / (0.0004 + 0.02 * u.flare.z)) * exp(-abs(dvec.x) / 0.35);
+        let gd = abs(distance(vec2<f32>(nx, ny), vec2<f32>(1.0) - u.flare.xy) - 0.10);
+        let ghost = exp(-gd * gd / 0.0008);
+        adj = adj + hue_to_rgb(u.flare.w) * (u.flare.z * (0.5 * core + 0.7 * streak + 0.35 * ghost));
     }
     // film grain (pre-gamma, linear domain)
     if (u.a4.x > 0.0) {
@@ -462,6 +824,8 @@ pub struct Gpu {
     stats: Pipe,
     heal: Pipe,
     nr: Pipe,
+    soft: Pipe,
+    glow: Pipe,
     sharpen: Pipe,
     finish: Pipe,
 }
@@ -560,6 +924,8 @@ impl Gpu {
             stats: mk("stats_main"),
             heal: mk("heal_main"),
             nr: mk("nr_main"),
+            soft: mk("soft_main"),
+            glow: mk("glow_main"),
             sharpen: mk("sharpen_main"),
             finish: mk("finish_main"),
             device,
@@ -625,19 +991,28 @@ impl Gpu {
             usage: U::STORAGE | U::COPY_SRC,
             mapped_at_creation: false,
         });
+        // r,g,b,luma sums + count + 256-bin luma hist + pick rgb sums + pick cnt
+        const STATS_N: u64 = 265;
         let stats_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats"),
-            // r,g,b,luma sums + count + 256-bin luma histogram
-            size: (5 + 256) * 4,
+            size: STATS_N * 4,
             usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
             mapped_at_creation: false,
         });
+        // master 256 + per-channel 768 + hue-curves 1280
+        const LUT_N: u64 = 2304;
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lut"),
-            size: 1024,
+            size: LUT_N * 4,
             usage: storage_in,
             mapped_at_creation: false,
         });
+        // WB pick rect (virtual src px) for the stats pass
+        let pick0 = if r.wb_mode == crate::recipe::WbMode::Pick {
+            pick_rect(r.wb_pick, vw as usize, vh as usize, m.info.flip)
+        } else {
+            [-1.0; 4]
+        };
         let uni_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uni"),
             size: std::mem::size_of::<Uni>() as u64,
@@ -687,6 +1062,65 @@ impl Gpu {
                 a
             },
             lts: p.lights,
+            off0: [p.offset[0], p.offset[1], p.offset[2], 0.0],
+            mt0: [p.mid_col[0], p.mid_col[1], p.mid_col[2], p.mid_sat],
+            z0: p.zones[0],
+            z1: p.zones[1],
+            z2: p.zones[2],
+            z3: p.zones[3],
+            pv: [
+                p.pivot,
+                p.hl_roll,
+                p.sh_roll,
+                if p.chan_luts.is_empty() { 0.0 } else { 1.0 },
+            ],
+            qh: [p.qh[0], p.qh[1], p.qh[2], 0.0],
+            qs: [p.qs[0], p.qs[1], p.qs[2], 0.0],
+            ql: [p.ql[0], p.ql[1], p.ql[2], 0.0],
+            qadj: p.qadj,
+            qf: [
+                if p.has_qual { 1.0 } else { 0.0 },
+                if p.q_invert { 1.0 } else { 0.0 },
+                if p.mixer != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            mx0: [p.mixer[0], p.mixer[1], p.mixer[2], 0.0],
+            mx1: [p.mixer[3], p.mixer[4], p.mixer[5], 0.0],
+            mx2: [p.mixer[6], p.mixer[7], p.mixer[8], 0.0],
+            mono0: [p.mono[0], p.mono[1], p.mono[2], p.beauty],
+            pick0,
+            misc2: [
+                p.n_wins as f32,
+                p.n_clones as f32,
+                if p.hue_luts.is_empty() { 0.0 } else { 1.0 },
+                p.deband,
+            ],
+            fx0: [p.ca_fix, p.glow, p.noise_chroma, if p.chan_luts.is_empty() { 0.0 } else { 1.0 }],
+            flare: p.flare,
+            wins: {
+                let mut a = [[0.0f32; 4]; 16];
+                for (i, w) in p.wins.iter().take(4).enumerate() {
+                    a[i * 4] = [w[1], w[2], w[3], w[4]];
+                    a[i * 4 + 1] = [w[5], w[6], w[7], w[8]];
+                    a[i * 4 + 2] = [w[9], w[0], 0.0, 0.0];
+                }
+                a
+            },
+            clones: {
+                let mut a = [[0.0f32; 4]; 16];
+                for (i, c) in p.clones.iter().take(8).enumerate() {
+                    let (sx, sy) = frame_to_src(c[0], c[1], vw as usize, vh as usize, m.info.flip);
+                    let (dx, dy) = frame_to_src(c[2], c[3], vw as usize, vh as usize, m.info.flip);
+                    let (fw2, fh2) = match m.info.flip {
+                        5 | 6 => (vh, vw),
+                        _ => (vw, vh),
+                    };
+                    let rad = (c[4] * fw2.max(fh2) as f32).max(2.0);
+                    a[i * 2] = [sx, sy, rad, 0.0];
+                    a[i * 2 + 1] = [dx, dy, 0.0, 0.0];
+                }
+                a
+            },
         };
 
         let bind = |pipe: &Pipe| {
@@ -726,22 +1160,23 @@ impl Gpu {
         let stats = if Stats::needs(r) {
             // keep total samples under ~64K so the u32 accumulators can't overflow
             let step = ((n_px as f64 / 65536.0).sqrt().ceil() as u32).max(2);
-            self.queue.write_buffer(&stats_b, 0, &vec![0u8; (5 + 256) * 4]);
+            self.queue.write_buffer(&stats_b, 0, &vec![0u8; STATS_N as usize * 4]);
             self.queue
                 .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&build_params(m, r, None), step)));
             let mut enc = dev.create_command_encoder(&Default::default());
             run(&mut enc, &self.stats, (vw.div_ceil(step) * vh.div_ceil(step)) as u64);
             let stg = dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stg_stats"),
-                size: (5 + 256) * 4,
+                size: STATS_N * 4,
                 usage: U::COPY_DST | U::MAP_READ,
                 mapped_at_creation: false,
             });
-            enc.copy_buffer_to_buffer(&stats_b, 0, &stg, 0, (5 + 256) * 4);
+            enc.copy_buffer_to_buffer(&stats_b, 0, &stg, 0, STATS_N * 4);
             self.queue.submit([enc.finish()]);
-            let s = readback(dev, &stg, (5 + 256) * 4)?;
+            let s = readback(dev, &stg, STATS_N as usize * 4)?;
             let raw: &[u32] = bytemuck::cast_slice(&s);
             let cnt = raw[3].max(1) as f64;
+            let pcnt = raw[264] as f64;
             let mut st = Stats {
                 means: [
                     (raw[0] as f64 / 1e3 / cnt) as f32,
@@ -751,6 +1186,16 @@ impl Gpu {
                 luma_mean: (raw[4] as f64 / 1e3 / cnt) as f32,
                 luma_hist: [0u32; 256],
                 count: raw[3] as u64,
+                pick_means: if pcnt > 0.0 {
+                    [
+                        (raw[261] as f64 / 1e3 / pcnt) as f32,
+                        (raw[262] as f64 / 1e3 / pcnt) as f32,
+                        (raw[263] as f64 / 1e3 / pcnt) as f32,
+                    ]
+                } else {
+                    [0.0; 3]
+                },
+                pick_count: raw[264] as u64,
             };
             st.luma_hist.copy_from_slice(&raw[5..261]);
             Some(st)
@@ -759,19 +1204,57 @@ impl Gpu {
         };
 
         let p = build_params(m, r, stats.as_ref());
-        self.queue.write_buffer(&lut_b, 0, bytemuck::cast_slice(&p.lut));
+        // packed lut buffer: master | chan r,g,b | hue hh,hs,hl,ls,ss
+        let mut lut_buf = vec![0.0f32; LUT_N as usize];
+        lut_buf[..256].copy_from_slice(&p.lut);
+        for c in 0..3 {
+            let off = 256 + c * 256;
+            if p.chan_luts.is_empty() {
+                for i in 0..256 {
+                    lut_buf[off + i] = i as f32 / 255.0;
+                }
+            } else {
+                lut_buf[off..off + 256].copy_from_slice(&p.chan_luts[c * 256..(c + 1) * 256]);
+            }
+        }
+        let hue_defaults: [fn(f32) -> f32; 5] = [
+            |x| x,
+            |_| 1.0,
+            |_| 1.0,
+            |_| 1.0,
+            |x| x,
+        ];
+        for k in 0..5 {
+            let off = 1024 + k * 256;
+            if p.hue_luts.is_empty() {
+                for i in 0..256 {
+                    lut_buf[off + i] = hue_defaults[k](i as f32 / 255.0);
+                }
+            } else {
+                lut_buf[off..off + 256].copy_from_slice(&p.hue_luts[k * 256..(k + 1) * 256]);
+            }
+        }
+        self.queue.write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         self.queue
             .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p, 0)));
 
         let mut enc = dev.create_command_encoder(&Default::default());
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.
-        if p.n_spots > 0 {
+        if p.n_spots > 0 || p.n_clones > 0 {
             run(&mut enc, &self.heal, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
-        if p.noise_luma > 0.0 {
+        if p.noise_luma > 0.0 || p.noise_chroma > 0.0 {
             run(&mut enc, &self.nr, n_px);
+            enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
+        if p.beauty > 0.0 || p.deband > 0.0 {
+            run(&mut enc, &self.soft, n_px);
+            enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
+        if p.glow > 0.0 {
+            run(&mut enc, &self.glow, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
         if p.sharpen > 0.0 || p.clarity != 0.0 {

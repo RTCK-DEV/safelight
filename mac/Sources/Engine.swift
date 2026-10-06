@@ -94,6 +94,33 @@ final class AraEngine: @unchecked Sendable {
         return (cgImage(img), rows)
     }
 
+    /// Render plus scope buffers (histogram, waveform 3ch, vectorscope, CIE xy).
+    func renderScopes(path: String, recipe: Recipe, maxPx: UInt32)
+        -> (CGImage?, [UInt32], [UInt32], [UInt32], [UInt32])
+    {
+        let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        var wave = [UInt32](repeating: 0, count: 196608)
+        var vec = [UInt32](repeating: 0, count: 65536)
+        var cie = [UInt32](repeating: 0, count: 65536)
+        var bins = [UInt32](repeating: 0, count: 1024)
+        let img = wave.withUnsafeMutableBufferPointer { wv in
+            vec.withUnsafeMutableBufferPointer { vc in
+                cie.withUnsafeMutableBufferPointer { ce in
+                    bins.withUnsafeMutableBufferPointer { hs in
+                        js.withCString { r in
+                            path.withCString {
+                                araware_scopes(handle, $0, r, maxPx,
+                                               wv.baseAddress, vc.baseAddress,
+                                               ce.baseAddress, hs.baseAddress)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return (cgImage(img), bins, wave, vec, cie)
+    }
+
     func export(path: String, recipe: Recipe) -> CGImage? {
         let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
         return cgImage(js.withCString { r in path.withCString { araware_export(handle, $0, r) } })

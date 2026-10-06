@@ -8,6 +8,8 @@ pub enum WbMode {
     AsShot,
     /// neutralize on scene average (grey world)
     Auto,
+    /// eyedropper: neutralize the point in `wb_pick`
+    Pick,
     /// explicit kelvin/tint offsets relative to as-shot
     Manual,
 }
@@ -79,6 +81,91 @@ pub struct Recipe {
     pub spots: Vec<[f32; 4]>,
     /// dodge/burn radial lights [cx, cy, radius, ev] in normalized frame coords
     pub lights: Vec<[f32; 4]>,
+    // ---- DaVinci color page extras ----
+    /// WB eyedropper point (frame-normalized); used when wb_mode="pick"
+    pub wb_pick: [f32; 2],
+    /// global offset wheel, -0.25..0.25
+    pub offset: [f32; 3],
+    /// 3-way midtone tint: hue (0..1) + amount
+    pub midtone_hue: f32,
+    pub midtone_sat: f32,
+    /// per-channel custom curves (same [[x,y]] format as `curve`)
+    pub curve_r: Vec<[f32; 2]>,
+    pub curve_g: Vec<[f32; 2]>,
+    pub curve_b: Vec<[f32; 2]>,
+    /// hue-domain curves, x = input hue 0..1
+    pub hue_hue: Vec<[f32; 2]>,  // y = output hue 0..1
+    pub hue_sat: Vec<[f32; 2]>,  // y = sat gain (1 = neutral)
+    pub hue_lum: Vec<[f32; 2]>,  // y = luma gain (1 = neutral)
+    pub lum_sat: Vec<[f32; 2]>,  // y = sat gain vs input luma
+    pub sat_sat: Vec<[f32; 2]>,  // y = output sat (remap)
+    /// HSL qualifier (secondary): soft windows in each H/S/L channel
+    pub qh: [f32; 3],            // hue [center, half_width, soft] 0..1 cycle
+    pub qs: [f32; 3],            // sat [lo, hi, soft]
+    pub ql: [f32; 3],            // lum [lo, hi, soft]
+    /// inside-mask adjustments [hue_shift, sat_gain, lum_gain, temp]
+    pub qadj: [f32; 4],
+    pub q_invert: bool,
+    /// power windows: parametric spatial masks carrying local adjustments (max 4)
+    pub windows: Vec<PowerWindow>,
+    // ---- HDR wheels + raw gamma controls ----
+    /// zone adjustments [hue_tint(0..1), tint_amt, ev, sat] applied per luma band
+    pub z_dark: [f32; 4],
+    pub z_shadow: [f32; 4],
+    pub z_light: [f32; 4],
+    pub z_global: [f32; 4],
+    /// contrast pivot point, 0..1 (DaVinci pivot / raw midpoint)
+    pub pivot: f32,
+    /// highlight rolloff compression, 0..2 (1 = linear)
+    pub highlight_rolloff: f32,
+    /// shadow rolloff, 0..2 (1 = linear)
+    pub shadow_rolloff: f32,
+    // ---- channel mixer / clone stamp / beauty ----
+    /// RGB mixer: 3x3 row-major (identity default)
+    pub mixer: [f32; 9],
+    /// monochrome conversion weights [r,g,b]; all-zero = off
+    pub mono: [f32; 3],
+    /// clone stamps [sx, sy, dx, dy, radius, _] frame-normalized (max 8)
+    pub clones: Vec<[f32; 6]>,
+    /// skin smoothing amount 0..1 (edge-aware, skin-hue weighted)
+    pub beauty: f32,
+    // ---- restoration + light fx ----
+    /// chroma noise reduction 0..1 (spatial, pairs with noise_luma)
+    pub noise_chroma: f32,
+    /// chromatic aberration fix -0.5..0.5 (radial R/B scale)
+    pub ca_fix: f32,
+    /// debanding amount 0..1 (smooths quantized gradients)
+    pub deband: f32,
+    /// lens glow (bloom on highlights) 0..1
+    pub glow: f32,
+    /// lens flare [cx, cy, strength, hue] frame-normalized
+    pub flare: [f32; 4],
+}
+
+/// parametric spatial mask + local adjustment (DaVinci power window).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerWindow {
+    /// "circle" (p=[cx,cy,rx,ry,rot_deg,soft]) or "gradient" (p=[x1,y1,x2,y2,soft,0])
+    pub kind: String,
+    pub p: [f32; 6],
+    pub ev: f32,             // exposure offset in EV, -4..4
+    pub sat: f32,            // saturation offset -1..1
+    pub temp: f32,           // warm(+)/cool(-) -1..1
+    pub invert: bool,
+}
+
+impl Default for PowerWindow {
+    fn default() -> Self {
+        PowerWindow {
+            kind: "circle".into(),
+            p: [0.5, 0.5, 0.15, 0.15, 0.0, 0.2],
+            ev: 0.0,
+            sat: 0.0,
+            temp: 0.0,
+            invert: false,
+        }
+    }
 }
 
 impl Default for Recipe {
@@ -115,6 +202,40 @@ impl Default for Recipe {
             crop: [0.0; 4],
             spots: Vec::new(),
             lights: Vec::new(),
+            wb_pick: [0.5, 0.5],
+            offset: [0.0; 3],
+            midtone_hue: 0.33,
+            midtone_sat: 0.0,
+            curve_r: Vec::new(),
+            curve_g: Vec::new(),
+            curve_b: Vec::new(),
+            hue_hue: Vec::new(),
+            hue_sat: Vec::new(),
+            hue_lum: Vec::new(),
+            lum_sat: Vec::new(),
+            sat_sat: Vec::new(),
+            qh: [0.0, 0.0, 0.05],
+            qs: [0.0, 1.0, 0.05],
+            ql: [0.0, 1.0, 0.05],
+            qadj: [0.0; 4],
+            q_invert: false,
+            windows: Vec::new(),
+            z_dark: [0.0; 4],
+            z_shadow: [0.0; 4],
+            z_light: [0.0; 4],
+            z_global: [0.0; 4],
+            pivot: 0.18,
+            highlight_rolloff: 1.0,
+            shadow_rolloff: 1.0,
+            mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            mono: [0.0; 3],
+            clones: Vec::new(),
+            beauty: 0.0,
+            noise_chroma: 0.0,
+            ca_fix: 0.0,
+            deband: 0.0,
+            glow: 0.0,
+            flare: [0.0; 4],
         }
     }
 }
