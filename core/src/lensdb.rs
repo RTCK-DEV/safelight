@@ -341,13 +341,19 @@ impl LensDb {
                 } else if q.contains(&nn) || nn.contains(&q) {
                     usize::MAX - 1
                 } else {
-                    // token scoring: count significant shared tokens
+                    // token scoring: shared significant tokens; at least
+                    // one must carry a digit (model number / focal) so
+                    // generic pairs like "Mark III" can't false-match
                     let nt = Self::tokens(n);
-                    let hit = qsig
-                        .iter()
-                        .filter(|t| nt.iter().any(|u| u == **t))
-                        .count();
-                    if hit >= 2 { hit } else { continue; }
+                    let mut hit = 0usize;
+                    let mut digit_hit = false;
+                    for t in &qsig {
+                        if nt.iter().any(|u| *u == **t) {
+                            hit += 1;
+                            digit_hit |= t.chars().any(|c| c.is_ascii_digit());
+                        }
+                    }
+                    if hit >= 2 && digit_hit { hit } else { continue; }
                 };
                 if best.map(|(_, s)| score > s).unwrap_or(true) {
                     best = Some((l, score));
@@ -427,9 +433,11 @@ impl LensDb {
             scale: 1.0,
             lens_name: String::new(),
         };
+        // NOTE: never free-text match the *camera model* as a lens —
+        // generic tokens ("mark", "iii") false-match unrelated lenses.
+        // Empty EXIF lens is handled by fixed_lens() below.
         let lens = self
             .find_lens(exif_lens)
-            .or_else(|| self.find_lens(model))
             .or_else(|| self.fixed_lens(make, model));
         let Some(lens) = lens else {
             return none;
