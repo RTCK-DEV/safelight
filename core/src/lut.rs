@@ -20,7 +20,7 @@ impl CubeLut {
     pub fn sample(&self, r: f32, g: f32, b: f32) -> [f32; 3] {
         let n = self.size as f32;
         let norm = |v: f32, c: usize| {
-            ((v * self.dscale[c] + self.dmin[c]).clamp(0.0, 1.0) * (n - 1.0))
+            (v * self.dscale[c] + self.dmin[c]).clamp(0.0, 1.0) * (n - 1.0)
         };
         let fx = norm(r, 0);
         let fy = norm(g, 1);
