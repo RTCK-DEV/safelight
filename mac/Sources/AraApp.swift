@@ -93,8 +93,25 @@ final class LibraryStore: ObservableObject {
             return eng.smartEval(rules: (try? JSONSerialization.jsonObject(
                 with: Data(c.rules.utf8))) as? [String: Any] ?? [:])
         }
+        // manual collection: items may live in any known folder — resolve
+        // each ref against its own folder's catalog snapshot (variants
+        // appear there with path#vN refs of their own)
         let refs = Set(eng.collectionItems(id: cid))
-        return photos.filter { refs.contains($0.ref) || refs.contains($0.path) }
+        var byFolder: [String: Set<String>] = [:]
+        for r in refs {
+            let base = String(r.split(separator: "#").first.map(String.init) ?? r)
+            byFolder[URL(fileURLWithPath: base).deletingLastPathComponent().path,
+                     default: []].insert(r)
+        }
+        var out: [Photo] = []
+        for (dir, rs) in byFolder {
+            let snap = dir == (folder?.path ?? "") ? photos
+                : eng.assetsSnapshot(folder: dir)
+            out.append(contentsOf: snap.filter {
+                rs.contains($0.ref) || rs.contains($0.path)
+            })
+        }
+        return out
     }
 
     var filtered: [Photo] {

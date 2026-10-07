@@ -280,47 +280,14 @@ impl Catalog {
             }
             push(p, "raster", None);
         }
-        // expand virtual copies: <stem>.araware.v{n}.json siblings
-        let mut variants: Vec<AssetEntry> = Vec::new();
-        for e in entries.iter() {
-            for n in 1..=64u32 {
-                let vp = sidecar_path_for_v(Path::new(&e.path), n);
-                if !vp.exists() {
-                    break;
-                }
-                let sc = read_sidecar(&vp).unwrap_or_default();
-                variants.push(AssetEntry {
-                    path: e.path.clone(),
-                    name: format!("{} v{}", e.name, n),
-                    kind: e.kind.clone(),
-                    size: e.size,
-                    mtime: e.mtime,
-                    rating: sc.rating,
-                    label: sc.label.clone(),
-                    flag: sc.flag,
-                    keywords: sc.keywords.clone(),
-                    vslot: n,
-                    stack: 0,
-                    stack_seq: 0,
-                    pair: e.pair.clone(),
-                    has_sidecar: true,
-                    camera: e.camera.clone(),
-                    lens: e.lens.clone(),
-                    ctime: e.ctime,
-                    iso: e.iso,
-                    aperture: e.aperture,
-                    focal: e.focal,
-                    shutter: e.shutter,
-                });
-            }
-        }
-        entries.extend(variants);
+        expand_variants(&mut entries);
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 
     /// DB snapshot of a folder without rescanning (fast open / collections).
-    /// Stack ids are included; variants are scan-time objects and not stored.
+    /// Stack ids come from the files table; virtual copies are probed from
+    /// their sidecars exactly like scan() does, so the result mirrors scan.
     pub fn assets(&self, folder: &Path) -> Result<Vec<AssetEntry>> {
         let mut st = self.db.prepare(
             "SELECT path,name,kind,size,mtime,rating,label,flag,keywords,
@@ -354,7 +321,12 @@ impl Catalog {
                 lens: r.get(18)?,
             })
         })?;
-        Ok(rows.flatten().collect())
+        let mut out: Vec<AssetEntry> = rows.flatten().collect();
+        // variants live only in sidecars, not the files table — probe for
+        // them here too so snapshots match what scan() would return
+        expand_variants(&mut out);
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     /// every folder ever scanned (for the library sidebar)
@@ -665,6 +637,46 @@ impl Catalog {
         })?;
         Ok(rows.flatten().collect())
     }
+}
+
+/// Append virtual-copy rows for `<stem>.araware.v{n}.json` siblings (v1..v64).
+/// Variants are never stored in the files table — they exist as sidecars on
+/// disk, so both scan() and assets() probe for them identically.
+fn expand_variants(entries: &mut Vec<AssetEntry>) {
+    let mut variants: Vec<AssetEntry> = Vec::new();
+    for e in entries.iter() {
+        for n in 1..=64u32 {
+            let vp = sidecar_path_for_v(Path::new(&e.path), n);
+            if !vp.exists() {
+                break;
+            }
+            let sc = read_sidecar(&vp).unwrap_or_default();
+            variants.push(AssetEntry {
+                path: e.path.clone(),
+                name: format!("{} v{}", e.name, n),
+                kind: e.kind.clone(),
+                size: e.size,
+                mtime: e.mtime,
+                rating: sc.rating,
+                label: sc.label.clone(),
+                flag: sc.flag,
+                keywords: sc.keywords.clone(),
+                vslot: n,
+                stack: 0,
+                stack_seq: 0,
+                pair: e.pair.clone(),
+                has_sidecar: true,
+                camera: e.camera.clone(),
+                lens: e.lens.clone(),
+                ctime: e.ctime,
+                iso: e.iso,
+                aperture: e.aperture,
+                focal: e.focal,
+                shutter: e.shutter,
+            });
+        }
+    }
+    entries.extend(variants);
 }
 
 pub fn read_sidecar(sc_path: &Path) -> Result<Sidecar> {
