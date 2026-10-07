@@ -85,6 +85,17 @@ pub struct Params {
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
     pub wins: [[f32; 12]; 4],
     pub n_wins: u32,
+    /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
+    /// dst-normalized coords, then per-stroke records of 3 entries:
+    /// [radius, soft, signed_opacity(+paint/-erase), layer],
+    /// [seg_start, seg_count, 0, 0],
+    /// [xmin, ymin, xmax, ymax] aspect-space bbox (padded by radius).
+    /// Layer params (ev,sat,temp,strength) in brush_layers;
+    /// brush_misc = [n_strokes, dst_aspect, link_q_bits, 0].
+    pub brush_segs: Vec<[f32; 4]>,
+    pub brush_strokes: Vec<[f32; 4]>,
+    pub brush_layers: [[f32; 4]; 4],
+    pub brush_misc: [f32; 4],
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
     pub zones: [[f32; 4]; 4],
     pub mixer: [f32; 9],
@@ -726,6 +737,75 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         ];
     }
 
+    // adjustment brushes → flattened segments + per-stroke records.
+    // Strokes live in frame-normalized coords like windows; translate into
+    // dst-normalized space here. Radius is a frame-height fraction → /sh.
+    // Per-stroke records (3 entries):
+    //   [radius_dst, soft, opacity_signed(+paint/−erase), layer_idx]
+    //   [seg_start, seg_count, 0, 0]
+    //   [xmin, ymin, xmax, ymax] normalized-space bbox (unpadded)
+    let mut brush_segs: Vec<[f32; 4]> = Vec::new();
+    let mut brush_strokes: Vec<[f32; 4]> = Vec::new();
+    let mut brush_layers = [[0.0f32; 4]; 4];
+    let mut link_bits = 0.0f32;
+    for (li, b) in r.brushes.iter().take(4).enumerate() {
+        brush_layers[li] = [
+            b.ev.clamp(-4.0, 4.0),
+            b.sat.clamp(-1.0, 1.0),
+            b.temp.clamp(-1.0, 1.0),
+            if b.enabled { b.opacity.clamp(0.0, 1.0) } else { 0.0 },
+        ];
+        if b.link_q {
+            link_bits += (1u32 << li) as f32;
+        }
+        for st in b.strokes.iter() {
+            if st.pts.len() < 2 {
+                continue;
+            }
+            if brush_strokes.len() >= 64 * 3 {
+                break;
+            }
+            let seg_start = brush_segs.len() as f32;
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for w in st.pts.windows(2) {
+                if brush_segs.len() >= 4096 {
+                    break;
+                }
+                let a = [
+                    (w[0][0] - r.crop[0]) / sw,
+                    (w[0][1] - r.crop[1]) / sh,
+                ];
+                let c = [
+                    (w[1][0] - r.crop[0]) / sw,
+                    (w[1][1] - r.crop[1]) / sh,
+                ];
+                x0 = x0.min(a[0].min(c[0]));
+                y0 = y0.min(a[1].min(c[1]));
+                x1 = x1.max(a[0].max(c[0]));
+                y1 = y1.max(a[1].max(c[1]));
+                brush_segs.push([a[0], a[1], c[0], c[1]]);
+            }
+            let nseg = brush_segs.len() as f32 - seg_start;
+            if nseg < 1.0 {
+                continue;
+            }
+            brush_strokes.push([
+                (st.radius / sh).clamp(0.001, 1.0),
+                st.soft.clamp(0.0, 0.98),
+                if st.erase { -st.opacity.abs() } else { st.opacity.abs() },
+                li as f32,
+            ]);
+            brush_strokes.push([seg_start, nseg, 0.0, 0.0]);
+            brush_strokes.push([x0, y0, x1, y1]);
+        }
+    }
+    let brush_misc = [
+        (brush_strokes.len() / 3) as f32,
+        link_bits,
+        0.0,
+        0.0,
+    ];
+
     let mut clones = [[0.0; 6]; 8];
     for (i, c) in r.clones.iter().take(8).enumerate() {
         clones[i] = [
@@ -832,6 +912,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         q_clean: [r.q_clean[0].clamp(0.0, 1.0), r.q_clean[1].clamp(0.0, 1.0)],
         q_blur: r.q_blur.clamp(0.0, 1.0),
         q_show: r.q_show,
+        brush_segs,
+        brush_strokes,
+        brush_layers,
+        brush_misc,
         // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
@@ -2258,6 +2342,68 @@ fn finish_linear(
                 }
                 adj[0] += win[9] * mask * 0.08;
                 adj[2] -= win[9] * mask * 0.08;
+            }
+            // adjustment brushes: same local ev/sat/temp inside stroke masks
+            let n_str = p.brush_misc[0] as usize;
+            if n_str > 0 {
+                let aspect = dw as f32 / dh as f32;
+                let link_bits = p.brush_misc[1] as u32;
+                let (pax, pay) = (nx * aspect, ny);
+                let mut pm = [0.0f32; 4];
+                let mut em = [0.0f32; 4];
+                for s in 0..n_str {
+                    let e0 = p.brush_strokes[s * 3];
+                    let e1 = p.brush_strokes[s * 3 + 1];
+                    let bb = p.brush_strokes[s * 3 + 2];
+                    let rad = e0[0];
+                    if pax < bb[0] * aspect - rad || pax > bb[2] * aspect + rad {
+                        continue;
+                    }
+                    if pay < bb[1] - rad || pay > bb[3] + rad {
+                        continue;
+                    }
+                    let inner = rad * (1.0 - e0[1]);
+                    let mut w = 0.0f32;
+                    let (s0, s1) = (e1[0] as usize, (e1[0] + e1[1]) as usize);
+                    for g in s0..s1.min(p.brush_segs.len()) {
+                        let seg = p.brush_segs[g];
+                        let ax = seg[0] * aspect;
+                        let bx = seg[2] * aspect;
+                        let (vx, vy) = (bx - ax, seg[3] - seg[1]);
+                        let len2 = (vx * vx + vy * vy).max(1e-9);
+                        let t = (((pax - ax) * vx + (pay - seg[1]) * vy) / len2).clamp(0.0, 1.0);
+                        let dx = pax - ax - t * vx;
+                        let dy = pay - seg[1] - t * vy;
+                        let d = (dx * dx + dy * dy).sqrt();
+                        w = w.max(1.0 - sstep(inner, rad, d));
+                    }
+                    let li = (e0[3] as usize).min(3);
+                    if e0[2] >= 0.0 {
+                        pm[li] = pm[li].max(w * e0[2]);
+                    } else {
+                        em[li] = em[li].max(w * -e0[2]);
+                    }
+                }
+                for (li, lp) in p.brush_layers.iter().enumerate() {
+                    let mut mask = (pm[li] - em[li]).clamp(0.0, 1.0) * lp[3];
+                    if mask <= 0.001 {
+                        continue;
+                    }
+                    if link_bits & (1u32 << li) != 0 {
+                        mask *= qual_mask(col, p);
+                    }
+                    if mask <= 0.001 {
+                        continue;
+                    }
+                    let evg = (2.0f32).powf(lp[0] * mask);
+                    let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
+                    for c in 0..3 {
+                        adj[c] = adj[c] * evg;
+                        adj[c] = l + (adj[c] - l) * (1.0 + lp[1] * mask);
+                    }
+                    adj[0] += lp[2] * mask * 0.08;
+                    adj[2] -= lp[2] * mask * 0.08;
+                }
             }
             // lens flare: core glow + horizontal streak + mirrored ghost ring
             if p.flare[2] > 0.0 {

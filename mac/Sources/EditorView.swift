@@ -111,6 +111,13 @@ struct EditorView: View {
     @State private var renderTask: Task<Void, Never>?
     // tool: off|heal|dodge|burn|wbpick|clone|window|grad|flare|qpick|qadd|qsub
     @State private var retouchMode = "off"
+    // adjustment brush
+    @State private var brushRadius: Double = 0.04
+    @State private var brushSoft: Double = 0.5
+    @State private var brushFlow: Double = 1.0
+    @State private var brushErase = false
+    @State private var selBrush = 0              // active brush layer index
+    @State private var liveFrame: [[Double]] = [] // in-progress stroke (frame-norm)
     @State private var spotSize = 0.05
     @State private var lightRadius = 0.25
     @State private var lightEV = 0.5
@@ -216,6 +223,17 @@ struct EditorView: View {
             w.p = [0.0, fy, 1.0, fy, 0, 0.5]
             recipe.windows.append(w)
             selWindow = w.id
+        case "brush":
+            // tap = single dab (zero-length segment resolves to a disc)
+            if recipe.brushes.isEmpty { recipe.brushes.append(BrushLayer()) }
+            if selBrush >= recipe.brushes.count { selBrush = recipe.brushes.count - 1 }
+            var st = BrushStroke()
+            st.pts = [[fx, fy], [fx, fy]]
+            st.radius = brushRadius
+            st.soft = brushSoft
+            st.opacity = brushFlow
+            st.erase = brushErase
+            recipe.brushes[selBrush].strokes.append(st)
         case "flare":
             recipe.flare[0] = nx
             recipe.flare[1] = ny
@@ -403,7 +421,10 @@ struct EditorView: View {
                 })
                 .gesture(DragGesture(minimumDistance: 4)
                     .onChanged { g in stageDrag(g, in: geo.size) }
-                    .onEnded { _ in dragBase = nil })
+                    .onEnded { _ in
+                        if retouchMode == "brush" { commitBrushStroke() }
+                        dragBase = nil
+                    })
                 .gesture(MagnifyGesture()
                     .onChanged { v in
                         if !pinching { pinching = true; pinchBase = zoom }
@@ -525,6 +546,19 @@ struct EditorView: View {
 
     /// Stage drag routing: window move / gradient draw / pan when zoomed.
     private func stageDrag(_ g: DragGesture.Value, in size: CGSize) {
+        if retouchMode == "brush" {
+            guard let (_, _, fx, fy) = frameCoord(g.location, in: size) else { return }
+            // sample the polyline at ~1/4-radius spacing so long strokes
+            // stay smooth without flooding the segment buffer
+            let minD = brushRadius * 0.25
+            if let last = liveFrame.last {
+                let dx = fx - last[0], dy = fy - last[1]
+                if dx * dx + dy * dy < minD * minD { return }
+            }
+            liveFrame.append([fx, fy])
+            if liveFrame.count > 1024 { liveFrame.removeFirst(liveFrame.count - 1024) }
+            return
+        }
         if retouchMode == "window" || retouchMode == "grad" {
             guard let (_, _, sfx, sfy) = frameCoord(g.startLocation, in: size),
                   let (_, _, fx, fy) = frameCoord(g.location, in: size) else { return }
@@ -559,6 +593,22 @@ struct EditorView: View {
             pan = CGSize(width: base[0] + g.translation.width,
                          height: base[1] + g.translation.height)
         }
+    }
+
+    /// end of a brush drag: fold the sampled points into a stroke on the
+    /// active layer (LR-style: strokes in one layer share its adjustment).
+    private func commitBrushStroke() {
+        guard liveFrame.count >= 2 else { liveFrame = []; return }
+        if recipe.brushes.isEmpty { recipe.brushes.append(BrushLayer()) }
+        if selBrush >= recipe.brushes.count { selBrush = recipe.brushes.count - 1 }
+        var st = BrushStroke()
+        st.pts = liveFrame
+        st.radius = brushRadius
+        st.soft = brushSoft
+        st.opacity = brushFlow
+        st.erase = brushErase
+        recipe.brushes[selBrush].strokes.append(st)
+        liveFrame = []
     }
 
     /// Bare-key shortcuts. Returns true when the key was consumed.
@@ -604,6 +654,7 @@ struct EditorView: View {
             "qpick": "Qualifier — tap a colour to key it",
             "qadd": "Qualifier + — tap to add to the key",
             "qsub": "Qualifier − — tap to remove from the key",
+            "brush": brushErase ? "Brush — drag to erase" : "Brush — drag to paint, tap to dab",
         ]
         Text(names[retouchMode] ?? retouchMode)
             .font(.system(size: 10.5, weight: .medium))
@@ -1316,7 +1367,7 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Retouch") {
                 SegPicker([("off", "Off"), ("heal", "Heal"), ("clone", "Clone"),
-                           ("dodge", "Dodge"), ("burn", "Burn")],
+                           ("dodge", "Dodge"), ("burn", "Burn"), ("brush", "Brush")],
                           selection: $retouchMode)
                 if retouchMode == "heal" {
                     SliderRow("Size", $spotSize, 0.01...0.15, reset: 0.05)
@@ -1330,6 +1381,54 @@ struct EditorView: View {
                 } else if retouchMode == "dodge" || retouchMode == "burn" {
                     SliderRow("Radius", $lightRadius, 0.05...0.6, reset: 0.25)
                     SliderRow("EV", $lightEV, 0...2, reset: 0.5)
+                }
+                // adjustment brush: paint strokes, layer holds the adjustment
+                if retouchMode == "brush" || !recipe.brushes.isEmpty {
+                    Divider().overlay(Ara.hairline)
+                    HStack(spacing: 6) {
+                        Text("Brush").font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(Ara.text2)
+                        Spacer()
+                        ToolChip(label: "Erase", icon: "eraser", active: brushErase) {
+                            brushErase.toggle()
+                        }
+                        .help("Erase strokes from the active layer")
+                        ToolChip(label: "+Layer", icon: "plus", active: false) {
+                            if recipe.brushes.count < 4 {
+                                recipe.brushes.append(BrushLayer())
+                                selBrush = recipe.brushes.count - 1
+                            }
+                        }
+                        .help("New brush layer with its own adjustment (max 4)")
+                    }
+                    SliderRow("Size", $brushRadius, 0.005...0.25, reset: 0.04)
+                    SliderRow("Feather", $brushSoft, 0...1, reset: 0.5)
+                    SliderRow("Flow", $brushFlow, 0.05...1, reset: 1)
+                    ForEach(Array(recipe.brushes.enumerated()), id: \.element.id) { li, layer in
+                        BrushLayerRow(layer: layer, index: li, selected: li == selBrush,
+                                      onSelect: { selBrush = li },
+                                      onToggle: { recipe.brushes[li].enabled.toggle() },
+                                      onDelete: {
+                            recipe.brushes.remove(at: li)
+                            selBrush = max(0, min(selBrush, recipe.brushes.count - 1))
+                        })
+                    }
+                    if recipe.brushes.indices.contains(selBrush) {
+                        let bl = Binding<BrushLayer>(
+                            get: { recipe.brushes[selBrush] },
+                            set: { recipe.brushes[selBrush] = $0 })
+                        SliderRow("Exposure", bl.ev, -4...4)
+                        SliderRow("Saturation", bl.sat, -1...1)
+                        SliderRow("Temp", bl.temp, -1...1)
+                        SliderRow("Opacity", bl.opacity, 0...1, reset: 1)
+                        HStack(spacing: 6) {
+                            Text("Link Q").font(.system(size: 10)).foregroundStyle(Ara.text2)
+                            Spacer()
+                            Toggle("", isOn: bl.linkQ)
+                                .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                        }
+                        .help("Gate this brush layer by the HSL qualifier matte")
+                    }
                 }
                 if !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty {
                     ForEach(recipe.spots.indices, id: \.self) { i in
@@ -1679,6 +1778,8 @@ struct EditorView: View {
         zoom = 1
         pan = .zero
         lensProfile = ""
+        liveFrame = []
+        selBrush = 0
         Task {
             let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
             if let d = meta.data(using: .utf8),
@@ -1888,6 +1989,7 @@ struct EditorView: View {
             return recipe.mixer != d.mixer || recipe.mono != d.mono
         case .retouch:
             return !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty
+                || !recipe.brushes.isEmpty
         case .detail:
             return recipe.sharpen != 0 || recipe.noise_luma != 0 || recipe.noise_chroma != d.noise_chroma
                 || recipe.dehaze != 0 || recipe.deband != 0 || recipe.ca_fix != 0 || recipe.beauty != 0
@@ -1954,6 +2056,8 @@ struct EditorView: View {
             recipe.mixer = d.mixer; recipe.mono = d.mono
         case .retouch:
             recipe.spots = []; recipe.lights = []; recipe.clones = []
+            recipe.brushes = []
+            selBrush = 0
             pendingClone = nil
         case .detail:
             recipe.sharpen = 0; recipe.noise_luma = 0; recipe.noise_chroma = d.noise_chroma
@@ -2905,7 +3009,100 @@ extension EditorView {
             cross.move(to: .init(x: cx, y: cy - 10)); cross.addLine(to: .init(x: cx, y: cy + 10))
             ctx.stroke(cross, with: .color(.yellow), lineWidth: 1.5)
         }
+        // adjustment-brush strokes: centreline + feather circles at the ends
+        for (li, layer) in recipe.brushes.enumerated() {
+            let sel = li == selBrush
+            for st in layer.strokes where st.pts.count >= 2 {
+                let col: Color = st.erase ? .red : (sel ? Ara.accent : .white)
+                let alpha: Double = layer.enabled ? (sel ? 0.95 : 0.55) : 0.2
+                var ln = Path()
+                ln.move(to: .init(x: fx2sx(st.pts[0][0]), y: fy2sy(st.pts[0][1])))
+                for pt in st.pts.dropFirst() {
+                    ln.addLine(to: .init(x: fx2sx(pt[0]), y: fy2sy(pt[1])))
+                }
+                ctx.stroke(ln, with: .color(col.opacity(alpha)),
+                           style: StrokeStyle(lineWidth: sel ? 1.8 : 1.1, dash: st.erase ? [4, 3] : []))
+                if sel {
+                    // feather extent at both ends (radius is a frame-height fraction)
+                    let r = st.radius * rect.height / max(sh, 0.01)
+                    for pt in [st.pts.first!, st.pts.last!] {
+                        let cx = fx2sx(pt[0]), cy = fy2sy(pt[1])
+                        ctx.stroke(Circle().path(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)),
+                                   with: .color(col.opacity(alpha * 0.5)), lineWidth: 0.8)
+                    }
+                }
+            }
         }
+        // live (in-progress) stroke: brighter preview while painting
+        if liveFrame.count >= 2 {
+            var ln = Path()
+            ln.move(to: .init(x: fx2sx(liveFrame[0][0]), y: fy2sy(liveFrame[0][1])))
+            for pt in liveFrame.dropFirst() {
+                ln.addLine(to: .init(x: fx2sx(pt[0]), y: fy2sy(pt[1])))
+            }
+            ctx.stroke(ln, with: .color((brushErase ? Color.red : Ara.accent).opacity(0.95)), lineWidth: 2)
+        }
+        // brush cursor: feather circle tracks the mouse in brush mode
+        if retouchMode == "brush", stageHover {
+            let r = brushRadius * rect.height / max(sh, 0.01)
+            let c = lastHover
+            ctx.stroke(Circle().path(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)),
+                       with: .color((brushErase ? Color.red : Color.white).opacity(0.8)), lineWidth: 1.2)
+            ctx.stroke(Circle().path(in: CGRect(x: c.x - r * (1 - brushSoft), y: c.y - r * (1 - brushSoft),
+                                                width: r * 2 * (1 - brushSoft), height: r * 2 * (1 - brushSoft))),
+                       with: .color((brushErase ? Color.red : Color.white).opacity(0.4)), lineWidth: 0.8)
+        }
+        }
+    }
+}
+
+/// one brush layer row: select / visibility / stroke count / delete
+struct BrushLayerRow: View {
+    let layer: BrushLayer
+    let index: Int
+    let selected: Bool
+    let onSelect: () -> Void
+    let onToggle: () -> Void
+    let onDelete: () -> Void
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: onSelect) {
+                HStack(spacing: 6) {
+                    Image(systemName: "paintbrush.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(selected ? Ara.accent : Ara.text3)
+                    Text("Layer \(index + 1)")
+                        .font(.system(size: 10.5, weight: selected ? .semibold : .regular))
+                        .foregroundStyle(selected ? Ara.text1 : Ara.text2)
+                    Text("×\(layer.strokes.count)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(Ara.text3)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Button(action: onToggle) {
+                Image(systemName: layer.enabled ? "eye" : "eye.slash")
+                    .font(.system(size: 10))
+                    .foregroundStyle(layer.enabled ? Ara.text2 : Ara.text3)
+            }
+            .buttonStyle(.plain)
+            .help(layer.enabled ? "Hide layer" : "Show layer")
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Ara.text3)
+            }
+            .buttonStyle(.plain)
+            .help("Delete layer")
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 5)
+        .background(RoundedRectangle(cornerRadius: 4)
+            .fill(selected ? Ara.accent.opacity(0.12) : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 4)
+                .stroke(selected ? Ara.accent.opacity(0.4) : Color.clear, lineWidth: 0.5)))
     }
 }
 

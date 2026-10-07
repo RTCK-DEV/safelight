@@ -105,6 +105,12 @@ struct Uni {
     lens1: [f32; 4],
     lens2: [f32; 4],
     lens3: [f32; 4],
+    /// adjustment brushes: per-layer [ev,sat,temp,strength] (4 layers),
+    /// misc = [n_strokes, link_q_bits, 0, 0], stroke records 3 entries
+    /// each (params / seg range / normalized-space bbox)
+    blayers: [[f32; 4]; 4],
+    bmisc: [f32; 4],
+    bstr: [[f32; 4]; 192],
 }
 
 const WGSL: &str = r#"
@@ -165,6 +171,9 @@ struct Uni {
     lens1: vec4<f32>,
     lens2: vec4<f32>,
     lens3: vec4<f32>,
+    blayers: array<vec4<f32>, 4>,
+    bmisc: vec4<f32>,
+    bstr: array<vec4<f32>, 192>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -176,6 +185,7 @@ struct Uni {
 @group(0) @binding(7) var<storage, read_write> stats: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read> tap_idx: array<vec2<u32>>;
 @group(0) @binding(9) var<storage, read> taps: array<vec2<i32>>;
+@group(0) @binding(10) var<storage, read> brushsegs: array<vec4<f32>>;
 
 fn cfa_col(sx: u32, sy: u32) -> u32 {
     return cfa[(sy % u.g3.y) * u.g3.x + (sx % u.g3.x)];
@@ -1330,6 +1340,61 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
             adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
         }
     }
+    // adjustment brushes: same local ev/sat/temp inside stroke masks.
+    // Mirrors the finish_linear brush block in develop.rs.
+    let n_str = u32(u.bmisc.x);
+    if (n_str > 0u) {
+        let aspect = f32(dw) / f32(dh);
+        let link_bits = u32(u.bmisc.y);
+        let pax = nx * aspect;
+        let pay = ny;
+        var pm = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        var em = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        for (var si = 0u; si < n_str; si = si + 1u) {
+            let e0 = u.bstr[si * 3u];
+            let e1 = u.bstr[si * 3u + 1u];
+            let bb = u.bstr[si * 3u + 2u];
+            let rad = e0.x;
+            if (pax < bb.x * aspect - rad || pax > bb.z * aspect + rad) { continue; }
+            if (pay < bb.y - rad || pay > bb.w + rad) { continue; }
+            let inner = rad * (1.0 - e0.y);
+            var w = 0.0;
+            let s0 = u32(e1.x);
+            let s1 = u32(e1.x + e1.y);
+            for (var g = s0; g < s1; g = g + 1u) {
+                let seg = brushsegs[g];
+                let ax = seg.x * aspect;
+                let vx = seg.z * aspect - ax;
+                let vy = seg.w - seg.y;
+                let len2 = max(vx * vx + vy * vy, 1e-9);
+                let t = clamp(((pax - ax) * vx + (pay - seg.y) * vy) / len2, 0.0, 1.0);
+                let dx = pax - ax - t * vx;
+                let dy = pay - seg.y - t * vy;
+                let d = sqrt(dx * dx + dy * dy);
+                w = max(w, 1.0 - sstep(inner, rad, d));
+            }
+            let li = min(u32(e0.w), 3u);
+            if (e0.z >= 0.0) {
+                pm[li] = max(pm[li], w * e0.z);
+            } else {
+                em[li] = max(em[li], w * -e0.z);
+            }
+        }
+        for (var li = 0u; li < 4u; li = li + 1u) {
+            let lp = u.blayers[li];
+            var bmask = clamp(pm[li] - em[li], 0.0, 1.0) * lp.w;
+            if (bmask <= 0.001) { continue; }
+            if ((link_bits & (1u << li)) != 0u) {
+                bmask = bmask * qual_mask(col);
+            }
+            if (bmask <= 0.001) { continue; }
+            let evg = pow(2.0, lp.x * bmask);
+            let l = luma(adj);
+            adj = adj * evg;
+            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + lp.y * bmask);
+            adj = adj + vec3<f32>(lp.z * bmask * 0.08, 0.0, -lp.z * bmask * 0.08);
+        }
+    }
     // lens flare: core + horizontal streak + mirrored ghost ring
     if (u.flare.z > 0.0) {
         let dvec = vec2<f32>(nx, ny) - u.flare.xy;
@@ -1444,7 +1509,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..10)
+                entries: &(0..11)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -1754,10 +1819,27 @@ impl Gpu {
                 .map(|c| [c.vig[0], c.vig[1], c.vig[2], c.scale])
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
             lens3: [0.0, 0.0, 0.0, if corr.is_some() { lens_amt } else { 0.0 }],
+            blayers: p.brush_layers,
+            bmisc: p.brush_misc,
+            bstr: {
+                let mut a = [[0.0f32; 4]; 192];
+                for (i, s) in p.brush_strokes.iter().take(192).enumerate() {
+                    a[i] = *s;
+                }
+                a
+            },
         };
 
+        // adjustment-brush segment upload. Brush packing ignores `stats`, so
+        // a stats-free params build produces identical segments to the main
+        // pass's params below.
+        let p0 = build_params(m, r, None);
+        let segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
+        let segs32 = if segs32.is_empty() { vec![0.0f32; 4] } else { segs32 };
+        let brush_b = mk_buf("brushsegs", bytemuck::cast_slice(&segs32), storage_in);
+
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
                 .iter()
                 .map(|&i| wgpu::BindGroupEntry {
                     binding: i,
@@ -1771,7 +1853,8 @@ impl Gpu {
                         6 => lut_b.as_entire_binding(),
                         7 => stats_b.as_entire_binding(),
                         8 => idx_b.as_entire_binding(),
-                        _ => tap_b.as_entire_binding(),
+                        9 => tap_b.as_entire_binding(),
+                        _ => brush_b.as_entire_binding(),
                     },
                 })
                 .collect();
@@ -1797,7 +1880,7 @@ impl Gpu {
             let step = ((n_px as f64 / 65536.0).sqrt().ceil() as u32).max(2);
             self.queue.write_buffer(&stats_b, 0, &vec![0u8; STATS_N as usize * 4]);
             self.queue
-                .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&build_params(m, r, None), step)));
+                .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p0, step)));
             let mut enc = dev.create_command_encoder(&Default::default());
             run(&mut enc, &self.stats, (vw.div_ceil(step) * vh.div_ceil(step)) as u64);
             let stg = dev.create_buffer(&wgpu::BufferDescriptor {

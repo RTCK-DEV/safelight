@@ -117,6 +117,60 @@ struct PowerWindow: Codable, Equatable, Identifiable {
     }
 }
 
+/// Mirrors araware_core::recipe::BrushStroke (serde).
+struct BrushStroke: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var pts: [[Double]] = []   // frame-normalized polyline
+    var radius: Double = 0.05  // fraction of frame height
+    var soft: Double = 0.5     // feather 0..1
+    var opacity: Double = 1    // stroke flow 0..1
+    var erase: Bool = false
+
+    enum CodingKeys: String, CodingKey { case pts, radius, soft, opacity, erase }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        pts = (try? c.decode([[Double]].self, forKey: .pts)) ?? []
+        radius = (try? c.decode(Double.self, forKey: .radius)) ?? 0.05
+        soft = (try? c.decode(Double.self, forKey: .soft)) ?? 0.5
+        opacity = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        erase = (try? c.decode(Bool.self, forKey: .erase)) ?? false
+    }
+}
+
+/// Mirrors araware_core::recipe::BrushLayer (serde).
+struct BrushLayer: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var enabled: Bool = true
+    var opacity: Double = 1
+    var ev: Double = 0
+    var sat: Double = 0
+    var temp: Double = 0
+    var linkQ: Bool = false
+    var strokes: [BrushStroke] = []
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, opacity, ev, sat, temp
+        case linkQ = "link_q"
+        case strokes
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
+        opacity = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        ev = (try? c.decode(Double.self, forKey: .ev)) ?? 0
+        sat = (try? c.decode(Double.self, forKey: .sat)) ?? 0
+        temp = (try? c.decode(Double.self, forKey: .temp)) ?? 0
+        linkQ = (try? c.decode(Bool.self, forKey: .linkQ)) ?? false
+        strokes = (try? c.decode([BrushStroke].self, forKey: .strokes)) ?? []
+    }
+}
+
 /// Mirrors araware_core::recipe::Recipe (serde snake_case).
 struct Recipe: Codable, Equatable {
     var exposure: Double = 0
@@ -211,6 +265,8 @@ struct Recipe: Codable, Equatable {
     var key_h: Double = 0
     // lensfun profile correction strength 0..1 (1 = on, LR-style default)
     var lens_corr: Double = 1
+    // adjustment-brush layers (LR-style, up to 4 honoured by the engine)
+    var brushes: [BrushLayer] = []
 
 }
 
@@ -235,7 +291,7 @@ extension Recipe {
         case mixer, mono, clones
         case beauty, noise_chroma, dehaze, ca_fix, deband, glow, flare
         case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
-        case lens_corr
+        case lens_corr, brushes
     }
 
     init(from decoder: Decoder) throws {
@@ -317,6 +373,7 @@ extension Recipe {
         wb_pick_size = opt(.wb_pick_size, Double.self) ?? 0.025
         lut_file = opt(.lut_file, String.self) ?? ""
         lut_amount = opt(.lut_amount, Double.self) ?? 1
+        brushes = opt(.brushes, [BrushLayer].self) ?? []
         key_v = opt(.key_v, Double.self) ?? 0
         key_h = opt(.key_h, Double.self) ?? 0
         lens_corr = opt(.lens_corr, Double.self) ?? 1

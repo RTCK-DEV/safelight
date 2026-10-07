@@ -170,6 +170,71 @@ pub struct Recipe {
     /// distortion, lateral CA and vignetting at that strength.
     #[serde(default = "default_one")]
     pub lens_corr: f32,
+    /// adjustment-brush layers (LR-style): each layer carries its own
+    /// ev/sat/temp + opacity and a list of painted strokes, applied
+    /// inside the stroked mask. Up to 4 layers are honoured.
+    #[serde(default)]
+    pub brushes: Vec<BrushLayer>,
+}
+
+/// one painted stroke inside a brush layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrushStroke {
+    /// polyline points in frame-normalized (pre-crop) coordinates
+    pub pts: Vec<[f32; 2]>,
+    /// radius as a fraction of the frame height
+    pub radius: f32,
+    /// feather 0..1: mask is solid until radius*(1-soft), then ramps out
+    pub soft: f32,
+    /// stroke strength 0..1 (brush flow)
+    pub opacity: f32,
+    /// erase stroke: subtracts from the layer mask instead of adding
+    pub erase: bool,
+}
+
+impl Default for BrushStroke {
+    fn default() -> Self {
+        BrushStroke {
+            pts: Vec::new(),
+            radius: 0.05,
+            soft: 0.5,
+            opacity: 1.0,
+            erase: false,
+        }
+    }
+}
+
+/// a brush layer: shared adjustment applied inside its strokes' union mask.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrushLayer {
+    pub enabled: bool,
+    /// layer strength 0..1
+    pub opacity: f32,
+    /// exposure offset -4..4 EV
+    pub ev: f32,
+    /// saturation offset -1..1
+    pub sat: f32,
+    /// warm(+)/cool(-) -1..1
+    pub temp: f32,
+    /// gate this layer's mask by the HSL qualifier matte
+    pub link_q: bool,
+    pub strokes: Vec<BrushStroke>,
+}
+
+impl Default for BrushLayer {
+    fn default() -> Self {
+        BrushLayer {
+            enabled: true,
+            opacity: 1.0,
+            ev: 0.0,
+            sat: 0.0,
+            temp: 0.0,
+            link_q: false,
+            strokes: Vec::new(),
+        }
+    }
 }
 
 /// parametric spatial mask + local adjustment (DaVinci power window).
@@ -297,6 +362,7 @@ impl Default for Recipe {
             key_v: 0.0,
             key_h: 0.0,
             lens_corr: 1.0,
+            brushes: Vec::new(),
         }
     }
 }
