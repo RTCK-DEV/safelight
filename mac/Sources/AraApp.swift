@@ -70,8 +70,22 @@ final class LibraryStore: ObservableObject {
         return photos.first(where: { selection.contains($0.id) })
     }
 
+    /// selected photos as currently in scope — resolves against `filtered`
+    /// so All-Photos/collection selections of other folders' assets work
     var selectedPhotos: [Photo] {
-        photos.filter { selection.contains($0.id) }
+        filtered.filter { selection.contains($0.id) }
+    }
+
+    /// decode a selection/photo ref into (path, vslot); refs are `path`
+    /// or `path#vN` (N = virtual copy slot)
+    func splitRef(_ ref: String) -> (path: String, vslot: Int) {
+        if let i = ref.lastIndex(of: "#") {
+            let suffix = ref[ref.index(after: i)...]
+            if suffix.hasPrefix("v"), let n = Int(suffix.dropFirst()) {
+                return (String(ref[..<i]), n)
+            }
+        }
+        return (ref, 0)
     }
 
     private func scopePhotos() -> [Photo] {
@@ -199,9 +213,14 @@ final class LibraryStore: ObservableObject {
 
     // ---- batch / selection ops -----------------------------------------
 
-    /// apply a mutator to every selected photo (rate/flag/label batch ops)
-    func forEachSelected(_ f: (Photo) -> Void) {
-        for p in selectedPhotos { f(p) }
+    /// apply a mutator to every selected ref — selection ids carry
+    /// (path, vslot) so batch ops work even on assets outside the open
+    /// folder, without needing a Photo row
+    func forEachSelected(_ f: (_ path: String, _ vslot: Int) -> Void) {
+        for ref in selection {
+            let r = splitRef(ref)
+            f(r.path, r.vslot)
+        }
     }
 
     func stackSelection() {
@@ -260,12 +279,12 @@ final class LibraryStore: ObservableObject {
     }
 
     func addSelectedToCollection(_ c: CollectionInfo) {
-        eng.collectionAddItems(id: c.id, refs: selectedPhotos.map(\.ref))
+        eng.collectionAddItems(id: c.id, refs: Array(selection))
         reloadCollections()
     }
 
     func removeSelectedFromCollection(_ c: CollectionInfo) {
-        eng.collectionRemoveItems(id: c.id, refs: selectedPhotos.map(\.ref))
+        eng.collectionRemoveItems(id: c.id, refs: Array(selection))
         reloadCollections()
     }
 

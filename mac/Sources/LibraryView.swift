@@ -334,23 +334,21 @@ struct LibraryView: View {
         Menu("Rating") {
             ForEach(0...5, id: \.self) { r in
                 Button(r == 0 ? "No stars" : String(repeating: "★", count: r)) {
-                    store.forEachSelected { q in
-                        store.setRating(path: q.path, vslot: q.vslot, r)
-                    }
+                    store.forEachSelected { store.setRating(path: $0, vslot: $1, r) }
                 }
             }
         }
         // flags
         Menu("Flag") {
-            Button("Pick (P)") { store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, 1) } }
-            Button("Unflag (U)") { store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, 0) } }
-            Button("Reject (X)") { store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, -1) } }
+            Button("Pick (P)") { store.forEachSelected { store.setFlag(path: $0, vslot: $1, 1) } }
+            Button("Unflag (U)") { store.forEachSelected { store.setFlag(path: $0, vslot: $1, 0) } }
+            Button("Reject (X)") { store.forEachSelected { store.setFlag(path: $0, vslot: $1, -1) } }
         }
         // labels
         Menu("Label") {
-            Button("None") { store.forEachSelected { store.setLabel(path: $0.path, vslot: $0.vslot, "") } }
+            Button("None") { store.forEachSelected { store.setLabel(path: $0, vslot: $1, "") } }
             ForEach(labelColors, id: \.name) { l in
-                Button { store.forEachSelected { store.setLabel(path: $0.path, vslot: $0.vslot, l.name) } } label: {
+                Button { store.forEachSelected { store.setLabel(path: $0, vslot: $1, l.name) } } label: {
                     Label(l.name, systemImage: "circle.fill")
                 }
             }
@@ -424,13 +422,13 @@ struct LibraryView: View {
     private func gridKey(_ key: KeyPress) -> KeyPress.Result {
         if let c = key.characters.first {
             switch c {
-            case "p": store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, 1) }; return .handled
-            case "u": store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, 0) }; return .handled
-            case "x": store.forEachSelected { store.setFlag(path: $0.path, vslot: $0.vslot, -1) }; return .handled
+            case "p": store.forEachSelected { store.setFlag(path: $0, vslot: $1, 1) }; return .handled
+            case "u": store.forEachSelected { store.setFlag(path: $0, vslot: $1, 0) }; return .handled
+            case "x": store.forEachSelected { store.setFlag(path: $0, vslot: $1, -1) }; return .handled
             case "g": if store.selection.count > 1 { store.stackSelection() }; return .handled
             case "0","1","2","3","4","5":
                 let r = Int(String(c)) ?? 0
-                store.forEachSelected { store.setRating(path: $0.path, vslot: $0.vslot, r) }
+                store.forEachSelected { store.setRating(path: $0, vslot: $1, r) }
                 return .handled
             default: break
             }
