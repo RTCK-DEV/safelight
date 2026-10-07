@@ -327,6 +327,10 @@ pub struct Sidecar {
     pub version: u32,
     pub rating: i32,
     pub label: String,
+    /// pick flag: -1 rejected, 0 unflagged, 1 picked (LR convention)
+    pub flag: i32,
+    /// user keywords/tags
+    pub keywords: Vec<String>,
     pub recipe: Recipe,
     /// saved grade versions (DaVinci stills/versions)
     pub versions: Vec<GradeVersion>,
@@ -338,6 +342,8 @@ impl Default for Sidecar {
             version: 1,
             rating: 0,
             label: String::new(),
+            flag: 0,
+            keywords: Vec::new(),
             recipe: Recipe::default(),
             versions: Vec::new(),
         }
@@ -345,12 +351,23 @@ impl Default for Sidecar {
 }
 
 pub fn sidecar_path_for(asset: &std::path::Path) -> std::path::PathBuf {
+    sidecar_path_for_v(asset, 0)
+}
+
+/// Sidecar for a virtual copy: slot 0 = master `<stem>.araware.json`,
+/// slot n = `<stem>.araware.v{n}.json`.
+pub fn sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
     let mut p = asset.to_path_buf();
     let stem = asset
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("asset")
         .to_string();
-    p.set_file_name(format!("{stem}.araware.json"));
+    let name = if vslot == 0 {
+        format!("{stem}.araware.json")
+    } else {
+        format!("{stem}.araware.v{vslot}.json")
+    };
+    p.set_file_name(name);
     p
 }

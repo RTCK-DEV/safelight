@@ -92,6 +92,7 @@ struct EditorView: View {
     @State private var recipe = Recipe()
     @State private var rating = 0
     @State private var label = ""
+    @State private var flag = 0
     // sidecar values as loaded — guards the initial-bind onChange from
     // rewriting the sidecar file on every photo open
     @State private var loadedRating = -1
@@ -238,7 +239,7 @@ struct EditorView: View {
         .task { load() }
         .onChange(of: recipe) { old, new in
             dirty = (new != baseline) || versions != baselineVersions
-            store.unsavedEdits[photo.path] = dirty ? new : nil
+            store.unsavedEdits[photo.id] = dirty ? new : nil
             if applyingHistory {
                 // programmatic recipe assignment (undo/redo/version apply)
                 applyingHistory = false
@@ -249,7 +250,7 @@ struct EditorView: View {
         }
         .onChange(of: versions) { _, _ in
             dirty = (recipe != baseline) || versions != baselineVersions
-            store.unsavedVersions[photo.path] = (versions != baselineVersions) ? versions : nil
+            store.unsavedVersions[photo.id] = (versions != baselineVersions) ? versions : nil
         }
         .onChange(of: cmp) { _, m in
             if m != .off { ensureBaseline() }
@@ -258,9 +259,10 @@ struct EditorView: View {
         // store.setRating) keep the open editor's rating mirror in sync —
         // otherwise a later save() would serialize the stale value back.
         .onChange(of: store.photos) { _, ps in
-            if let p = ps.first(where: { $0.path == photo.path }), p.rating != rating {
-                rating = p.rating
-                loadedRating = p.rating
+            if let p = ps.first(where: { $0.id == photo.id }) {
+                if p.rating != rating { rating = p.rating; loadedRating = p.rating }
+                if p.flag != flag { flag = p.flag }
+                if p.label != label { label = p.label; loadedLabel = p.label }
             }
         }
         .alert("Save Version", isPresented: $showVersionName) {
@@ -573,6 +575,9 @@ struct EditorView: View {
             case "w":
                 cmp = cmp == .wipeV ? .wipeH : cmp == .wipeH ? .off : .wipeV
                 return true
+            case "p": store.setFlag(path: photo.path, vslot: photo.vslot, flag == 1 ? 0 : 1); flag = flag == 1 ? 0 : 1; status = flag == 1 ? "Picked" : "Unflagged"; return true
+            case "x": store.setFlag(path: photo.path, vslot: photo.vslot, flag == -1 ? 0 : -1); flag = flag == -1 ? 0 : -1; status = flag == -1 ? "Rejected" : "Unflagged"; return true
+            case "u": store.setFlag(path: photo.path, vslot: photo.vslot, 0); flag = 0; status = "Unflagged"; return true
             default: break
             }
         }
@@ -714,9 +719,9 @@ struct EditorView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(store.filtered) { p in
-                            FilmCell(photo: p, selected: p.path == store.selection?.path,
-                                     dirty: store.unsavedEdits[p.path] != nil)
-                                .onTapGesture { store.selection = p }
+                            FilmCell(photo: p, selected: store.selection.contains(p.id),
+                                     dirty: store.unsavedEdits[p.id] != nil)
+                                .onTapGesture { store.select(p) }
                                 .id(p.id)
                         }
                     }
@@ -748,7 +753,7 @@ struct EditorView: View {
                         .onChange(of: rating) { _, r in
                             guard r != loadedRating else { return }
                             loadedRating = r
-                            store.setRating(path: photo.path, r)
+                            store.setRating(path: photo.path, vslot: photo.vslot, r)
                         }
                 }
                 HStack(spacing: 6) {
@@ -756,10 +761,7 @@ struct EditorView: View {
                         .onChange(of: label) { _, l in
                             guard l != loadedLabel else { return }
                             loadedLabel = l
-                            AraEngine.shared.setLabel(path: photo.path, l)
-                            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
-                                store.photos[i].label = l
-                            }
+                            store.setLabel(path: photo.path, vslot: photo.vslot, l)
                         }
                     Spacer()
                     IconAction(icon: "arrow.uturn.backward") { undo() }
@@ -1639,13 +1641,14 @@ struct EditorView: View {
     }
 
     private func load() {
-        let sc = AraEngine.shared.sidecar(path: photo.path)
+        let sc = AraEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
         baseline = sc.recipe
         baselineVersions = sc.versions
-        versions = store.unsavedVersions[photo.path] ?? sc.versions
-        recipe = store.unsavedEdits[photo.path] ?? sc.recipe
+        versions = store.unsavedVersions[photo.id] ?? sc.versions
+        recipe = store.unsavedEdits[photo.id] ?? sc.recipe
         rating = sc.rating
         label = sc.label
+        flag = sc.flag
         loadedRating = sc.rating
         loadedLabel = sc.label
         image = nil
@@ -1659,21 +1662,22 @@ struct EditorView: View {
     }
 
     private func save() {
-        var sc = Sidecar()
+        // start from the on-disk sidecar so flag/keywords survive a save
+        var sc = AraEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
         sc.rating = rating
         sc.label = label
         sc.recipe = recipe
         sc.versions = versions
         let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
-        let ok = AraEngine.shared.writeSidecar(path: photo.path, sc)
+        let ok = AraEngine.shared.writeSidecar(path: photo.path, vslot: photo.vslot, sc)
         status = ok ? "Saved \(stem).araware.json"
                     : "Save failed: \(AraEngine.shared.lastError)"
         if ok {
             baseline = recipe
             baselineVersions = versions
             baselineImg = nil   // re-render compare base with the saved recipe
-            store.unsavedEdits.removeValue(forKey: photo.path)
-            store.unsavedVersions.removeValue(forKey: photo.path)
+            store.unsavedEdits.removeValue(forKey: photo.id)
+            store.unsavedVersions.removeValue(forKey: photo.id)
             dirty = false
         }
     }
@@ -1942,17 +1946,17 @@ struct EditorView: View {
     private func stepPhoto(_ dir: Int) {
         // match by path — rating/label edits mutate Photo values and would
         // break a Hashable-equality lookup
-        guard let i = store.filtered.firstIndex(where: { $0.path == photo.path }) else { return }
+        guard let i = store.filtered.firstIndex(where: { $0.id == photo.id }) else { return }
         let j = i + dir
         guard store.filtered.indices.contains(j) else { return }
-        store.selection = store.filtered[j]
+        store.select(store.filtered[j])
     }
 
     private func setRating(_ r: Int) {
         rating = (rating == r) ? 0 : r
         if rating != loadedRating {
             loadedRating = rating
-            store.setRating(path: photo.path, rating)
+            store.setRating(path: photo.path, vslot: photo.vslot, rating)
         }
         status = "Rating \(rating)"
     }
@@ -1960,12 +1964,12 @@ struct EditorView: View {
     /// DaVinci "Apply Grade from One Clip Prior" (Cmd+=): copy the previous
     /// photo's recipe (its unsaved edits win over its sidecar).
     private func applyPrevRecipe() {
-        guard let i = store.filtered.firstIndex(where: { $0.path == photo.path }), i > 0 else {
+        guard let i = store.filtered.firstIndex(where: { $0.id == photo.id }), i > 0 else {
             status = "No previous photo"
             return
         }
         let prev = store.filtered[i - 1]
-        let r = store.unsavedEdits[prev.path] ?? AraEngine.shared.sidecar(path: prev.path).recipe
+        let r = store.unsavedEdits[prev.id] ?? AraEngine.shared.sidecar(path: prev.path, vslot: prev.vslot).recipe
         recipe = r
         status = "Applied grade from \(prev.name)"
     }

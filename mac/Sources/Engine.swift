@@ -139,8 +139,10 @@ final class AraEngine: @unchecked Sendable {
         return try? JSONDecoder().decode(AutoSuggestion.self, from: data)
     }
 
-    func sidecar(path: String) -> Sidecar {
-        guard let js = takeString(path.withCString { araware_sidecar_read($0) }),
+    func sidecar(path: String, vslot: Int = 0) -> Sidecar {
+        let js = takeString(path.withCString { araware_sidecar_read_v($0, Int32(vslot)) })
+            ?? takeString(path.withCString { araware_sidecar_read($0) })
+        guard let js,
               let data = js.data(using: .utf8),
               let sc = try? JSONDecoder().decode(Sidecar.self, from: data)
         else { return Sidecar() }
@@ -148,10 +150,12 @@ final class AraEngine: @unchecked Sendable {
     }
 
     @discardableResult
-    func writeSidecar(path: String, _ sc: Sidecar) -> Bool {
+    func writeSidecar(path: String, vslot: Int = 0, _ sc: Sidecar) -> Bool {
         guard let data = try? JSONEncoder().encode(sc),
               let js = String(data: data, encoding: .utf8) else { return false }
-        return js.withCString { j in path.withCString { araware_sidecar_write($0, j) } } == 0
+        return js.withCString { j in
+            path.withCString { araware_sidecar_write_v($0, Int32(vslot), j) }
+        } == 0
     }
 
     @discardableResult
@@ -162,5 +166,127 @@ final class AraEngine: @unchecked Sendable {
     @discardableResult
     func setLabel(path: String, _ label: String) -> Bool {
         label.withCString { l in path.withCString { araware_set_label(handle, $0, l) } } == 0
+    }
+
+    // MARK: - library organization (flags / keywords / stacks / variants / collections)
+
+    /// raw JSON dispatch into Engine::library — see core/src/engine.rs for ops
+    @discardableResult
+    func libraryCmd(_ cmd: [String: Any]) -> [String: Any]? {
+        guard let data = try? JSONSerialization.data(withJSONObject: cmd),
+              let s = String(data: data, encoding: .utf8),
+              let js = takeString(s.withCString { araware_library(handle, $0) }),
+              let out = js.data(using: .utf8),
+              let v = try? JSONSerialization.jsonObject(with: out) as? [String: Any]
+        else { return nil }
+        return v
+    }
+
+    private func libraryList<T: Decodable>(_ cmd: [String: Any]) -> [T] {
+        guard let data = try? JSONSerialization.data(withJSONObject: cmd),
+              let s = String(data: data, encoding: .utf8),
+              let js = takeString(s.withCString { araware_library(handle, $0) }),
+              let out = js.data(using: .utf8),
+              let v = try? JSONDecoder().decode([T].self, from: out)
+        else { return [] }
+        return v
+    }
+
+    @discardableResult
+    func setFlag(path: String, vslot: Int = 0, _ flag: Int) -> Bool {
+        libraryCmd(["op": "set_flag", "path": path, "vslot": vslot, "flag": flag]) != nil
+    }
+
+    @discardableResult
+    func setKeywords(path: String, _ keywords: [String]) -> Bool {
+        libraryCmd(["op": "set_keywords", "path": path, "keywords": keywords]) != nil
+    }
+
+    @discardableResult
+    func stackGroup(_ paths: [String]) -> Int64 {
+        libraryCmd(["op": "stack_group", "paths": paths])
+            .flatMap { ($0["stack"] as? NSNumber)?.int64Value } ?? 0
+    }
+
+    @discardableResult
+    func stackUngroup(_ stack: Int64) -> Bool {
+        libraryCmd(["op": "stack_ungroup", "stack": stack]) != nil
+    }
+
+    @discardableResult
+    func stackCover(_ path: String) -> Bool {
+        libraryCmd(["op": "stack_cover", "path": path]) != nil
+    }
+
+    /// create a virtual copy of `path` seeded from `vslot`'s sidecar; returns new slot
+    @discardableResult
+    func variantCreate(path: String, vslot: Int = 0) -> Int {
+        Int(libraryCmd(["op": "variant_create", "path": path, "vslot": vslot])
+            .flatMap { ($0["vslot"] as? NSNumber)?.intValue } ?? 0)
+    }
+
+    @discardableResult
+    func variantDelete(path: String, vslot: Int) -> Bool {
+        libraryCmd(["op": "variant_delete", "path": path, "vslot": vslot]) != nil
+    }
+
+    @discardableResult
+    func variantPromote(path: String, vslot: Int) -> Bool {
+        libraryCmd(["op": "variant_promote", "path": path, "vslot": vslot]) != nil
+    }
+
+    var collections: [CollectionInfo] { libraryList(["op": "coll_list"]) }
+
+    @discardableResult
+    func collectionAdd(name: String, smart: Bool = false, rules: String = "") -> Int64 {
+        libraryCmd(["op": "coll_add", "name": name, "smart": smart, "rules": rules])
+            .flatMap { ($0["id"] as? NSNumber)?.int64Value } ?? 0
+    }
+
+    @discardableResult
+    func collectionRename(id: Int64, name: String) -> Bool {
+        libraryCmd(["op": "coll_rename", "id": id, "name": name]) != nil
+    }
+
+    @discardableResult
+    func collectionSetRules(id: Int64, rules: String) -> Bool {
+        libraryCmd(["op": "coll_rules", "id": id, "rules": rules]) != nil
+    }
+
+    @discardableResult
+    func collectionDelete(id: Int64) -> Bool {
+        libraryCmd(["op": "coll_delete", "id": id]) != nil
+    }
+
+    func collectionItems(id: Int64) -> [String] {
+        libraryList(["op": "coll_items", "id": id])
+    }
+
+    @discardableResult
+    func collectionAddItems(id: Int64, refs: [String]) -> Bool {
+        libraryCmd(["op": "coll_add_items", "id": id, "paths": refs]) != nil
+    }
+
+    @discardableResult
+    func collectionRemoveItems(id: Int64, refs: [String]) -> Bool {
+        libraryCmd(["op": "coll_remove_items", "id": id, "paths": refs]) != nil
+    }
+
+    /// evaluate smart rules against the catalog index — returns matching
+    /// Photo rows (masters only, across every scanned folder)
+    func smartEval(rules: [String: Any]) -> [Photo] {
+        let rulesJs = (try? JSONSerialization.data(withJSONObject: rules))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        return libraryList(["op": "smart_eval", "rules": rulesJs])
+    }
+
+    /// folders the catalog knows about (for the sidebar)
+    func knownFolders() -> [String] {
+        libraryList(["op": "folders"])
+    }
+
+    /// DB snapshot of a folder without rescanning
+    func assetsSnapshot(folder: String) -> [Photo] {
+        libraryList(["op": "assets", "path": folder])
     }
 }

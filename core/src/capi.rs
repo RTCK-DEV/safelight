@@ -318,6 +318,70 @@ pub unsafe extern "C" fn araware_set_label(
     }
 }
 
+/// sidecar read/write for a virtual copy slot (0 = master)
+#[no_mangle]
+pub unsafe extern "C" fn araware_sidecar_read_v(path: *const c_char, vslot: i32) -> *mut c_char {
+    let pstr = cstr(path);
+    let p = Path::new(&pstr);
+    let sp = crate::recipe::sidecar_path_for_v(p, vslot.max(0) as u32);
+    let sc = if sp.exists() {
+        crate::catalog::read_sidecar(&sp).unwrap_or_default()
+    } else {
+        Sidecar::default()
+    };
+    into_raw_string(serde_json::to_string(&sc).unwrap_or_else(|_| "{}".into()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn araware_sidecar_write_v(
+    path: *const c_char,
+    vslot: i32,
+    json: *const c_char,
+) -> i32 {
+    let pstr = cstr(path);
+    let p = Path::new(&pstr);
+    let sc: Sidecar = match serde_json::from_str(&cstr(json)) {
+        Ok(s) => s,
+        Err(err) => {
+            set_err(&err.into());
+            return -1;
+        }
+    };
+    match crate::catalog::write_sidecar(
+        &crate::recipe::sidecar_path_for_v(p, vslot.max(0) as u32),
+        &sc,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            set_err(&err);
+            -2
+        }
+    }
+}
+
+/// Library organization command surface — one JSON dispatch covering
+/// flags, keywords, stacks, virtual copies and collections.
+/// `cmd_json` example: {"op":"coll_list"} — see Engine::library.
+/// Returns a JSON string (or null + last_error on failure).
+#[no_mangle]
+pub unsafe extern "C" fn araware_library(e: *mut c_void, cmd_json: *const c_char) -> *mut c_char {
+    let Some(eng) = engine(e) else { return std::ptr::null_mut() };
+    let cmd: serde_json::Value = match serde_json::from_str(&cstr(cmd_json)) {
+        Ok(v) => v,
+        Err(err) => {
+            set_err(&err.into());
+            return std::ptr::null_mut();
+        }
+    };
+    match eng.library(&cmd) {
+        Ok(v) => into_raw_string(v.to_string()),
+        Err(err) => {
+            set_err(&err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Auto-correction analysis -> JSON with suggested recipe values.
 #[no_mangle]
 pub unsafe extern "C" fn araware_auto_analyze(e: *mut c_void, path: *const c_char) -> *mut c_char {

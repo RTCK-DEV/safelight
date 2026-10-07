@@ -1,7 +1,11 @@
 import Foundation
 
 struct Photo: Identifiable, Codable, Hashable {
-    var id: String { path }
+    /// unique row id — variants share `path` so the slot must be mixed in
+    var id: String { vslot == 0 ? path : "\(path)#v\(vslot)" }
+    /// collection/stack references use the same form
+    var ref: String { id }
+    /// real file on disk (the key for render/thumbnail engine calls)
     let path: String
     let name: String
     let kind: String
@@ -9,14 +13,32 @@ struct Photo: Identifiable, Codable, Hashable {
     let mtime: Int64
     var rating: Int
     var label: String
+    /// -1 rejected, 0 none, 1 picked
+    var flag: Int
+    var keywords: [String]
+    /// virtual copy slot (0 = master, n>0 = .araware.v{n}.json sidecar)
+    let vslot: Int
+    /// stack id (0 = unstacked) + position within it
+    let stack: Int64
+    let stack_seq: Int
     let pair: String?
     let has_sidecar: Bool
     /// "make model" + lens from the file header/EXIF ("" when unknown)
     let camera: String
     let lens: String
+    /// capture metadata
+    let ctime: Int64
+    let iso: Double
+    let aperture: Double
+    let focal: Double
+    let shutter: Double
+
+    var isVariant: Bool { vslot > 0 }
 
     enum CodingKeys: String, CodingKey {
-        case path, name, kind, size, mtime, rating, label, pair, has_sidecar, camera, lens
+        case path, name, kind, size, mtime, rating, label, flag, keywords
+        case vslot, stack, stack_seq, pair, has_sidecar, camera, lens
+        case ctime, iso, aperture, focal, shutter
     }
 
     init(from decoder: Decoder) throws {
@@ -28,11 +50,30 @@ struct Photo: Identifiable, Codable, Hashable {
         mtime = try c.decode(Int64.self, forKey: .mtime)
         rating = try c.decode(Int.self, forKey: .rating)
         label = try c.decode(String.self, forKey: .label)
+        flag = (try? c.decode(Int.self, forKey: .flag)) ?? 0
+        keywords = (try? c.decode([String].self, forKey: .keywords)) ?? []
+        vslot = (try? c.decode(Int.self, forKey: .vslot)) ?? 0
+        stack = (try? c.decode(Int64.self, forKey: .stack)) ?? 0
+        stack_seq = (try? c.decode(Int.self, forKey: .stack_seq)) ?? 0
         pair = try? c.decode(String.self, forKey: .pair)
         has_sidecar = (try? c.decode(Bool.self, forKey: .has_sidecar)) ?? false
         camera = (try? c.decode(String.self, forKey: .camera)) ?? ""
         lens = (try? c.decode(String.self, forKey: .lens)) ?? ""
+        ctime = (try? c.decode(Int64.self, forKey: .ctime)) ?? 0
+        iso = (try? c.decode(Double.self, forKey: .iso)) ?? 0
+        aperture = (try? c.decode(Double.self, forKey: .aperture)) ?? 0
+        focal = (try? c.decode(Double.self, forKey: .focal)) ?? 0
+        shutter = (try? c.decode(Double.self, forKey: .shutter)) ?? 0
     }
+}
+
+/// catalog collection row (manual or rules-evaluated smart)
+struct CollectionInfo: Codable, Identifiable, Hashable {
+    var id: Int64
+    var name: String
+    var smart: Int
+    var rules: String
+    var count: Int
 }
 
 enum WbMode: String, Codable, CaseIterable {
@@ -305,8 +346,28 @@ struct Sidecar: Codable {
     var version: Int = 1
     var rating: Int = 0
     var label: String = ""
+    /// -1 rejected, 0 none, 1 picked
+    var flag: Int = 0
+    var keywords: [String] = []
     var recipe: Recipe = Recipe()
     var versions: [GradeVersion] = []
+
+    enum CodingKeys: String, CodingKey {
+        case version, rating, label, flag, keywords, recipe, versions
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = (try? c.decode(Int.self, forKey: .version)) ?? 1
+        rating = (try? c.decode(Int.self, forKey: .rating)) ?? 0
+        label = (try? c.decode(String.self, forKey: .label)) ?? ""
+        flag = (try? c.decode(Int.self, forKey: .flag)) ?? 0
+        keywords = (try? c.decode([String].self, forKey: .keywords)) ?? []
+        recipe = (try? c.decode(Recipe.self, forKey: .recipe)) ?? Recipe()
+        versions = (try? c.decode([GradeVersion].self, forKey: .versions)) ?? []
+    }
 }
 
 /// Suggested corrections from `araware_auto_analyze` (core/src/auto.rs).

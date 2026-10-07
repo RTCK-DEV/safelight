@@ -15,6 +15,8 @@ enum Ara {
     static let accent = Color(red: 0.96, green: 0.66, blue: 0.24)   // warm amber
     static let accentSoft = accent.opacity(0.16)
     static let gold = Color(red: 1.0, green: 0.80, blue: 0.30)
+    static let red = Color(red: 0.92, green: 0.36, blue: 0.33)
+    static let green = Color(red: 0.45, green: 0.78, blue: 0.42)
     static let track = Color.white.opacity(0.13)
 
     /// Gradient slider tracks (RawTherapee/DaVinci coloured rails): temp is
