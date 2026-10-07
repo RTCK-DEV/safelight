@@ -19,7 +19,7 @@ at a directory of RAW files, no Lightroom-style import step.
 |---|---|---|
 | engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto/pick, cam→sRGB, tone + custom/hue curves, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma+chroma NR, clarity, straighten, vignette, grain, DaVinci-style grading, retouch, light effects), embedded-thumbnail extraction, EXIF, scopes |
 | GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→heal/clone→NR→soft→glow→sharpen/clarity→finish (crop+resize+straighten+flip+CA-fix+adjust+windows+flare+dodge/burn+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
-| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + label + recipe + versions) |
+| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + label + flag + keywords + recipe + versions), stacks/collections tables, smart rules |
 | C ABI | `core/src/capi.rs` | opaque engine handle, images as `{data,len,w,h}` RGBA8, JSON in/out |
 | CLI | `cli/` | `render`, `thumb`, `reference`, `scan`, `meta`, `rate` — test harness + batch tool |
 | macOS app | `mac/` | SwiftUI library grid + editor; builds a self-contained `.app` with libraw bundled |
@@ -103,6 +103,35 @@ All edits are non-destructive: ratings, recipes and grade versions live in
 ```json
 "versions": [{"name": "Teal look", "recipe": { ... }}]
 ```
+
+## Library
+
+Three-pane layout (sidebar / grid / editor). Per-file state lives in the
+sidecars; the SQLite catalog indexes scans and owns stacks + collections.
+
+- **Flags**: `P` pick / `U` unflag / `X` reject — badges on cells, rejected
+  cells dimmed. Keys work on every selected photo (multi-select: `⌘`-click
+  toggles, `⇧`-click ranges, arrows navigate).
+- **Stacks**: `G` groups the selection into a stack; collapsed stacks show
+  the cover with a depth badge. Context menu: expand/collapse, ungroup,
+  set-as-cover.
+- **Virtual copies**: extra sidecar `<stem>.araware.vN.json` — no file
+  duplication, inherits the master's rating/label on creation, can be
+  promoted to master.
+- **Collections**: manual (drag-in via context menu) and smart (rule sheet:
+  rating, flag, label, camera/lens/keyword/filename contains, edited-only);
+  sidebar shows live counts.
+- **Survey**: 2–4 selected photos side-by-side, rendered at loupe res with
+  their own recipes; click flags picked, `Esc` exits.
+- **Filter strip**: stars-min, flag segment, label dots, camera/lens/keyword
+  dropdowns, filename/camera/lens search, sort (name / capture time /
+  modified / rating / size).
+- **Info card**: camera, lens, ISO / f / shutter / focal chips, flag buttons,
+  stack + variant badges, keyword editor.
+- **Thumbnails**: PNG disk cache in `~/.araware/thumbs/` keyed by
+  path+mtime+size — rescans and scope switches are instant.
+- **Batch export**: context menu "Export Selected…" renders every selected
+  photo with its own recipe to a chosen folder.
 
 ## Editor interaction (DaVinci-derived)
 
