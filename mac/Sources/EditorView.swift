@@ -154,6 +154,7 @@ struct EditorView: View {
     // collapsible chrome (darktable panel-edge arrows)
     @State private var showInspector = true
     @State private var showStrip = true
+    @State private var autoBusy = false
 
     /// letterboxed image rect inside the preview area (zoom/pan applied)
     private func imageRect(in size: CGSize) -> CGRect {
@@ -926,11 +927,9 @@ struct EditorView: View {
                 SliderRow("Tint", $recipe.tint, -1...1, track: Ara.tintTrack)
             }
             Panel("Tone", trailing: {
-                ToolChip(label: "Auto", icon: "wand.and.stars") {
-                    recipe.wb_mode = .auto
-                    recipe.auto_exposure = true
-                    recipe.auto_contrast = true
-                }
+                ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.all) }
+                    .help("Analyze the photo and apply every suggestion")
+                    .opacity(autoBusy ? 0.5 : 1)
             }) {
                 SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
                 SliderRow("Contrast", $recipe.contrast, -1...1)
@@ -939,12 +938,20 @@ struct EditorView: View {
                 SliderRow("Whites", $recipe.whites, -1...1)
                 SliderRow("Blacks", $recipe.blacks, -1...1)
             }
-            Panel("Colour") {
+            Panel("Colour", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.colour) }
+                    .help("Estimate vibrance from the chroma distribution")
+                    .opacity(autoBusy ? 0.5 : 1)
+            }) {
                 SliderRow("Saturation", $recipe.saturation, -1...1)
                 SliderRow("Vibrance", $recipe.vibrance, -1...1)
                 SliderRow("Clarity", $recipe.clarity, -1...1)
             }
-            Panel("Geometry") {
+            Panel("Geometry", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.geometry) }
+                    .help("Detect horizon tilt and converging verticals")
+                    .opacity(autoBusy ? 0.5 : 1)
+            }) {
                 SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
             }
         }
@@ -1022,6 +1029,7 @@ struct EditorView: View {
                     recipe.wb_mode = .auto
                     recipe.auto_exposure = true
                     recipe.auto_contrast = true
+                    status = "Auto: WB + exposure + contrast"
                 }
             }) {
                 HStack(spacing: 6) {
@@ -1115,6 +1123,9 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Tone Equalizer", trailing: {
                 HStack(spacing: 4) {
+                    ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.zones) }
+                        .help("Set band gains from the luma histogram")
+                        .opacity(autoBusy ? 0.5 : 1)
                     ToolChip(label: "Image", icon: "hand.draw", active: zoneImgMode) {
                         zoneImgMode.toggle()
                     }
@@ -1330,7 +1341,11 @@ struct EditorView: View {
 
     private var detailPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Panel("Detail") {
+            Panel("Detail", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.detail) }
+                    .help("Estimate noise in flat areas and fringing at edges")
+                    .opacity(autoBusy ? 0.5 : 1)
+            }) {
                 SliderRow("Sharpen", $recipe.sharpen, 0...1)
                 SliderRow("Noise", $recipe.noise_luma, 0...1)
                 SliderRow("NR Chroma", $recipe.noise_chroma, 0...1)
@@ -1360,7 +1375,11 @@ struct EditorView: View {
 
     private var xformPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Panel("Transform") {
+            Panel("Transform", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.geometry) }
+                    .help("Detect horizon tilt and converging verticals")
+                    .opacity(autoBusy ? 0.5 : 1)
+            }) {
                 SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
                 SliderRow("Keystone V", $recipe.key_v, -0.4...0.4)
                 SliderRow("Keystone H", $recipe.key_h, -0.4...0.4)
@@ -1460,6 +1479,7 @@ struct EditorView: View {
                     .font(.system(size: 10).monospacedDigit())
                     .foregroundStyle(dirty && status.isEmpty ? Ara.accent : Ara.text3)
                     .lineLimit(1).truncationMode(.middle)
+                    .help(status)
                 Spacer()
                 IconAction(icon: "doc.on.doc") { copyRecipe() }
                 IconAction(icon: "clipboard") { pasteRecipe() }
@@ -1489,8 +1509,78 @@ struct EditorView: View {
         }
     }
 
-    /// Crop aspect preset: shrink/grow the current crop (centre-preserving)
-    /// to the given w:h ratio. k == 0 resets to the full frame.
+    /// which suggestion subset a per-panel Auto chip applies
+    private enum AutoScope { case all, tone, geometry, detail, zones, colour }
+
+    /// engine-side analysis on a neutral preview, then apply the scope's
+    /// suggestions (core/src/auto.rs). One analysis per click.
+    private func runAuto(_ scope: AutoScope) {
+        guard !autoBusy else { return }
+        autoBusy = true
+        status = "Analyzing…"
+        let p = photo.path
+        Task {
+            let sug = await AraEngine.shared.work { $0.autoAnalyze(path: p) }
+            await MainActor.run {
+                autoBusy = false
+                guard let s = sug else {
+                    status = "Auto analysis failed: \(AraEngine.shared.lastError)"
+                    return
+                }
+                switch scope {
+                case .all:
+                    recipe.wb_mode = .auto
+                    recipe.auto_exposure = true
+                    recipe.auto_contrast = true
+                    recipe.rotation_deg = s.rotation_deg
+                    recipe.key_v = s.key_v; recipe.key_h = s.key_h
+                    recipe.noise_luma = s.noise_luma; recipe.noise_chroma = s.noise_chroma
+                    recipe.ca_fix = s.ca_fix
+                    recipe.vibrance = s.vibrance
+                    recipe.zones_ev = s.zones_ev
+                case .tone:
+                    recipe.wb_mode = .auto
+                    recipe.auto_exposure = true
+                    recipe.auto_contrast = true
+                case .geometry:
+                    recipe.rotation_deg = s.rotation_deg
+                    recipe.key_v = s.key_v; recipe.key_h = s.key_h
+                case .detail:
+                    recipe.noise_luma = s.noise_luma; recipe.noise_chroma = s.noise_chroma
+                    recipe.ca_fix = s.ca_fix
+                case .zones:
+                    recipe.zones_ev = s.zones_ev
+                case .colour:
+                    recipe.vibrance = s.vibrance
+                }
+                status = autoSummary(s, scope)
+            }
+        }
+    }
+
+    /// status line describing what THIS chip actually applied (not the full
+    /// suggestion, which may include fields other scopes own)
+    private func autoSummary(_ s: AutoSuggestion, _ scope: AutoScope) -> String {
+        var parts: [String] = []
+        switch scope {
+        case .all:
+            return "Auto: \(s.summary)"
+        case .tone:
+            return "Auto: WB + exposure + contrast"
+        case .geometry:
+            if s.rotation_deg != 0 { parts.append(String(format: "straighten %+.1f°", s.rotation_deg)) }
+            if s.key_v != 0 { parts.append(String(format: "keystone %+.2f", s.key_v)) }
+        case .detail:
+            if s.noise_luma > 0 { parts.append(String(format: "NR %.2f (σ=%.1f)", s.noise_luma, s.noise_sigma)) }
+            if s.ca_fix > 0 { parts.append(String(format: "CA %.2f", s.ca_fix)) }
+        case .zones:
+            if s.zones_ev.contains(where: { $0 != 0 }) { parts.append("zone EQ set") }
+        case .colour:
+            if s.vibrance != 0 { parts.append(String(format: "vibrance %+.2f", s.vibrance)) }
+        }
+        return parts.isEmpty ? "Auto: nothing to correct" : "Auto: \(parts.joined(separator: " · "))"
+    }
+
     private func applyAspect(_ k: Double) {
         if k == 0 { recipe.crop = [0, 0, 0, 0]; return }
         guard let img = image else { return }

@@ -130,6 +130,15 @@ final class AraEngine: @unchecked Sendable {
         takeString(path.withCString { araware_metadata(handle, $0) }) ?? ""
     }
 
+    /// Auto-correction analysis on a neutral preview — returns suggested
+    /// recipe values plus confidence fields (see core/src/auto.rs).
+    func autoAnalyze(path: String) -> AutoSuggestion? {
+        guard let js = takeString(path.withCString { araware_auto_analyze(handle, $0) }),
+              let data = js.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(AutoSuggestion.self, from: data)
+    }
+
     func sidecar(path: String) -> Sidecar {
         guard let js = takeString(path.withCString { araware_sidecar_read($0) }),
               let data = js.data(using: .utf8),

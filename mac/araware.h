@@ -36,4 +36,6 @@ int araware_set_rating(void* e, const char* path, int rating);
 int araware_set_label(void* e, const char* path, const char* label);
 AraImage araware_reference(const char* path);
 
+char* araware_auto_analyze(void* e, const char* path);
+
 #endif

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::auto;
 use crate::catalog::{AssetEntry, Catalog};
 use crate::decode::{self, Decoded};
 use crate::develop::{self, RgbaImage};
@@ -98,6 +99,13 @@ impl Engine {
     /// export: full-res render (max_px = 0)
     pub fn export(&self, path: &Path, recipe: &Recipe) -> Result<RgbaImage> {
         self.render(path, recipe, 0)
+    }
+
+    /// auto-correction analysis: neutral 512px render -> suggested recipe
+    /// values (see auto.rs). CPU stats on an sRGB preview.
+    pub fn auto_analyze(&self, path: &Path) -> Result<auto::AutoResult> {
+        let img = self.render(path, &Recipe::default(), 512)?;
+        Ok(auto::analyze(&img))
     }
 
     /// fast preview: embedded thumbnail if any, else small develop.

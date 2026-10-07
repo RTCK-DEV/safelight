@@ -14,6 +14,7 @@ fn main() -> Result<()> {
   araware-cli reference <raw> <out.png>
   araware-cli scan <folder>
   araware-cli meta <file>
+  araware-cli auto <file>
   araware-cli rate <file> <0-5>"
         );
         std::process::exit(2);
@@ -83,6 +84,10 @@ fn main() -> Result<()> {
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        "auto" => {
+            let r = eng.auto_analyze(Path::new(&args[2]))?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
         }
         "rate" => {
             let rating: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);

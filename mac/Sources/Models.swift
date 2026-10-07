@@ -301,3 +301,31 @@ struct Sidecar: Codable {
     var recipe: Recipe = Recipe()
     var versions: [GradeVersion] = []
 }
+
+/// Suggested corrections from `araware_auto_analyze` (core/src/auto.rs).
+struct AutoSuggestion: Codable {
+    var rotation_deg: Double = 0
+    var key_v: Double = 0
+    var key_h: Double = 0
+    var noise_luma: Double = 0
+    var noise_chroma: Double = 0
+    var ca_fix: Double = 0
+    var vibrance: Double = 0
+    var zones_ev: [Double] = [Double](repeating: 0, count: 9)
+    var straighten_conf: Double = 0
+    var keystone_conf: Double = 0
+    var noise_sigma: Double = 0
+    var ca_score: Double = 0
+
+    /// one-line human summary of the substantive suggestions
+    var summary: String {
+        var parts: [String] = []
+        if rotation_deg != 0 { parts.append(String(format: "straighten %+.1f°", rotation_deg)) }
+        if key_v != 0 { parts.append(String(format: "keystone %+.2f", key_v)) }
+        if noise_luma > 0 { parts.append(String(format: "NR %.2f (σ=%.1f)", noise_luma, noise_sigma)) }
+        if ca_fix > 0 { parts.append(String(format: "CA %.2f", ca_fix)) }
+        if vibrance > 0 { parts.append(String(format: "vibrance %+.2f", vibrance)) }
+        if zones_ev.contains(where: { $0 != 0 }) { parts.append("zone EQ set") }
+        return parts.isEmpty ? "no suggestions" : parts.joined(separator: " · ")
+    }
+}

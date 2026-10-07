@@ -318,6 +318,25 @@ pub unsafe extern "C" fn araware_set_label(
     }
 }
 
+/// Auto-correction analysis -> JSON with suggested recipe values.
+#[no_mangle]
+pub unsafe extern "C" fn araware_auto_analyze(e: *mut c_void, path: *const c_char) -> *mut c_char {
+    let eng = &*(e as *const Engine);
+    match eng.auto_analyze(Path::new(&cstr(path))) {
+        Ok(r) => match serde_json::to_string(&r) {
+            Ok(j) => into_raw_string(j),
+            Err(e) => {
+                set_err(&e.into());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_err(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// libraw reference render (sanity check / debugging)
 #[no_mangle]
 pub unsafe extern "C" fn araware_reference(path: *const c_char) -> AraImage {

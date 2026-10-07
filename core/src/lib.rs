@@ -3,6 +3,7 @@
 //! decode (LibRaw) -> develop pipeline (CPU reference, wgpu for speed)
 //! -> catalog (folder scan + SQLite index + JSON sidecars) -> C FFI.
 
+pub mod auto;
 pub mod capi;
 pub mod catalog;
 pub mod decode;
