@@ -220,6 +220,9 @@ impl Engine {
                 v["timestamp"] = json!(m.info.timestamp);
                 v["width"] = json!(m.w);
                 v["height"] = json!(m.h);
+                v["rgb_cam"] = json!(m.rgb_cam);
+                v["cam_xyz"] = json!(m.cam_xyz);
+                v["pre_mul"] = json!(m.pre_mul);
             }
             Decoded::Raster { w, h, .. } => {
                 v["width"] = json!(w);

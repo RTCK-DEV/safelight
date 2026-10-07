@@ -2153,10 +2153,47 @@ struct LookPicker: View {
     @State private var thumbPath = ""
     @State private var loading = false
 
-    private let options: [(String, String)] = [
-        ("", "None"), ("teal_orange", "Teal & Orange"), ("film_fade", "Film Fade"),
+    private let creative: [(String, String)] = [
+        ("teal_orange", "Teal & Orange"), ("film_fade", "Film Fade"),
         ("bleach", "Bleach Bypass"), ("noir", "Noir"), ("matte", "Matte"),
     ]
+
+    /// camera-matching profiles for the file's make (LR "Camera Matching")
+    private var cameraLooks: [(String, String)] {
+        let cam = photo.camera.lowercased()
+        if cam.contains("fujifilm") {
+            return [("fuji_provia", "Provia"), ("fuji_velvia", "Velvia"),
+                    ("fuji_astia", "Astia"), ("fuji_chrome", "Classic Chrome"),
+                    ("fuji_acros", "Acros")]
+        }
+        if cam.contains("canon") {
+            return [("canon_faithful", "Faithful"), ("canon_landscape", "Landscape"),
+                    ("canon_portrait", "Portrait"), ("canon_mono", "Monochrome")]
+        }
+        if cam.contains("nikon") {
+            return [("nikon_neutral", "Neutral"), ("nikon_vivid", "Vivid"),
+                    ("nikon_portrait", "Portrait"), ("nikon_mono", "Monochrome")]
+        }
+        if cam.contains("sony") {
+            return [("sony_neutral", "Neutral"), ("sony_vivid", "Vivid"),
+                    ("sony_portrait", "Portrait"), ("sony_bw", "B&W")]
+        }
+        if cam.contains("olympus") || cam.contains("om system") {
+            return [("oly_vivid", "Vivid"), ("oly_muted", "Muted"),
+                    ("oly_mono", "Monochrome")]
+        }
+        if cam.contains("panasonic") {
+            return [("pana_natural", "Natural"), ("pana_vivid", "Vivid"),
+                    ("pana_mono", "Monochrome")]
+        }
+        if cam.contains("leica") {
+            return [("leica_natural", "Natural"), ("leica_vivid", "Vivid"),
+                    ("leica_bw", "B&W")]
+        }
+        return []
+    }
+
+    private var options: [(String, String)] { [("", "None")] + cameraLooks + creative }
 
     var body: some View {
         Button {
@@ -2181,6 +2218,11 @@ struct LookPicker: View {
                 Text("LOOKS")
                     .font(.system(size: 9, weight: .semibold)).tracking(1.2)
                     .foregroundStyle(Ara.text3)
+                if !cameraLooks.isEmpty {
+                    Text("CAMERA MATCHING")
+                        .font(.system(size: 7.5, weight: .semibold)).tracking(1)
+                        .foregroundStyle(Ara.text3.opacity(0.7))
+                }
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
                           spacing: 8) {
                     ForEach(options, id: \.0) { v, name in

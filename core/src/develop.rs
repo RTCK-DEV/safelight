@@ -409,6 +409,144 @@ fn apply_look(p: &mut Params, look: &str) {
             p.high_col = hue_to_rgb(0.10);
             p.high_sat = (p.high_sat + 0.15).min(1.0);
         }
+        // ---- camera-matching profiles (Lightroom "Camera Matching"
+        // equivalents — approximated renderings, not vendor data) ----
+        // Fujifilm film simulations
+        "fuji_provia" => {
+            p.saturation += 0.03;
+            p.contrast += 0.03;
+        }
+        "fuji_velvia" => {
+            p.saturation += 0.35;
+            p.contrast += 0.15;
+            p.high_col = hue_to_rgb(0.08);
+            p.high_sat = (p.high_sat + 0.10).min(1.0);
+            p.shadow_col = hue_to_rgb(0.55);
+            p.shadow_sat = (p.shadow_sat + 0.08).min(1.0);
+        }
+        "fuji_astia" => {
+            p.contrast -= 0.12;
+            p.saturation += 0.06;
+            p.high_col = hue_to_rgb(0.09);
+            p.high_sat = (p.high_sat + 0.08).min(1.0);
+            for c in &mut p.lift {
+                *c += 0.01;
+            }
+        }
+        "fuji_chrome" => {
+            // Classic Chrome: muted editorial — desaturated, warm
+            // shadows, slightly cyan highlights
+            p.saturation -= 0.30;
+            p.contrast += 0.08;
+            p.shadow_col = hue_to_rgb(0.07);
+            p.shadow_sat = (p.shadow_sat + 0.12).min(1.0);
+            p.high_col = hue_to_rgb(0.52);
+            p.high_sat = (p.high_sat + 0.06).min(1.0);
+            for c in &mut p.lift {
+                *c += 0.015;
+            }
+        }
+        "fuji_acros" => {
+            p.saturation = -1.0;
+            p.contrast += 0.22;
+            for c in &mut p.lift {
+                *c += 0.008;
+            }
+        }
+        // Canon Picture Styles
+        "canon_faithful" => {
+            p.saturation -= 0.08;
+            p.contrast -= 0.02;
+        }
+        "canon_landscape" => {
+            p.saturation += 0.22;
+            p.contrast += 0.10;
+            p.shadow_col = hue_to_rgb(0.38);
+            p.shadow_sat = (p.shadow_sat + 0.10).min(1.0);
+        }
+        "canon_portrait" => {
+            p.contrast -= 0.12;
+            p.saturation -= 0.05;
+            p.high_col = hue_to_rgb(0.09);
+            p.high_sat = (p.high_sat + 0.06).min(1.0);
+        }
+        "canon_mono" => {
+            p.saturation = -1.0;
+            p.contrast += 0.15;
+        }
+        // Nikon Picture Controls
+        "nikon_vivid" => {
+            p.saturation += 0.30;
+            p.contrast += 0.18;
+        }
+        "nikon_neutral" => {
+            p.contrast -= 0.08;
+            p.saturation -= 0.05;
+        }
+        "nikon_portrait" => {
+            p.contrast -= 0.10;
+            p.saturation -= 0.04;
+        }
+        "nikon_mono" => {
+            p.saturation = -1.0;
+            p.contrast += 0.12;
+        }
+        // Sony Creative Styles
+        "sony_vivid" => {
+            p.saturation += 0.25;
+            p.contrast += 0.15;
+        }
+        "sony_neutral" => {
+            p.contrast -= 0.06;
+            p.saturation -= 0.04;
+        }
+        "sony_portrait" => {
+            p.contrast -= 0.10;
+            p.saturation -= 0.03;
+        }
+        "sony_bw" => {
+            p.saturation = -1.0;
+            p.contrast += 0.14;
+        }
+        // Olympus Picture Modes
+        "oly_vivid" => {
+            p.saturation += 0.28;
+            p.contrast += 0.12;
+        }
+        "oly_muted" => {
+            p.saturation -= 0.25;
+            p.contrast -= 0.05;
+        }
+        "oly_mono" => {
+            p.saturation = -1.0;
+            p.contrast += 0.15;
+        }
+        // Panasonic Photo Styles
+        "pana_vivid" => {
+            p.saturation += 0.25;
+            p.contrast += 0.12;
+        }
+        "pana_natural" => {
+            p.saturation -= 0.08;
+            p.contrast -= 0.05;
+        }
+        "pana_mono" => {
+            p.saturation = -1.0;
+            p.contrast += 0.13;
+        }
+        // Leica film styles
+        "leica_vivid" => {
+            p.saturation += 0.20;
+            p.contrast += 0.12;
+        }
+        "leica_natural" => {
+            p.saturation -= 0.05;
+            p.contrast -= 0.03;
+        }
+        "leica_bw" => {
+            p.saturation = -1.0;
+            p.contrast += 0.18;
+        }
         _ => {}
     }
 }
