@@ -138,6 +138,8 @@ pub struct Recipe {
     // ---- restoration + light fx ----
     /// chroma noise reduction 0..1 (spatial, pairs with noise_luma)
     pub noise_chroma: f32,
+    /// haze removal 0..1 (dark-channel-prior veil subtraction)
+    pub dehaze: f32,
     /// chromatic aberration fix -0.5..0.5 (radial R/B scale)
     pub ca_fix: f32,
     /// debanding amount 0..1 (smooths quantized gradients)
@@ -276,7 +278,8 @@ impl Default for Recipe {
             mono: [0.0; 3],
             clones: Vec::new(),
             beauty: 0.0,
-            noise_chroma: 0.0,
+            noise_chroma: 0.2,
+            dehaze: 0.0,
             ca_fix: 0.0,
             deband: 0.0,
             glow: 0.0,

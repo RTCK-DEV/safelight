@@ -21,6 +21,8 @@ pub struct AutoResult {
     pub noise_chroma: f32,
     /// chromatic-aberration fix strength 0..0.7
     pub ca_fix: f32,
+    /// haze removal strength 0..0.7 (dark-channel veil floor)
+    pub dehaze: f32,
     /// vibrance suggestion 0..0.5 (never negative — saturation is taste)
     pub vibrance: f32,
     /// per-band EV suggestions for the 9-band tone equalizer (-4..+4 bands)
@@ -38,6 +40,22 @@ fn median(xs: &mut [f32]) -> f32 {
     }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     xs[xs.len() / 2]
+}
+
+fn percentile(xs: &mut [f32], p: f32) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs[((xs.len() - 1) as f32 * p) as usize]
+}
+
+fn srgb_to_lin(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// median absolute deviation → robust sigma estimate
@@ -62,6 +80,7 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
             noise_luma: 0.0,
             noise_chroma: 0.0,
             ca_fix: 0.0,
+            dehaze: 0.0,
             vibrance: 0.0,
             zones_ev: [0.0; 9],
             straighten_conf: 0.0,
@@ -74,6 +93,9 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
     // --- per-pixel planes -------------------------------------------------
     let mut lum = vec![0f32; n];
     let mut chr = vec![0f32; n];
+    // min-channel floor among low-chroma pixels — atmospheric veil is
+    // near-achromatic; saturated scenes legitimately have high min channels
+    let mut dark_low: Vec<f32> = Vec::with_capacity(n / 8);
     for i in 0..n {
         let (r, g, b) = (
             img.data[i * 4] as f32 / 255.0,
@@ -82,6 +104,10 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
         );
         lum[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         chr[i] = r.max(g).max(b) - r.min(g).min(b);
+        if i % 5 == 0 && chr[i] < 0.18 {
+            // LINEAR min-channel: veil floor lives in linear space
+            dark_low.push(srgb_to_lin(r).min(srgb_to_lin(g)).min(srgb_to_lin(b)));
+        }
     }
 
     // Sobel gradients (x only needed interior; edges ignored)
@@ -340,6 +366,18 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
     zones[8] = 0.0;
     zones[4] = 0.0;
 
+    // --- dehaze: haze lifts the DARK floor of the image, not the midtones.
+    // Bright low-chroma regions (clouds, white walls) legitimately have high
+    // min-channels, so the median is useless; the low percentile — the
+    // darkest achievable min-channel — is the veil estimate.
+    let veil_floor = percentile(&mut dark_low, 0.05);
+    // clean scenes floor at ~0.01 linear; visible haze starts ~0.025+
+    let dehaze = if dark_low.len() > n / 40 {
+        ((veil_floor - 0.022) * 10.0).clamp(0.0, 0.5)
+    } else {
+        0.0
+    };
+
     AutoResult {
         rotation_deg: rotation,
         key_v,
@@ -347,6 +385,7 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
         noise_luma,
         noise_chroma,
         ca_fix,
+        dehaze,
         vibrance,
         zones_ev: zones,
         straighten_conf,

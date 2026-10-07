@@ -1357,6 +1357,7 @@ struct EditorView: View {
                 SliderRow("Sharpen", $recipe.sharpen, 0...1)
                 SliderRow("Noise", $recipe.noise_luma, 0...1)
                 SliderRow("NR Chroma", $recipe.noise_chroma, 0...1)
+                SliderRow("Dehaze", $recipe.dehaze, 0...1)
                 SliderRow("Deband", $recipe.deband, 0...1)
                 SliderRow("CA Fix", $recipe.ca_fix, 0...1)
                 SliderRow("Beauty", $recipe.beauty, 0...1)
@@ -1544,6 +1545,7 @@ struct EditorView: View {
                     recipe.key_v = s.key_v; recipe.key_h = s.key_h
                     recipe.noise_luma = s.noise_luma; recipe.noise_chroma = s.noise_chroma
                     recipe.ca_fix = s.ca_fix
+                    recipe.dehaze = s.dehaze
                     recipe.vibrance = s.vibrance
                     recipe.zones_ev = s.zones_ev
                 case .tone:
@@ -1556,6 +1558,7 @@ struct EditorView: View {
                 case .detail:
                     recipe.noise_luma = s.noise_luma; recipe.noise_chroma = s.noise_chroma
                     recipe.ca_fix = s.ca_fix
+                    recipe.dehaze = s.dehaze
                 case .zones:
                     recipe.zones_ev = s.zones_ev
                 case .colour:
@@ -1581,6 +1584,7 @@ struct EditorView: View {
         case .detail:
             if s.noise_luma > 0 { parts.append(String(format: "NR %.2f (σ=%.1f)", s.noise_luma, s.noise_sigma)) }
             if s.ca_fix > 0 { parts.append(String(format: "CA %.2f", s.ca_fix)) }
+            if s.dehaze > 0 { parts.append(String(format: "dehaze %.2f", s.dehaze)) }
         case .zones:
             if s.zones_ev.contains(where: { $0 != 0 }) { parts.append("zone EQ set") }
         case .colour:
@@ -1853,8 +1857,8 @@ struct EditorView: View {
         case .retouch:
             return !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty
         case .detail:
-            return recipe.sharpen != 0 || recipe.noise_luma != 0 || recipe.noise_chroma != 0
-                || recipe.deband != 0 || recipe.ca_fix != 0 || recipe.beauty != 0
+            return recipe.sharpen != 0 || recipe.noise_luma != 0 || recipe.noise_chroma != d.noise_chroma
+                || recipe.dehaze != 0 || recipe.deband != 0 || recipe.ca_fix != 0 || recipe.beauty != 0
         case .fx:
             return recipe.clarity != 0 || recipe.vignette != 0 || recipe.grain != 0
                 || recipe.glow != 0 || recipe.flare[2] != 0
@@ -1919,8 +1923,8 @@ struct EditorView: View {
             recipe.spots = []; recipe.lights = []; recipe.clones = []
             pendingClone = nil
         case .detail:
-            recipe.sharpen = 0; recipe.noise_luma = 0; recipe.noise_chroma = 0
-            recipe.deband = 0; recipe.ca_fix = 0; recipe.beauty = 0
+            recipe.sharpen = 0; recipe.noise_luma = 0; recipe.noise_chroma = d.noise_chroma
+            recipe.dehaze = 0; recipe.deband = 0; recipe.ca_fix = 0; recipe.beauty = 0
         case .fx:
             recipe.clarity = 0; recipe.vignette = 0; recipe.grain = 0
             recipe.glow = 0; recipe.flare = d.flare

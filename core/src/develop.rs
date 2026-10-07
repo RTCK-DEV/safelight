@@ -94,6 +94,10 @@ pub struct Params {
     pub n_clones: u32,
     pub beauty: f32,
     pub noise_chroma: f32,
+    /// dehaze veil strength (recipe dehaze * 0.85) — 0 = off
+    pub dehaze: f32,
+    /// atmospheric light estimate A (min-channel p99.5, >= 0.05)
+    pub dehaze_a: f32,
     pub ca_fix: f32,
     pub deband: f32,
     pub glow: f32,
@@ -120,6 +124,8 @@ pub struct Stats {
     pub means: [f32; 3],
     pub luma_mean: f32,
     pub luma_hist: [u32; 256],
+    /// 256-bin histogram of min(r,g,b) — dark-channel prior for dehaze
+    pub min_hist: [u32; 256],
     pub count: u64,
     /// mean raw level inside the WB-pick rectangle (camera space)
     pub pick_means: [f32; 3],
@@ -132,6 +138,7 @@ impl Default for Stats {
             means: [0.0; 3],
             luma_mean: 0.0,
             luma_hist: [0; 256],
+            min_hist: [0; 256],
             count: 0,
             pick_means: [0.0; 3],
             pick_count: 0,
@@ -146,11 +153,24 @@ impl Stats {
             || r.wb_mode == WbMode::Pick
             || r.auto_exposure
             || r.auto_contrast
+            || r.dehaze > 0.0
     }
     fn luma_percentile(&self, p: f32) -> f32 {
         let target = (self.count as f64 * p as f64) as u64;
         let mut acc = 0u64;
         for (i, &b) in self.luma_hist.iter().enumerate() {
+            acc += b as u64;
+            if acc >= target.max(1) {
+                return i as f32 / 255.0;
+            }
+        }
+        1.0
+    }
+    /// dark-channel percentile: atmospheric light estimate for dehaze
+    fn dark_percentile(&self, p: f32) -> f32 {
+        let target = (self.count as f64 * p as f64) as u64;
+        let mut acc = 0u64;
+        for (i, &b) in self.min_hist.iter().enumerate() {
             acc += b as u64;
             if acc >= target.max(1) {
                 return i as f32 / 255.0;
@@ -690,6 +710,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         n_clones: r.clones.len().min(8) as u32,
         beauty: r.beauty.clamp(0.0, 1.0),
         noise_chroma: r.noise_chroma.clamp(0.0, 1.0),
+        dehaze: r.dehaze.clamp(0.0, 1.0) * 0.85,
+        dehaze_a: stats
+            .map(|s| s.dark_percentile(0.995))
+            .unwrap_or(1.0)
+            .max(0.05),
         ca_fix: r.ca_fix.clamp(-0.5, 0.5),
         deband: r.deband.clamp(0.0, 1.0),
         glow: r.glow.clamp(0.0, 1.0),
@@ -836,6 +861,16 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     if p.white_pt - p.black_pt < 0.999 || p.black_pt > 0.001 {
         for c in &mut x {
             *c = (*c - p.black_pt) / (p.white_pt - p.black_pt).max(0.02);
+        }
+    }
+    // dehaze (dark-channel prior): veil = dehaze * min(r,g,b); transmission
+    // t = 1 - veil/A floored at 0.35; x' = (x - veil)/t — mirrors gpu.rs
+    if p.dehaze > 0.0 {
+        let mn = x[0].min(x[1]).min(x[2]);
+        let t = (1.0 - p.dehaze * mn / p.dehaze_a).max(0.35);
+        let v = p.dehaze * mn;
+        for c in &mut x {
+            *c = ((*c - v) / t).max(0.0);
         }
     }
     // tone equalizer: per-zone exposure on the post-exposure luma
@@ -1480,6 +1515,34 @@ fn heal_find_source(
 
 /// shared tail: spatial ops -> straighten/flip/crop/fit-resize -> adjust ->
 /// dodge/burn -> grain/vignette -> gamma. Same ordering as the gpu.rs finish pass.
+/// atmospheric-light scalar for dehaze: 99.5th percentile of min(r,g,b)
+/// over the linear sRGB buffer (sparse sample). Mirrors the gpu.rs
+/// stats_main min-channel histogram on wb_matrix(demosaic()).
+fn atmosphere(lin: &[[f32; 3]], w: usize, h: usize) -> f32 {
+    let mut hist = [0u32; 256];
+    // identical sampling grid to gpu.rs stats_main so CPU/GPU derive the
+    // same A: step = ceil(sqrt(px/65536)), 2D stride over (x,y)
+    let step = ((w * h) as f64 / 65536.0).sqrt().ceil().max(2.0) as usize;
+    let mut n = 0u64;
+    for y in (0..h).step_by(step) {
+        for x in (0..w).step_by(step) {
+            let px = &lin[y * w + x];
+            let mn = px[0].min(px[1]).min(px[2]).clamp(0.0, 1.0);
+            hist[(mn * 255.0) as usize] += 1;
+            n += 1;
+        }
+    }
+    let target = (n as f64 * 0.995) as u64;
+    let mut acc = 0u64;
+    for (i, &b) in hist.iter().enumerate() {
+        acc += b as u64;
+        if acc >= target.max(1) {
+            return (i as f32 / 255.0).max(0.05);
+        }
+    }
+    1.0
+}
+
 fn finish_linear(
     mut lin: Vec<[f32; 3]>,
     w: usize,
@@ -1488,6 +1551,13 @@ fn finish_linear(
     flip: i32,
     max_px: u32,
 ) -> RgbaImage {
+    // dehaze's atmosphere scalar is image-dependent: derive it on the actual
+    // linear buffer so mosaic and raster paths share the estimate.
+    let mut pc = p.clone();
+    if pc.dehaze > 0.0 {
+        pc.dehaze_a = atmosphere(&lin, w, h);
+    }
+    let p = &pc;
     heal_lin(&mut lin, w, h, &p.spots, p.n_spots, flip);
     clone_lin(&mut lin, w, h, &p.clones, p.n_clones, flip);
     if p.noise_luma > 0.0 {

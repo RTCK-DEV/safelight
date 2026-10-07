@@ -97,6 +97,8 @@ struct Uni {
     ze0: [f32; 4],
     ze1: [f32; 4],
     ze2: [f32; 4],
+    /// dehaze: veil strength w, atmospheric light A, 0, 0
+    dh0: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -151,6 +153,8 @@ struct Uni {
     ze0: vec4<f32>,
     ze1: vec4<f32>,
     ze2: vec4<f32>,
+    // dh0 = [veil strength w, atmospheric light A, 0, 0]
+    dh0: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -232,6 +236,10 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let l = clamp(luma(c), 0.0, 1.0);
     atomicAdd(&stats[4], u32(l * 1000.0));
     atomicAdd(&stats[5u + u32(l * 255.0)], 1u);
+    // dark-channel histogram (linear sRGB domain) for dehaze A estimation
+    let lin3 = wb_matrix(c);
+    let mn = clamp(min(lin3.x, min(lin3.y, lin3.z)), 0.0, 1.0);
+    atomicAdd(&stats[265u + u32(mn * 255.0)], 1u);
     // WB pick region accumulation (stats[261..264] = rgb sums, [264] = count)
     let px = f32((i % nx) * step);
     let py = f32((i / nx) * step);
@@ -646,6 +654,13 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     // auto-contrast percentile remap
     if (u.misc.y - u.misc.x < 0.999 || u.misc.x > 0.001) {
         x = (x - vec3<f32>(u.misc.x)) / max(u.misc.y - u.misc.x, 0.02);
+    }
+    // dehaze (dark-channel prior): veil = w * min(r,g,b); t floored at
+    // 0.35; x' = (x - veil)/t — mirrors develop.rs
+    if (u.dh0.x > 0.0) {
+        let mn = min(x.x, min(x.y, x.z));
+        let t = max(1.0 - u.dh0.x * mn / u.dh0.y, 0.35);
+        x = max((x - vec3<f32>(u.dh0.x * mn)) / t, vec3<f32>(0.0));
     }
     // tone equalizer: per-zone EV (9 log2-luma zones, centers -4..+4)
     if (u.ze2.y > 0.5) {
@@ -1149,7 +1164,8 @@ impl Gpu {
             mapped_at_creation: false,
         });
         // r,g,b,luma sums + count + 256-bin luma hist + pick rgb sums + pick cnt
-        const STATS_N: u64 = 265;
+        // + 256-bin min-channel (dark-channel) histogram for dehaze
+        const STATS_N: u64 = 521;
         let stats_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats"),
             size: STATS_N * 4,
@@ -1300,6 +1316,7 @@ impl Gpu {
                 p.key_v,
                 p.key_h,
             ],
+            dh0: [p.dehaze, p.dehaze_a, 0.0, 0.0],
         };
 
         let bind = |pipe: &Pipe| {
@@ -1364,6 +1381,7 @@ impl Gpu {
                 ],
                 luma_mean: (raw[4] as f64 / 1e3 / cnt) as f32,
                 luma_hist: [0u32; 256],
+                min_hist: [0u32; 256],
                 count: raw[3] as u64,
                 pick_means: if pcnt > 0.0 {
                     [
@@ -1377,6 +1395,7 @@ impl Gpu {
                 pick_count: raw[264] as u64,
             };
             st.luma_hist.copy_from_slice(&raw[5..261]);
+            st.min_hist.copy_from_slice(&raw[265..521]);
             Some(st)
         } else {
             None

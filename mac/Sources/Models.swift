@@ -152,7 +152,8 @@ struct Recipe: Codable, Equatable {
     var clones: [[Double]] = []
     // restoration & light effects
     var beauty: Double = 0
-    var noise_chroma: Double = 0
+    var noise_chroma: Double = 0.2  // mild chroma NR by default (LR/Affinity convention)
+    var dehaze: Double = 0
     var ca_fix: Double = 0
     var deband: Double = 0
     var glow: Double = 0
@@ -189,7 +190,7 @@ extension Recipe {
         case z_dark, z_shadow, z_light, z_global
         case pivot, highlight_rolloff, shadow_rolloff
         case mixer, mono, clones
-        case beauty, noise_chroma, ca_fix, deband, glow, flare
+        case beauty, noise_chroma, dehaze, ca_fix, deband, glow, flare
         case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
     }
 
@@ -260,7 +261,8 @@ extension Recipe {
         mono = opt(.mono, [Double].self) ?? [0, 0, 0]
         clones = opt(.clones, [[Double]].self) ?? []
         beauty = opt(.beauty, Double.self) ?? 0
-        noise_chroma = opt(.noise_chroma, Double.self) ?? 0
+        noise_chroma = opt(.noise_chroma, Double.self) ?? 0.2
+        dehaze = opt(.dehaze, Double.self) ?? 0
         ca_fix = opt(.ca_fix, Double.self) ?? 0
         deband = opt(.deband, Double.self) ?? 0
         glow = opt(.glow, Double.self) ?? 0
@@ -315,6 +317,7 @@ struct AutoSuggestion: Codable {
     var noise_luma: Double = 0
     var noise_chroma: Double = 0
     var ca_fix: Double = 0
+    var dehaze: Double = 0
     var vibrance: Double = 0
     var zones_ev: [Double] = [Double](repeating: 0, count: 9)
     var straighten_conf: Double = 0
@@ -329,6 +332,7 @@ struct AutoSuggestion: Codable {
         if key_v != 0 { parts.append(String(format: "keystone %+.2f", key_v)) }
         if noise_luma > 0 { parts.append(String(format: "NR %.2f (σ=%.1f)", noise_luma, noise_sigma)) }
         if ca_fix > 0 { parts.append(String(format: "CA %.2f", ca_fix)) }
+        if dehaze > 0 { parts.append(String(format: "dehaze %.2f", dehaze)) }
         if vibrance > 0 { parts.append(String(format: "vibrance %+.2f", vibrance)) }
         if zones_ev.contains(where: { $0 != 0 }) { parts.append("zone EQ set") }
         return parts.isEmpty ? "no suggestions" : parts.joined(separator: " · ")
