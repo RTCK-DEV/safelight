@@ -118,16 +118,6 @@ struct LibraryView: View {
                               systemImage: c.smart == 1 ? "sparkle.magnifyingglass" : "tray.full")
                             .tag(String(c.id))
                             .badge(c.count)
-                            .contextMenu {
-                                Button("Rename…") { renameCollection(c) }
-                                if c.smart == 1 {
-                                    Button("Edit Rules…") { editSmart(c) }
-                                }
-                                Divider()
-                                Button("Delete", role: .destructive) {
-                                    store.deleteCollection(c)
-                                }
-                            }
                     }
                     HStack(spacing: 8) {
                         Button { showNewCollection = true } label: {
@@ -143,6 +133,19 @@ struct LibraryView: View {
                 }
             }
             .listStyle(.sidebar)
+            // per-row .contextMenu on a selectable List eats primary clicks
+            // (SwiftUI quirk) — use the list-level selection context menu.
+            .contextMenu(forSelectionType: String.self) { sel in
+                if let s = sel.first, let cid = Int64(s),
+                   let c = store.collections.first(where: { $0.id == cid }) {
+                    Button("Rename…") { renameCollection(c) }
+                    if c.smart == 1 {
+                        Button("Edit Rules…") { editSmart(c) }
+                    }
+                    Divider()
+                    Button("Delete", role: .destructive) { store.deleteCollection(c) }
+                }
+            }
             .onChange(of: store.scope) { _, s in
                 // "folder:<path>" rows switch the scanned folder itself
                 if s.hasPrefix("folder:") {
