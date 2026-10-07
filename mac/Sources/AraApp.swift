@@ -29,6 +29,8 @@ final class LibraryStore: ObservableObject {
     @Published var labelFilter = ""
     @Published var cameraFilter = ""
     @Published var lensFilter = ""
+    /// darktable lighttable sort key: name | date | rating | size
+    @Published var sortKey = "name"
 
     /// Recipes edited but not yet saved, keyed by photo path — keeps unsaved
     /// work alive when switching photos. Cleared when the folder reloads.
@@ -42,11 +44,29 @@ final class LibraryStore: ObservableObject {
     var lenses: [String] { Array(Set(photos.map(\.lens).filter { !$0.isEmpty })).sorted() }
 
     var filtered: [Photo] {
-        photos.filter {
+        let f = photos.filter {
             $0.rating >= minRating
                 && (labelFilter.isEmpty || $0.label == labelFilter)
                 && (cameraFilter.isEmpty || $0.camera == cameraFilter)
                 && (lensFilter.isEmpty || $0.lens == lensFilter)
+        }
+        switch sortKey {
+        case "date":   return f.sorted { $0.mtime < $1.mtime }
+        case "rating": return f.sorted { $0.rating > $1.rating }
+        case "size":   return f.sorted { $0.size > $1.size }
+        default:       return f.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    /// Single rating write path for the whole app — thumbnail hover-stars,
+    /// the editor's star row and digit keys all go through here so the
+    /// sidecar, the grid and the open editor can never disagree.
+    /// `r` is absolute (0-5); callers wanting toggle semantics compute it.
+    func setRating(path: String, _ r: Int) {
+        let nr = min(max(r, 0), 5)
+        _ = eng.setRating(path: path, nr)
+        if let i = photos.firstIndex(where: { $0.path == path }) {
+            photos[i].rating = nr
         }
     }
 

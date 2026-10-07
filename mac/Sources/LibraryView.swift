@@ -17,6 +17,7 @@ struct LibraryView: View {
                         FilterMenu(title: "Lens", options: store.lenses, sel: $store.lensFilter)
                     }
                     Spacer()
+                    SortMenu(sel: $store.sortKey)
                     Text("\(store.filtered.count)/\(store.photos.count)")
                         .font(.system(size: 10).monospacedDigit())
                         .foregroundStyle(Ara.text3)
@@ -51,7 +52,9 @@ struct LibraryView: View {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 148), spacing: 10)], spacing: 10) {
                                 ForEach(store.filtered) { photo in
                                     ThumbCell(photo: photo,
-                                              selected: store.selection?.path == photo.path)
+                                              selected: store.selection?.path == photo.path,
+                                              onRate: { store.setRating(path: photo.path,
+                                                                        (photo.rating == $0) ? 0 : $0) })
                                         .onTapGesture { store.selection = photo }
                                 }
                             }
@@ -150,6 +153,35 @@ struct FilterMenu: View {
     }
 }
 
+/// darktable sort dropdown for the grid order.
+struct SortMenu: View {
+    @Binding var sel: String
+    var body: some View {
+        Menu {
+            ForEach([("name", "Name"), ("date", "Date"), ("rating", "Rating"),
+                     ("size", "File Size")], id: \.0) { k, name in
+                Button { sel = k } label: {
+                    if sel == k { Label(name, systemImage: "checkmark") } else { Text(name) }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(["date": "Date", "rating": "Rating", "size": "Size"][sel] ?? "Name")
+                    .font(.system(size: 10))
+            }
+            .foregroundStyle(Ara.text3)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(Ara.border, lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Sort order")
+    }
+}
+
 /// Label-colour dots used as the library filter.
 struct LabelFilter: View {
     @Binding var label: String
@@ -178,6 +210,7 @@ struct LabelFilter: View {
 struct ThumbCell: View {
     let photo: Photo
     let selected: Bool
+    var onRate: ((Int) -> Void)? = nil
     @State private var image: CGImage?
     @State private var hovering = false
 
@@ -227,6 +260,30 @@ struct ThumbCell: View {
                                 .overlay(Circle().stroke(.black.opacity(0.5), lineWidth: 0.5))
                                 .padding(6)
                             Spacer()
+                        }
+                        Spacer()
+                    }
+                }
+
+                // darktable lighttable: inline star rating on hover
+                if hovering, let onRate {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            HStack(spacing: 2) {
+                                ForEach(1...5, id: \.self) { i in
+                                    Image(systemName: i <= photo.rating ? "star.fill" : "star")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(i <= photo.rating ? Ara.gold : .white.opacity(0.75))
+                                        .frame(width: 13, height: 16)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture { onRate(i) }
+                                }
+                            }
+                            .padding(.horizontal, 4).padding(.vertical, 2)
+                            .background(.black.opacity(0.55))
+                            .clipShape(Capsule())
+                            .padding(5)
                         }
                         Spacer()
                     }

@@ -25,11 +25,12 @@ enum CompareMode: String, CaseIterable, Identifiable {
 
 /// Inspector palettes, DaVinci color-page style: one at a time via the icon strip.
 enum Palette: String, CaseIterable, Identifiable {
-    case meters, light, wheels, curves, zones, qualifier, windows, mixer,
+    case quick, meters, light, wheels, curves, zones, qualifier, windows, mixer,
          retouch, detail, fx, xform, versions
     var id: String { rawValue }
     var icon: String {
         switch self {
+        case .quick: return "speedometer"
         case .meters: return "waveform.path.ecg"
         case .light: return "sun.max"
         case .wheels: return "circle.circle"
@@ -47,6 +48,7 @@ enum Palette: String, CaseIterable, Identifiable {
     }
     var title: String {
         switch self {
+        case .quick: return "Quick"
         case .meters: return "Meters"
         case .light: return "Light"
         case .wheels: return "Wheels"
@@ -60,6 +62,25 @@ enum Palette: String, CaseIterable, Identifiable {
         case .fx: return "Effects"
         case .xform: return "Transform"
         case .versions: return "Versions"
+        }
+    }
+    /// darktable contextual hint: one line shown under the palette title.
+    var hint: String {
+        switch self {
+        case .quick: return "Everyday controls in one place"
+        case .meters: return "Drag vertically on the parade to set exposure"
+        case .light: return "White balance, tonal range and colour"
+        case .wheels: return "Drag inside a wheel to tint — the slider sets the mean"
+        case .curves: return "Click to add a point, drag to move, double-click deletes"
+        case .zones: return "Enable Image mode, then scroll on the photo to move the band under the cursor"
+        case .qualifier: return "Key a colour range with the droppers, adjust inside it"
+        case .windows: return "Tap or drag on the photo to place local masks"
+        case .mixer: return "Channel mixing and monochrome conversion"
+        case .retouch: return "Tap the photo with a tool armed — Esc backs out"
+        case .detail: return "Sharpening, noise reduction and restoration"
+        case .fx: return "Clarity, vignette, grain and light effects"
+        case .xform: return "Rotation, keystone and crop"
+        case .versions: return "Named snapshots and the edit history stack"
         }
     }
 }
@@ -109,13 +130,30 @@ struct EditorView: View {
     @State private var lastEditTime = Date.distantPast
     @State private var applyingHistory = false
     // palettes
-    @State private var palette: Palette = .light
+    @State private var palette: Palette = .quick
     @State private var selWindow: UUID?
     // grade versions
     @State private var versions: [GradeVersion] = []
     @State private var baselineVersions: [GradeVersion] = []
     @State private var showVersionName = false
     @State private var versionName = ""
+    // cursor probe / status bar (RawTherapee-style readout)
+    @State private var probeText = ""
+    @State private var probeBuf: [UInt8] = []
+    @State private var probeW = 0
+    @State private var probeH = 0
+    @State private var lastHover: CGPoint = .zero
+    @State private var stageSize: CGSize = .zero
+    // darktable tone-equalizer image interaction: scroll on the photo to
+    // adjust the EV band under the cursor
+    @State private var zoneImgMode = false
+    @State private var zoneHover: Int? = nil
+    // scope-as-control drag state
+    @State private var scopeDragBase: Double? = nil
+    @State private var scopeTapTime = Date.distantPast
+    // collapsible chrome (darktable panel-edge arrows)
+    @State private var showInspector = true
+    @State private var showStrip = true
 
     /// letterboxed image rect inside the preview area (zoom/pan applied)
     private func imageRect(in size: CGSize) -> CGRect {
@@ -189,8 +227,10 @@ struct EditorView: View {
         HSplitView {
             stageColumn
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            inspector
-                .frame(minWidth: 300, idealWidth: 316, maxWidth: 380)
+            if showInspector {
+                inspector
+                    .frame(minWidth: 300, idealWidth: 316, maxWidth: 380)
+            }
         }
         .background(Ara.bg0)
         .background(shortcutLayer)
@@ -212,6 +252,15 @@ struct EditorView: View {
         }
         .onChange(of: cmp) { _, m in
             if m != .off { ensureBaseline() }
+        }
+        // Thumbnail hover-stars (and any other writer through
+        // store.setRating) keep the open editor's rating mirror in sync —
+        // otherwise a later save() would serialize the stale value back.
+        .onChange(of: store.photos) { _, ps in
+            if let p = ps.first(where: { $0.path == photo.path }), p.rating != rating {
+                rating = p.rating
+                loadedRating = p.rating
+            }
         }
         .alert("Save Version", isPresented: $showVersionName) {
             TextField("Name", text: $versionName)
@@ -294,6 +343,23 @@ struct EditorView: View {
                             toolBanner
                                 .position(x: rect.midX, y: rect.maxY - 20)
                         }
+                        // darktable tone-equalizer badge: hovering band + EV
+                        if zoneImgMode, let zi = zoneHover {
+                            Text(String(format: "%+d EV band   %+.2f", zi - 4, recipe.zones_ev[zi]))
+                                .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                                .foregroundStyle(Ara.text1)
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(Capsule().fill(.black.opacity(0.72))
+                                    .overlay(Capsule().stroke(Ara.accent.opacity(0.5), lineWidth: 0.5)))
+                                .position(x: min(lastHover.x + 78, geo.size.width - 90),
+                                          y: max(lastHover.y - 22, 14))
+                                .allowsHitTesting(false)
+                        }
+                        // RawTherapee navigator: minimap + draggable viewport
+                        if zoom > 1.01 {
+                            navigator(in: rect, stage: geo.size)
+                                .position(x: 12 + 75, y: 12 + 75 * rect.height / max(rect.width, 1) / 2)
+                        }
                         zoomControls
                             // pinned to the stage edge — the image rect grows
                             // past the viewport once zoomed in
@@ -302,8 +368,31 @@ struct EditorView: View {
                         ProgressView()
                             .tint(Ara.accent)
                     }
+                    // chrome toggles, darktable panel-edge arrows
+                    HStack(spacing: 4) {
+                        IconAction(icon: "rectangle.bottomhalf.filled", active: showStrip) {
+                            showStrip.toggle()
+                        }
+                        .help("Filmstrip")
+                        IconAction(icon: "sidebar.right", active: showInspector) {
+                            withAnimation(.easeInOut(duration: 0.15)) { showInspector.toggle() }
+                        }
+                        .help("Inspector")
+                    }
+                    .padding(.horizontal, 6).padding(.vertical, 4)
+                    .background(Capsule().fill(.black.opacity(0.6))
+                        .overlay(Capsule().stroke(Ara.hairline, lineWidth: 0.5)))
+                    .position(x: geo.size.width - 44, y: 18)
                 }
                 .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let loc): updateProbe(loc, in: geo.size)
+                    case .ended: stageHover = false; probeText = ""; zoneHover = nil
+                    }
+                }
+                .onAppear { stageSize = geo.size }
+                .onChange(of: geo.size) { _, s in stageSize = s }
                 .gesture(SpatialTapGesture().onEnded { v in
                     placeAt(v.location, in: geo.size)
                 })
@@ -326,13 +415,28 @@ struct EditorView: View {
                 }
                 .onHover { stageHover = $0 }
             }
-            filmstrip
+            if showStrip {
+                filmstrip
+            }
+            statusBar
         }
         .onAppear {
             keyMon.handler = { [self] ev in handleKey(ev) }
             keyMon.install()
             scrollMon.handler = { [self] ev in
                 guard stageHover else { return true }
+                // darktable tone equalizer: scroll over the photo adjusts the
+                // luminance band under the cursor instead of zooming
+                if zoneImgMode, let zi = zoneIndex(at: lastHover) {
+                    let d = Double(ev.scrollingDeltaY + ev.scrollingDeltaX)
+                    if d != 0 {
+                        var z = recipe.zones_ev
+                        z[zi] = (z[zi] + d * 0.03).clamped(to: -4...4)
+                        recipe.zones_ev = z
+                        zoneHover = zi
+                    }
+                    return false
+                }
                 let nz = (zoom * (1 + ev.scrollingDeltaY * 0.003)).clamped(to: 0.5...8)
                 if nz != zoom { zoom = nz; if zoom <= 1 { pan = .zero } }
                 return true
@@ -501,6 +605,107 @@ struct EditorView: View {
                 .overlay(Capsule().stroke(Ara.accent.opacity(0.5), lineWidth: 0.5)))
     }
 
+    /// Cursor probe: sample the small sRGB probe buffer under the pointer
+    /// and format an RT-style readout. Also feeds the zone-EQ badge.
+    private func updateProbe(_ loc: CGPoint, in size: CGSize) {
+        stageHover = true
+        lastHover = loc
+        let rect = imageRect(in: size)
+        guard rect.contains(loc), probeW > 0, !probeBuf.isEmpty else {
+            probeText = ""; zoneHover = nil; return
+        }
+        let nx = Double((loc.x - rect.minX) / rect.width)
+        let ny = Double((loc.y - rect.minY) / rect.height)
+        let px = min(max(Int(nx * Double(probeW)), 0), probeW - 1)
+        let py = min(max(Int(ny * Double(probeH)), 0), probeH - 1)
+        let o = (py * probeW + px) * 4
+        guard o + 2 < probeBuf.count else { return }
+        let r = Double(probeBuf[o]), g = Double(probeBuf[o + 1]), b = Double(probeBuf[o + 2])
+        let (hh, ss, vv) = rgbHsv((r / 255, g / 255, b / 255))
+        probeText = String(format: "%4d,%4d  ·  R%3d G%3d B%3d  ·  H%3.0f° S%2.0f%% V%2.0f%%",
+                           Int(nx * Double(image?.width ?? 0)), Int(ny * Double(image?.height ?? 0)),
+                           Int(r), Int(g), Int(b), hh * 360, ss * 100, vv * 100)
+        if zoneImgMode { zoneHover = zoneIndex(luma: 0.2126 * r + 0.7152 * g + 0.0722 * b) }
+    }
+
+    /// sRGB luma byte → tone-equalizer band index 0...8 (centres −4…+4 EV).
+    private func zoneIndex(luma l: Double) -> Int {
+        min(max(Int((log2(max(l / 255, 0.015)) + 4).rounded()), 0), 8)
+    }
+
+    private func zoneIndex(at loc: CGPoint) -> Int? {
+        guard let (nx, ny, _, _) = frameCoord(loc, in: stageSize),
+              nx >= 0, nx <= 1, ny >= 0, ny <= 1,
+              probeW > 0 else { return nil }
+        let px = min(max(Int(nx * Double(probeW)), 0), probeW - 1)
+        let py = min(max(Int(ny * Double(probeH)), 0), probeH - 1)
+        let o = (py * probeW + px) * 4
+        guard o + 2 < probeBuf.count else { return nil }
+        return zoneIndex(luma: 0.2126 * Double(probeBuf[o]) + 0.7152 * Double(probeBuf[o + 1])
+            + 0.0722 * Double(probeBuf[o + 2]))
+    }
+
+    /// RawTherapee navigator: mini preview + draggable viewport rectangle,
+    /// shown top-left whenever zoomed in.
+    private func navigator(in rect: CGRect, stage: CGSize) -> some View {
+        let nw: CGFloat = 150
+        let nh = nw * rect.height / max(rect.width, 1)
+        let fx0 = Double((0 - rect.minX) / rect.width).clamped(to: 0...1)
+        let fx1 = Double((stage.width - rect.minX) / rect.width).clamped(to: 0...1)
+        let fy0 = Double((0 - rect.minY) / rect.height).clamped(to: 0...1)
+        let fy1 = Double((stage.height - rect.minY) / rect.height).clamped(to: 0...1)
+        return ZStack(alignment: .topLeading) {
+            if let image {
+                Image(image, scale: 1, label: Text("navigator"))
+                    .resizable().frame(width: nw, height: nh).opacity(0.8)
+            }
+            Rectangle()
+                .fill(Color.white.opacity(0.07))
+                .overlay(Rectangle().stroke(Ara.accent, lineWidth: 1.2))
+                .frame(width: max(CGFloat(fx1 - fx0) * nw, 6),
+                       height: max(CGFloat(fy1 - fy0) * nh, 6))
+                .offset(x: CGFloat(fx0) * nw, y: CGFloat(fy0) * nh)
+        }
+        .frame(width: nw, height: nh)
+        .background(Ara.bg1.opacity(0.9))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Ara.border, lineWidth: 0.75))
+        .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+            // centre the viewport on the dragged point
+            let fx = Double(g.location.x / nw).clamped(to: 0...1)
+            let fy = Double(g.location.y / nh).clamped(to: 0...1)
+            pan = CGSize(
+                width: stage.width / 2 - CGFloat(fx) * rect.width - (stage.width - rect.width) / 2,
+                height: stage.height / 2 - CGFloat(fy) * rect.height - (stage.height - rect.height) / 2)
+        })
+    }
+
+    /// Bottom status strip (RawTherapee): probe readout / filename, render
+    /// spinner and zoom readout — always visible, no inspector needed.
+    private var statusBar: some View {
+        VStack(spacing: 0) {
+            Ara.hairline.frame(height: 1)
+            HStack(spacing: 10) {
+                Text(probeText.isEmpty ? photo.name : probeText)
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(probeText.isEmpty ? Ara.text3 : Ara.text2)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if rendering {
+                    ProgressView().controlSize(.mini).tint(Ara.accent)
+                        .frame(width: 10, height: 10)
+                }
+                Text(zoneImgMode ? "zone scroll" : String(format: "%.0f%%", zoom * 100))
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(zoneImgMode ? Ara.accent : Ara.text3)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Ara.bg1)
+        }
+    }
+
     private var filmstrip: some View {
         VStack(spacing: 0) {
             Ara.hairline.frame(height: 1)
@@ -542,10 +747,7 @@ struct EditorView: View {
                         .onChange(of: rating) { _, r in
                             guard r != loadedRating else { return }
                             loadedRating = r
-                            AraEngine.shared.setRating(path: photo.path, r)
-                            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
-                                store.photos[i].rating = r
-                            }
+                            store.setRating(path: photo.path, r)
                         }
                 }
                 HStack(spacing: 6) {
@@ -599,28 +801,33 @@ struct EditorView: View {
 
             paletteStrip
 
-            // palette header: title + per-palette reset (DaVinci palette reset)
-            HStack {
-                Text(palette.title.uppercased())
-                    .font(.system(size: 9.5, weight: .semibold)).tracking(1.2)
-                    .foregroundStyle(Ara.text2)
-                Spacer()
-                if paletteDirty(palette) {
-                    Button {
-                        resetPalette(palette)
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .foregroundStyle(Ara.accent)
+            // palette header: title + hint + per-palette reset
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(palette.title.uppercased())
+                        .font(.system(size: 9.5, weight: .semibold)).tracking(1.2)
+                        .foregroundStyle(Ara.text2)
+                    Spacer()
+                    if paletteDirty(palette) {
+                        Button {
+                            resetPalette(palette)
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .foregroundStyle(Ara.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reset this palette")
                     }
-                    .buttonStyle(.plain)
-                    .help("Reset this palette")
                 }
+                Text(palette.hint)
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(Ara.text3)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(Ara.bg1)
             .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
-
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     paletteContent
@@ -678,6 +885,7 @@ struct EditorView: View {
     @ViewBuilder
     private var paletteContent: some View {
         switch palette {
+        case .quick: quickPalette
         case .meters: metersPalette
         case .light: lightPalette
         case .wheels: wheelsPalette
@@ -694,6 +902,54 @@ struct EditorView: View {
         }
     }
 
+    /// darktable quick-access panel: the 20% of controls used for 80% of
+    /// edits, curated in one flat scroll — histogram, WB, tone, colour.
+    private var quickPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Histogram") {
+                if !hist.isEmpty {
+                    HistogramView(hist: hist).frame(height: 72)
+                } else {
+                    Rectangle().fill(Ara.bg3).frame(height: 72)
+                        .overlay(ProgressView().tint(Ara.text3))
+                }
+            }
+            Panel("White Balance", trailing: {
+                ToolChip(label: "Pick", icon: "eyedropper", active: retouchMode == "wbpick") {
+                    retouchMode = retouchMode == "wbpick" ? "off" : "wbpick"
+                }
+            }) {
+                SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
+                           (.manual, "Manual"), (.pick, "Pick")],
+                          selection: $recipe.wb_mode)
+                SliderRow("Temp", $recipe.temperature, -1...1, track: Ara.tempTrack)
+                SliderRow("Tint", $recipe.tint, -1...1, track: Ara.tintTrack)
+            }
+            Panel("Tone", trailing: {
+                ToolChip(label: "Auto", icon: "wand.and.stars") {
+                    recipe.wb_mode = .auto
+                    recipe.auto_exposure = true
+                    recipe.auto_contrast = true
+                }
+            }) {
+                SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
+                SliderRow("Contrast", $recipe.contrast, -1...1)
+                SliderRow("Highlights", $recipe.highlights, -1...1)
+                SliderRow("Shadows", $recipe.shadows, -1...1)
+                SliderRow("Whites", $recipe.whites, -1...1)
+                SliderRow("Blacks", $recipe.blacks, -1...1)
+            }
+            Panel("Colour") {
+                SliderRow("Saturation", $recipe.saturation, -1...1)
+                SliderRow("Vibrance", $recipe.vibrance, -1...1)
+                SliderRow("Clarity", $recipe.clarity, -1...1)
+            }
+            Panel("Geometry") {
+                SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
+            }
+        }
+    }
+
     private var metersPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Histogram") {
@@ -707,8 +963,39 @@ struct EditorView: View {
             Panel("Scopes") {
                 SegPicker([("parade", "Parade"), ("vector", "Vector"), ("cie", "CIE")],
                           selection: $scopeKind)
-                ScopesView(wave: wave, vec: vec, cie: cie, kind: scopeKind)
-                    .frame(height: 128)
+                ZStack {
+                    ScopesView(wave: wave, vec: vec, cie: cie, kind: scopeKind)
+                    // darktable: the waveform itself is a control — vertical
+                    // drag sets exposure, double-click resets it. The
+                    // minimumDistance:0 drag swallows onTapGesture, so the
+                    // double-click is detected manually like in TrackSlider.
+                    if scopeKind == "parade" {
+                        Color.white.opacity(0.001)
+                            .contentShape(Rectangle())
+                            .gesture(DragGesture(minimumDistance: 0)
+                                .onChanged { g in
+                                    if scopeDragBase == nil {
+                                        scopeDragBase = recipe.exposure
+                                        if g.time.timeIntervalSince(scopeTapTime) < 0.3 {
+                                            recipe.exposure = 0
+                                            scopeDragBase = 0
+                                            scopeTapTime = .distantPast
+                                            return
+                                        }
+                                        scopeTapTime = g.time
+                                    }
+                                    recipe.exposure = ((scopeDragBase ?? 0)
+                                        - Double(g.translation.height) * 0.015)
+                                        .clamped(to: -4...4)
+                                }
+                                .onEnded { _ in scopeDragBase = nil })
+                    }
+                }
+                .frame(height: 128)
+                Text(scopeKind == "parade"
+                     ? "Drag up/down on the parade = exposure · double-click resets"
+                     : "Switch to Parade for drag-to-expose")
+                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
             }
         }
     }
@@ -727,8 +1014,8 @@ struct EditorView: View {
                     SliderRow("Pick Area", $recipe.wb_pick_size, 0.002...0.2, reset: 0.025)
                         .help("Sampling half-width of the WB eyedropper as a fraction of the frame")
                 }
-                SliderRow("Temp", $recipe.temperature, -1...1)
-                SliderRow("Tint", $recipe.tint, -1...1)
+                SliderRow("Temp", $recipe.temperature, -1...1, track: Ara.tempTrack)
+                SliderRow("Tint", $recipe.tint, -1...1, track: Ara.tintTrack)
             }
             Panel("Tone", trailing: {
                 ToolChip(label: "Auto", icon: "wand.and.stars") {
@@ -792,11 +1079,11 @@ struct EditorView: View {
                 }
             }
             Panel("Split Tone") {
-                SliderRow("Shd Hue", $recipe.shadow_hue, 0...1, reset: 0.55)
+                SliderRow("Shd Hue", $recipe.shadow_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
                 SliderRow("Shd Sat", $recipe.shadow_sat, 0...1)
-                SliderRow("Mid Hue", $recipe.midtone_hue, 0...1, reset: 0.55)
+                SliderRow("Mid Hue", $recipe.midtone_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
                 SliderRow("Mid Sat", $recipe.midtone_sat, 0...1)
-                SliderRow("Hi Hue", $recipe.highlight_hue, 0...1, reset: 0.08)
+                SliderRow("Hi Hue", $recipe.highlight_hue, 0...1, reset: 0.08, track: Ara.hueTrack)
                 SliderRow("Hi Sat", $recipe.highlight_sat, 0...1)
             }
         }
@@ -809,7 +1096,8 @@ struct EditorView: View {
                            (4, "H·H"), (5, "H·S"), (6, "H·L"), (7, "L·S"), (8, "S·S")],
                           selection: $curveChan)
                 CurveEditor(points: curveBinding(curveChan),
-                            tint: curveTint(curveChan), hist: hist.count > 3 ? hist[3] : [])
+                            tint: curveTint(curveChan), hist: hist.count > 3 ? hist[3] : [],
+                            spectrum: curveChan >= 4 && curveChan <= 6)
                     .frame(height: 132)
                 HStack {
                     ToolChip(label: "Clear", icon: "xmark") {
@@ -826,13 +1114,21 @@ struct EditorView: View {
     private var zonesPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Tone Equalizer", trailing: {
-                ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
-                    recipe.zones_ev = [Double](repeating: 0, count: 9)
+                HStack(spacing: 4) {
+                    ToolChip(label: "Image", icon: "hand.draw", active: zoneImgMode) {
+                        zoneImgMode.toggle()
+                    }
+                    .help("Scroll on the photo to adjust the band under the cursor")
+                    ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
+                        recipe.zones_ev = [Double](repeating: 0, count: 9)
+                    }
                 }
             }) {
                 ZoneEQ(zones: $recipe.zones_ev)
-                Text("EV gain per luminance band (−4…+4 EV around mid grey)")
-                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                Text(zoneImgMode
+                     ? "Hover the photo and scroll — the EV badge marks the band under the cursor"
+                     : "EV gain per luminance band (−4…+4 EV around mid grey)")
+                    .font(.system(size: 8.5)).foregroundStyle(zoneImgMode ? Ara.accent : Ara.text3)
             }
             Panel("HDR Zones") {
                 ZoneRow("Dark", $recipe.z_dark)
@@ -921,7 +1217,7 @@ struct EditorView: View {
                     Text("ADJUST INSIDE KEY")
                         .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
                         .foregroundStyle(Ara.text3)
-                    SliderRow("Hue Δ", $recipe.qadj[0], -0.5...0.5)
+                    SliderRow("Hue Δ", $recipe.qadj[0], -0.5...0.5, track: Ara.hueTrack)
                     SliderRow("Sat Δ", $recipe.qadj[1], -1...1)
                     SliderRow("Lum Δ", $recipe.qadj[2], -1...1)
                     SliderRow("Temp Δ", $recipe.qadj[3], -1...1)
@@ -1057,7 +1353,7 @@ struct EditorView: View {
                 SliderRow("Grain", $recipe.grain, 0...1)
                 SliderRow("Glow", $recipe.glow, 0...1)
                 SliderRow("Flare", $recipe.flare[2], 0...1)
-                SliderRow("Fl Hue", $recipe.flare[3], 0...1)
+                SliderRow("Fl Hue", $recipe.flare[3], 0...1, track: Ara.hueTrack)
             }
         }
     }
@@ -1109,6 +1405,45 @@ struct EditorView: View {
                                onApply: { recipe = v.recipe },
                                onDelete: { versions.removeAll { $0.id == v.id } })
                 }
+            }
+            // darktable history stack: every undo step as a clickable row.
+            Panel("Edit History") {
+                if undoStack.isEmpty {
+                    Text("Edits appear here as you make them — click a step to jump back.")
+                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(Array(undoStack.enumerated().reversed()), id: \.offset) { i, _ in
+                    Button {
+                        jumpToHistory(i)
+                    } label: {
+                        HStack(spacing: 7) {
+                            Text(i == 0 ? "0" : "\(i)")
+                                .font(.system(size: 9).monospacedDigit())
+                                .foregroundStyle(Ara.text3)
+                                .frame(width: 14, alignment: .trailing)
+                            Text(i == 0 ? "Original" : "Edit \(i)")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(Ara.text2)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                // current state marker — always the active row
+                HStack(spacing: 7) {
+                    Text("\(undoStack.count)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(Ara.accent)
+                        .frame(width: 14, alignment: .trailing)
+                    Text("Current")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(Ara.text1)
+                    Spacer()
+                }
+                .padding(.horizontal, 8).padding(.vertical, 4)
             }
         }
     }
@@ -1374,6 +1709,15 @@ struct EditorView: View {
     private func paletteDirty(_ p: Palette) -> Bool {
         let d = Recipe()
         switch p {
+        case .quick:
+            return recipe.exposure != d.exposure || recipe.contrast != d.contrast
+                || recipe.highlights != d.highlights || recipe.shadows != d.shadows
+                || recipe.whites != d.whites || recipe.blacks != d.blacks
+                || recipe.temperature != d.temperature || recipe.tint != d.tint
+                || recipe.wb_mode != d.wb_mode || recipe.wb_pick != d.wb_pick
+                || recipe.saturation != d.saturation || recipe.vibrance != d.vibrance
+                || recipe.clarity != d.clarity || recipe.rotation_deg != d.rotation_deg
+                || recipe.auto_exposure || recipe.auto_contrast
         case .light:
             return recipe.exposure != d.exposure || recipe.contrast != d.contrast
                 || recipe.highlights != d.highlights || recipe.shadows != d.shadows
@@ -1401,6 +1745,7 @@ struct EditorView: View {
         case .zones:
             return recipe.z_dark != d.z_dark || recipe.z_shadow != d.z_shadow
                 || recipe.z_light != d.z_light || recipe.z_global != d.z_global
+                || recipe.zones_ev != d.zones_ev
         case .qualifier:
             return recipe.q_enabled || recipe.q_show
         case .windows:
@@ -1417,6 +1762,7 @@ struct EditorView: View {
                 || recipe.glow != 0 || recipe.flare[2] != 0
         case .xform:
             return recipe.rotation_deg != 0 || recipe.crop != d.crop
+                || recipe.key_v != 0 || recipe.key_h != 0
         case .meters, .versions:
             return false
         }
@@ -1426,6 +1772,15 @@ struct EditorView: View {
     private func resetPalette(_ p: Palette) {
         let d = Recipe()
         switch p {
+        case .quick:
+            recipe.exposure = d.exposure; recipe.contrast = d.contrast
+            recipe.highlights = d.highlights; recipe.shadows = d.shadows
+            recipe.whites = d.whites; recipe.blacks = d.blacks
+            recipe.temperature = d.temperature; recipe.tint = d.tint
+            recipe.wb_mode = d.wb_mode; recipe.wb_pick = d.wb_pick
+            recipe.saturation = d.saturation; recipe.vibrance = d.vibrance
+            recipe.clarity = d.clarity; recipe.rotation_deg = d.rotation_deg
+            recipe.auto_exposure = false; recipe.auto_contrast = false
         case .light:
             recipe.exposure = d.exposure; recipe.contrast = d.contrast
             recipe.highlights = d.highlights; recipe.shadows = d.shadows
@@ -1451,6 +1806,8 @@ struct EditorView: View {
         case .zones:
             recipe.z_dark = d.z_dark; recipe.z_shadow = d.z_shadow
             recipe.z_light = d.z_light; recipe.z_global = d.z_global
+            recipe.zones_ev = d.zones_ev
+            zoneImgMode = false
         case .qualifier:
             recipe.qh = d.qh; recipe.qs = d.qs; recipe.ql = d.ql; recipe.qadj = d.qadj
             recipe.q_invert = false; recipe.q_clean = d.q_clean; recipe.q_blur = 0
@@ -1471,6 +1828,7 @@ struct EditorView: View {
             recipe.glow = 0; recipe.flare = d.flare
         case .xform:
             recipe.rotation_deg = 0; recipe.crop = d.crop
+            recipe.key_v = 0; recipe.key_h = 0
         case .meters, .versions:
             break
         }
@@ -1492,10 +1850,7 @@ struct EditorView: View {
         rating = (rating == r) ? 0 : r
         if rating != loadedRating {
             loadedRating = rating
-            AraEngine.shared.setRating(path: photo.path, rating)
-            if let i = store.photos.firstIndex(where: { $0.path == photo.path }) {
-                store.photos[i].rating = rating
-            }
+            store.setRating(path: photo.path, rating)
         }
         status = "Rating \(rating)"
     }
@@ -1528,6 +1883,17 @@ struct EditorView: View {
         status = "Applied \(v.name)"
     }
 
+    /// darktable history jump: restore the recipe snapshot at undo index i.
+    private func jumpToHistory(_ i: Int) {
+        guard undoStack.indices.contains(i) else { return }
+        applyingHistory = true
+        let target = undoStack[i]
+        undoStack.removeSubrange(i...)
+        redoStack.removeAll()
+        recipe = target
+        status = i == 0 ? "Back to Original" : "Back to edit \(i)"
+    }
+
     private func copyRecipe() {
         guard let data = try? JSONEncoder().encode(recipe),
               let js = String(data: data, encoding: .utf8) else { return }
@@ -1545,6 +1911,26 @@ struct EditorView: View {
         }
         recipe = r
         status = "Recipe pasted"
+    }
+
+    /// Downsampled sRGB copy of the current render for the cursor probe
+    /// and the zone-EQ hover readout (160px wide, ~55KB).
+    private func makeProbe(_ img: CGImage) {
+        let pw = 160
+        let ph = max(1, Int(160.0 * Double(img.height) / Double(img.width)))
+        var buf = [UInt8](repeating: 0, count: pw * ph * 4)
+        buf.withUnsafeMutableBytes { ptr in
+            guard let ctx = CGContext(data: ptr.baseAddress, width: pw, height: ph,
+                                      bitsPerComponent: 8, bytesPerRow: pw * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return }
+            ctx.interpolationQuality = .medium
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: pw, height: ph))
+        }
+        probeBuf = buf
+        probeW = pw
+        probeH = ph
     }
 
     private func scheduleRender() {
@@ -1568,7 +1954,7 @@ struct EditorView: View {
             await MainActor.run {
                 // drop stale results — a newer render already started
                 guard gen == renderGen else { return }
-                if let img { image = img }
+                if let img { image = img; makeProbe(img) }
                 hist = (0..<4).map { ch in Array(bins[(ch * 256)..<(ch * 256 + 256)]) }
                 wave = wv
                 vec = vc
@@ -1877,7 +2263,7 @@ struct ZoneRow: View {
                 Text("hue")
                     .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
                     .frame(width: 52, alignment: .leading)
-                TrackSlider(value: $z[0], range: 0...1, height: 12)
+                TrackSlider(value: $z[0], range: 0...1, height: 12, track: Ara.hueTrack)
                 TrackSlider(value: $z[1], range: 0...1, height: 12)
                 TrackSlider(value: $z[3], range: -1...1, height: 12)
             }
@@ -1891,12 +2277,23 @@ struct CurveEditor: View {
     @Binding var points: [[Double]]
     var tint: Color = .white
     var hist: [UInt32] = []
+    /// darktable colour equalizer: rainbow spectrum along the input axis for
+    /// the hue-vs-* curves
+    var spectrum: Bool = false
 
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width, h = geo.size.height
             ZStack {
-                Rectangle().fill(Color(red: 0.05, green: 0.05, blue: 0.065))
+                if spectrum {
+                    LinearGradient(colors: [
+                        .red, .orange, .yellow, .green, .cyan, .blue,
+                        Color(hue: 0.83, saturation: 0.85, brightness: 0.9), .red,
+                    ], startPoint: .leading, endPoint: .trailing)
+                    .opacity(0.20)
+                } else {
+                    Rectangle().fill(Color(red: 0.05, green: 0.05, blue: 0.065))
+                }
                 Canvas { ctx, size in
                     // luma histogram backdrop
                     if hist.count == 256 {

@@ -16,6 +16,23 @@ enum Ara {
     static let accentSoft = accent.opacity(0.16)
     static let gold = Color(red: 1.0, green: 0.80, blue: 0.30)
     static let track = Color.white.opacity(0.13)
+
+    /// Gradient slider tracks (RawTherapee/DaVinci coloured rails): temp is
+    /// blue→neutral→amber, tint green→neutral→magenta, hue a rainbow strip.
+    static let tempTrack = LinearGradient(colors: [
+        Color(red: 0.30, green: 0.52, blue: 0.95),
+        Color(red: 0.80, green: 0.80, blue: 0.82),
+        Color(red: 0.98, green: 0.62, blue: 0.20),
+    ], startPoint: .leading, endPoint: .trailing)
+    static let tintTrack = LinearGradient(colors: [
+        Color(red: 0.25, green: 0.75, blue: 0.40),
+        Color(red: 0.80, green: 0.80, blue: 0.82),
+        Color(red: 0.90, green: 0.30, blue: 0.70),
+    ], startPoint: .leading, endPoint: .trailing)
+    static let hueTrack = LinearGradient(colors: [
+        .red, .orange, .yellow, .green, .cyan, .blue,
+        Color(hue: 0.83, saturation: 0.85, brightness: 0.95), .red,
+    ], startPoint: .leading, endPoint: .trailing)
 }
 
 /// Custom slider track: thin rail, amber fill drawn from the default (reset)
@@ -29,6 +46,8 @@ struct TrackSlider: View {
     var step: Double = 0.01
     var reset: Double? = nil
     var height: CGFloat = 16
+    /// optional gradient rail (temp/tint/hue); plain track colour when nil
+    var track: LinearGradient? = nil
 
     @State private var dragActive = false
     @State private var lastStart = Date.distantPast
@@ -48,10 +67,16 @@ struct TrackSlider: View {
             let kx = frac(value)
             let dx = frac(def)
             ZStack {
-                Capsule().fill(Ara.track)
-                    .frame(width: w, height: 4)
-                Capsule().fill(Ara.accent.opacity(0.85))
-                    .frame(width: max(abs(kx - dx), 2), height: 4)
+                if let track {
+                    Capsule().fill(track)
+                        .frame(width: w, height: 5)
+                        .overlay(Capsule().stroke(Ara.border, lineWidth: 0.5))
+                } else {
+                    Capsule().fill(Ara.track)
+                        .frame(width: w, height: 4)
+                }
+                Capsule().fill(track == nil ? Ara.accent.opacity(0.85) : Color.white.opacity(0.55))
+                    .frame(width: max(abs(kx - dx), 2), height: track == nil ? 4 : 5)
                     .offset(x: min(kx, dx))
                 Circle()
                     .fill(Color.white)
@@ -292,13 +317,16 @@ struct SliderRow: View {
     var step: Double = 0.01
     var reset: Double? = nil
 
+    var track: LinearGradient? = nil
+
     init(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>,
-         step: Double = 0.01, reset: Double? = nil) {
+         step: Double = 0.01, reset: Double? = nil, track: LinearGradient? = nil) {
         self.title = title
         self._value = value
         self.range = range
         self.step = step
         self.reset = reset
+        self.track = track
     }
 
     var body: some View {
@@ -308,7 +336,7 @@ struct SliderRow: View {
                 .foregroundStyle(Ara.text2)
                 .frame(width: 60, alignment: .leading)
                 .lineLimit(1)
-            TrackSlider(value: $value, range: range, step: step, reset: reset)
+            TrackSlider(value: $value, range: range, step: step, reset: reset, track: track)
             NumValue(value: $value, range: range, reset: reset, step: step)
         }
         .frame(height: 20)
