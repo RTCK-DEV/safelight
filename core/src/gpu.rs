@@ -164,9 +164,233 @@ struct Uni {
 @group(0) @binding(5) var<storage, read_write> outb: array<u32>;
 @group(0) @binding(6) var<storage, read> lut: array<f32>;
 @group(0) @binding(7) var<storage, read_write> stats: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read> tap_idx: array<vec2<u32>>;
+@group(0) @binding(9) var<storage, read> taps: array<vec2<i32>>;
 
 fn cfa_col(sx: u32, sy: u32) -> u32 {
     return cfa[(sy % u.g3.y) * u.g3.x + (sx % u.g3.x)];
+}
+
+// ---- color-difference demosaic (stride == 1, u.g4.w == 1) --------------
+// mirrors demosaic_plane() in develop.rs: pass 1 writes the interpolated
+// green plane into io_b.x (green_main), pass 2 reconstructs R/B from the
+// smooth C-G difference channels inside demosaic_cd() below.
+
+fn raw_v(sx_i: i32, sy_i: i32) -> f32 {
+    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let ci = min(cfa_col(sx, sy), 3u);
+    return (f32(rawbuf[sy * u.g0.x + sx]) - u.black[ci]) * u.norm[ci];
+}
+
+fn is_green(sx_i: i32, sy_i: i32) -> bool {
+    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let col = cfa_col(sx, sy);
+    return col == 1u || col == 3u;
+}
+
+fn is_color(sx_i: i32, sy_i: i32, ch: u32) -> bool {
+    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let col = cfa_col(sx, sy);
+    let cc = select(col, 1u, col == 3u);
+    return cc == ch;
+}
+
+// green plane value (io_b.x) at a sensor coordinate
+fn g_at(jx: i32, jy: i32) -> f32 {
+    let jvx = u32(clamp(jx - i32(u.g0.z), 0, i32(u.g1.x) - 1));
+    let jvy = u32(clamp(jy - i32(u.g0.w), 0, i32(u.g1.y) - 1));
+    return io_b[jvy * u.g1.x + jvx].x;
+}
+
+@compute @workgroup_size(256)
+fn green_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    if (i >= u.g1.x * u.g1.y) { return; }
+    let sx0 = i32(u.g0.z + (i % u.g1.x));
+    let sy0 = i32(u.g0.w + (i / u.g1.x));
+    var g = 0.0;
+    if (is_green(sx0, sy0)) {
+        g = raw_v(sx0, sy0);
+    } else {
+        // weighted median of neighbouring greens, weighted by how well
+        // the pixel's own measured channel agrees with the same-channel
+        // tap on each green tap's side — taps on our side of an edge win.
+        let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+        let col = cfa_col(u32(sx0), u32(sy0));
+        let own = raw_v(sx0, sy0);
+        let idx_g = tap_idx[ph * 3u + 1u];
+        let idx_c = tap_idx[ph * 3u + col];
+        var cand_d: array<f32, 24>;
+        var cand_w: array<f32, 24>;
+        var nc = 0u;
+        var wtot = 0.0;
+        for (var k = 0u; k < idx_g.y; k = k + 1u) {
+            if (nc >= 24u) { break; }
+            let t = taps[idx_g.x + k];
+            let jx = clamp(sx0 + t.x, 0, i32(u.g0.x) - 1);
+            let jy = clamp(sy0 + t.y, 0, i32(u.g0.y) - 1);
+            var best_dot = 0.0;
+            var best_val = 0.0;
+            let jlen = sqrt(f32(t.x * t.x + t.y * t.y));
+            for (var s = 0u; s < idx_c.y; s = s + 1u) {
+                let tc = taps[idx_c.x + s];
+                let dot = f32(tc.x * t.x + tc.y * t.y);
+                if (dot <= 0.0) { continue; }
+                let tlen = sqrt(f32(tc.x * tc.x + tc.y * tc.y));
+                let al = dot / (tlen * jlen);
+                if (al > best_dot) {
+                    best_dot = al;
+                    best_val = raw_v(sx0 + tc.x, sy0 + tc.y);
+                }
+            }
+            var w = 1.0 / (f32(t.x * t.x + t.y * t.y) + 0.5);
+            if (best_dot > 0.5) {
+                w = w / (abs(best_val - own) + 0.04);
+            }
+            cand_d[nc] = raw_v(jx, jy);
+            cand_w[nc] = w;
+            nc = nc + 1u;
+            wtot += w;
+        }
+        if (nc > 0u) {
+            for (var a = 1u; a < nc; a = a + 1u) {
+                let kd = cand_d[a];
+                let kw = cand_w[a];
+                var b = a;
+                while (b > 0u && cand_d[b - 1u] > kd) {
+                    cand_d[b] = cand_d[b - 1u];
+                    cand_w[b] = cand_w[b - 1u];
+                    b = b - 1u;
+                }
+                cand_d[b] = kd;
+                cand_w[b] = kw;
+            }
+            var acc = 0.0;
+            var dm = cand_d[nc - 1u];
+            for (var a = 0u; a < nc; a = a + 1u) {
+                acc += cand_w[a];
+                if (acc >= wtot * 0.5) { dm = cand_d[a]; break; }
+            }
+            g = dm;
+        }
+    }
+    io_b[i] = vec4<f32>(g, 0.0, 0.0, 0.0);
+}
+
+// pass 2: difference planes into io_b.yz (dR at .y, dB at .z)
+@compute @workgroup_size(256)
+fn diff_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    if (i >= u.g1.x * u.g1.y) { return; }
+    let sx0 = i32(u.g0.z + (i % u.g1.x));
+    let sy0 = i32(u.g0.w + (i / u.g1.x));
+    let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+    let col = cfa_col(u32(sx0), u32(sy0));
+    let cc = select(col, 1u, col == 3u);
+    let g = io_b[i].x;
+    var diffs = vec2<f32>(0.0);
+    for (var c = 0u; c < 2u; c = c + 1u) {
+        let ch = select(0u, 2u, c == 1u);
+        if (cc == ch) {
+            diffs[c] = raw_v(sx0, sy0) - g;
+        } else {
+            let idx = tap_idx[ph * 3u + ch];
+            // weighted median of same-channel C-G diffs, weighted by
+            // green similarity — taps on the same side of an edge have
+            // similar greens, so the median snaps to the right side
+            // instead of averaging across it.
+            var cand_d: array<f32, 24>;
+            var cand_w: array<f32, 24>;
+            var nc = 0u;
+            var wtot = 0.0;
+            for (var k = 0u; k < idx.y; k = k + 1u) {
+                if (nc >= 24u) { break; }
+                let t = taps[idx.x + k];
+                let jx = clamp(sx0 + t.x, 0, i32(u.g0.x) - 1);
+                let jy = clamp(sy0 + t.y, 0, i32(u.g0.y) - 1);
+                let dj = raw_v(jx, jy) - g_at(jx, jy);
+                let w = 1.0
+                    / (abs(g_at(jx, jy) - g) + 0.04)
+                    / (f32(t.x * t.x + t.y * t.y) + 0.5);
+                cand_d[nc] = dj;
+                cand_w[nc] = w;
+                nc = nc + 1u;
+                wtot += w;
+            }
+            if (nc == 0u) {
+                diffs[c] = 0.0;
+            } else {
+                // insertion sort by d (keep weights in step)
+                for (var a = 1u; a < nc; a = a + 1u) {
+                    let kd = cand_d[a];
+                    let kw = cand_w[a];
+                    var b = a;
+                    while (b > 0u && cand_d[b - 1u] > kd) {
+                        cand_d[b] = cand_d[b - 1u];
+                        cand_w[b] = cand_w[b - 1u];
+                        b = b - 1u;
+                    }
+                    cand_d[b] = kd;
+                    cand_w[b] = kw;
+                }
+                var acc = 0.0;
+                var dm = cand_d[nc - 1u];
+                for (var a = 0u; a < nc; a = a + 1u) {
+                    acc += cand_w[a];
+                    if (acc >= wtot * 0.5) { dm = cand_d[a]; break; }
+                }
+                diffs[c] = dm;
+            }
+        }
+    }
+    io_b[i] = vec4<f32>(g, diffs.x, diffs.y, 0.0);
+}
+
+// pass 3: reconstruct — G + 3x3 median of the difference plane
+// (zipper ticks are 1-px outliers in the smooth diff channel)
+fn demosaic_cd(i: u32) -> vec3<f32> {
+    let vx = i % u.g1.x;
+    let vy = i / u.g1.x;
+    let sx0 = i32(u.g0.z + vx);
+    let sy0 = i32(u.g0.w + vy);
+    let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+    let col = cfa_col(u32(sx0), u32(sy0));
+    let cc = select(col, 1u, col == 3u);
+    let g = io_b[i].x;
+    var px = vec3<f32>(0.0);
+    px.y = g;
+    for (var c = 0u; c < 2u; c = c + 1u) {
+        let ch = select(0u, 2u, c == 1u);
+        if (cc == ch) {
+            px[ch] = raw_v(sx0, sy0);
+        } else {
+            var nb: array<f32, 25>;
+            var n = 0u;
+            for (var oy = -2; oy <= 2; oy = oy + 1) {
+                for (var ox = -2; ox <= 2; ox = ox + 1) {
+                    let jx = u32(clamp(i32(vx) + ox, 0, i32(u.g1.x) - 1));
+                    let jy = u32(clamp(i32(vy) + oy, 0, i32(u.g1.y) - 1));
+                    nb[n] = io_b[jy * u.g1.x + jx][c + 1u];
+                    n = n + 1u;
+                }
+            }
+            // insertion sort (n == 9)
+            for (var a = 1u; a < n; a = a + 1u) {
+                let v = nb[a];
+                var b = a;
+                while (b > 0u && nb[b - 1u] > v) {
+                    nb[b] = nb[b - 1u];
+                    b = b - 1u;
+                }
+                nb[b] = v;
+            }
+            px[ch] = g + nb[n / 2u];
+        }
+    }
+    return px;
 }
 
 fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
@@ -255,7 +479,12 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
     let i = flat_index(gid, num);
     if (i >= u.g1.x * u.g1.y) { return; }
-    let cam = demosaic(i % u.g1.x, i / u.g1.x);
+    var cam: vec3<f32>;
+    if (u.g4.w == 1u) {
+        cam = demosaic_cd(i);
+    } else {
+        cam = demosaic(i % u.g1.x, i / u.g1.x);
+    }
     io_a[i] = vec4<f32>(wb_matrix(cam), 0.0);
 }
 
@@ -991,6 +1220,8 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     demosaic: Pipe,
+    green: Pipe,
+    diff: Pipe,
     stats: Pipe,
     heal: Pipe,
     nrl: Pipe,
@@ -1043,6 +1274,7 @@ impl Gpu {
         limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
         limits.max_buffer_size = al.max_buffer_size;
         limits.max_compute_invocations_per_workgroup = al.max_compute_invocations_per_workgroup;
+        limits.max_storage_buffers_per_shader_stage = al.max_storage_buffers_per_shader_stage;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("araware"),
             required_limits: limits,
@@ -1056,7 +1288,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..8)
+                entries: &(0..10)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -1092,6 +1324,8 @@ impl Gpu {
         };
         Ok(Gpu {
             demosaic: mk("demosaic_main"),
+            green: mk("green_main"),
+            diff: mk("diff_main"),
             stats: mk("stats_main"),
             heal: mk("heal_main"),
             nrl: mk("nrl_main"),
@@ -1135,6 +1369,20 @@ impl Gpu {
         let storage_in = U::STORAGE | U::COPY_DST;
         let raw_b = mk_buf("raw", bytemuck::cast_slice(&raw32), storage_in);
         let cfa_b = mk_buf("cfa", bytemuck::cast_slice(&cfa32), storage_in);
+        // color-difference demosaic tap tables (stride == 1 only)
+        let dt = crate::develop::build_demosaic_taps(&m.cfa);
+        let idx32: Vec<u32> = dt
+            .idx
+            .iter()
+            .flat_map(|&(o, c)| [o, c])
+            .collect();
+        let tap32: Vec<i32> = dt
+            .taps
+            .iter()
+            .flat_map(|&(x, y)| [x, y])
+            .collect();
+        let idx_b = mk_buf("tap_idx", bytemuck::cast_slice(&idx32), storage_in);
+        let tap_b = mk_buf("taps", bytemuck::cast_slice(&tap32), storage_in);
         let io_a = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("io_a"),
             size: n_px * 16,
@@ -1221,7 +1469,7 @@ impl Gpu {
             g1: [vw, vh, stride, m.info.flip as u32],
             g2: [vw, vh, dw, dh],
             g3: [m.cfa.w as u32, m.cfa.h as u32, samp_step, fw],
-            g4: [fh, m.w as u32, m.h as u32, 0],
+            g4: [fh, m.w as u32, m.h as u32, if stride == 1 { 1 } else { 0 }],
             lgg0: [p.lift[0], p.lift[1], p.lift[2], 0.0],
             lgg1: [p.gamma[0], p.gamma[1], p.gamma[2], 0.0],
             lgg2: [p.gain[0], p.gain[1], p.gain[2], 0.0],
@@ -1320,7 +1568,7 @@ impl Gpu {
         };
 
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7]
+            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
                 .iter()
                 .map(|&i| wgpu::BindGroupEntry {
                     binding: i,
@@ -1332,7 +1580,9 @@ impl Gpu {
                         4 => io_b.as_entire_binding(),
                         5 => out_b.as_entire_binding(),
                         6 => lut_b.as_entire_binding(),
-                        _ => stats_b.as_entire_binding(),
+                        7 => stats_b.as_entire_binding(),
+                        8 => idx_b.as_entire_binding(),
+                        _ => tap_b.as_entire_binding(),
                     },
                 })
                 .collect();
@@ -1448,6 +1698,10 @@ impl Gpu {
             .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p, 0)));
 
         let mut enc = dev.create_command_encoder(&Default::default());
+        if stride == 1 {
+            run(&mut enc, &self.green, n_px);
+            run(&mut enc, &self.diff, n_px);
+        }
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.
         if p.n_spots > 0 || p.n_clones > 0 {

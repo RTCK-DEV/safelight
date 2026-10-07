@@ -2,7 +2,7 @@
 //! Stages: normalize -> demosaic -> WB -> camera->sRGB matrix ->
 //!         tone/color adjustments -> sRGB gamma -> orient.
 //! The same math is mirrored by the wgpu compute pipeline in gpu.rs.
-use crate::decode::{Decoded, Mosaic};
+use crate::decode::{CfaPattern, Decoded, Mosaic};
 use crate::recipe::{Recipe, WbMode};
 
 #[derive(Debug, Clone)]
@@ -1072,6 +1072,275 @@ pub fn qual_mask(x: [f32; 3], p: &Params) -> f32 {
     mask
 }
 
+// ---- color-difference demosaic (full res, stride == 1) ------------------
+// G plane first: at non-green sites interpolate G from mirrored green tap
+// pairs weighted by inverse gradient (edge-aware, MHC-style), falling back
+// to inverse-distance. R/B then come from the smooth difference channels
+// (R-G, B-G) interpolated over same-color taps — the assumption AHD/RCD
+// share, applied generically to Bayer and X-Trans CFAs via tap tables.
+
+/// per-CFA-phase tap tables (phase = (y%ph)*pw + x%pw); channel index
+/// 0=R, 1=G (cells 1|3), 2=B. Shared by the CPU path and the GPU upload.
+pub struct DemosaicTaps {
+    /// (offset, count) into `taps`, indexed phase*3 + channel
+    pub idx: Vec<(u32, u32)>,
+    /// (dx, dy) sensor offsets
+    pub taps: Vec<(i32, i32)>,
+}
+
+pub fn build_demosaic_taps(cfa: &CfaPattern) -> DemosaicTaps {
+    let (pw, ph) = (cfa.w, cfa.h);
+    let mut idx = vec![(0u32, 0u32); pw * ph * 3];
+    let mut taps: Vec<(i32, i32)> = Vec::new();
+    for py in 0..ph {
+        for px in 0..pw {
+            let phase = py * pw + px;
+            for ch in 0..3usize {
+                let off = taps.len() as u32;
+                // 5x5 (Chebyshev 2, corners dropped) covers every Bayer case
+                // and most X-Trans; widen only if a phase finds nothing.
+                let mut rad = 2i32;
+                loop {
+                    let r2 = (rad * rad + 1) as f32;
+                    let mut found = false;
+                    for dy in -rad..=rad {
+                        for dx in -rad..=rad {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            if ((dx * dx + dy * dy) as f32) > r2 {
+                                continue;
+                            }
+                            let cell = cfa.cells
+                                [(py as i32 + dy).rem_euclid(ph as i32) as usize * pw
+                                    + (px as i32 + dx).rem_euclid(pw as i32) as usize];
+                            let cc = if cell == 3 { 1usize } else { cell as usize };
+                            if cc == ch {
+                                taps.push((dx, dy));
+                                found = true;
+                            }
+                        }
+                    }
+                    if found || rad >= 4 {
+                        break;
+                    }
+                    rad += 1;
+                }
+                idx[phase * 3 + ch] = (off, taps.len() as u32 - off);
+            }
+        }
+    }
+    DemosaicTaps { idx, taps }
+}
+
+/// full-res demosaic → camera-space linear RGB plane (m.w × m.h)
+fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32; 3]> {
+    let (vw, vh) = (m.w, m.h);
+    let (rw, rh) = (m.raw_w as i32, m.raw_h as i32);
+    let (pw, ph) = (m.cfa.w, m.cfa.h);
+    let nv = |sx: i32, sy: i32| -> f32 {
+        let cx = sx.clamp(0, rw - 1) as usize;
+        let cy = sy.clamp(0, rh - 1) as usize;
+        let col = m.cfa.cells[(cy % ph) * pw + (cx % pw)] as usize;
+        let ci = col.min(3);
+        (m.data[cy * m.raw_w + cx] as f32 - m.black[ci]) * norm[ci]
+    };
+    let is_color = |sx: i32, sy: i32, ch: usize| -> bool {
+        let cy = sy.clamp(0, rh - 1) as usize;
+        let cx = sx.clamp(0, rw - 1) as usize;
+        let col = m.cfa.cells[(cy % ph) * pw + (cx % pw)];
+        let cc = if col == 3 { 1usize } else { col as usize };
+        cc == ch
+    };
+    let is_green = |sx: i32, sy: i32| is_color(sx, sy, 1);
+    let phase_at = |sx: usize, sy: usize| (sy % ph) * pw + (sx % pw);
+    // g plane value at a sensor coordinate (clamped into the visible area)
+    let g_at = |g: &[f32], jx: i32, jy: i32| -> f32 {
+        let jvx = (jx as usize).clamp(m.left, m.left + vw - 1) - m.left;
+        let jvy = (jy as usize).clamp(m.top, m.top + vh - 1) - m.top;
+        g[jvy * vw + jvx]
+    };
+
+    // pass 1: green plane
+    let mut g = vec![0.0f32; vw * vh];
+    for vy in 0..vh {
+        let sy0 = m.top + vy;
+        for vx in 0..vw {
+            let sx0 = m.left + vx;
+            g[vy * vw + vx] = if is_green(sx0 as i32, sy0 as i32) {
+                nv(sx0 as i32, sy0 as i32)
+            } else {
+                // weighted median of neighbouring greens, weighted by
+                // how well the pixel's OWN measured channel agrees with
+                // the same-channel tap on each green tap's side — taps
+                // on our side of an edge win (no straddled means, which
+                // are what made zipper ticks).
+                let phase = phase_at(sx0, sy0);
+                let col = m.cfa.cells[phase] as usize;
+                let own = nv(sx0 as i32, sy0 as i32);
+                let (off_g, cnt_g) = taps.idx[phase * 3 + 1];
+                let (off_c, cnt_c) = taps.idx[phase * 3 + col];
+                let mut cand: [(f32, f32); 24] = [(0.0, 0.0); 24];
+                let mut nc = 0usize;
+                let mut wtot = 0.0f32;
+                for k in off_g..off_g + cnt_g {
+                    if nc >= cand.len() {
+                        break;
+                    }
+                    let (dx, dy) = taps.taps[k as usize];
+                    let jx = (sx0 as i32 + dx).clamp(0, rw - 1);
+                    let jy = (sy0 as i32 + dy).clamp(0, rh - 1);
+                    // same-channel tap most aligned with direction j
+                    let mut best_dot = 0.0f32;
+                    let mut best_val = 0.0f32;
+                    let jlen = ((dx * dx + dy * dy) as f32).sqrt();
+                    for t in off_c..off_c + cnt_c {
+                        let (tx, ty) = taps.taps[t as usize];
+                        let dot = (tx * dx + ty * dy) as f32;
+                        if dot <= 0.0 {
+                            continue;
+                        }
+                        let tlen = ((tx * tx + ty * ty) as f32).sqrt();
+                        let al = dot / (tlen * jlen);
+                        if al > best_dot {
+                            best_dot = al;
+                            best_val = nv(sx0 as i32 + tx, sy0 as i32 + ty);
+                        }
+                    }
+                    let mut w = 1.0 / ((dx * dx + dy * dy) as f32 + 0.5);
+                    if best_dot > 0.5 {
+                        w /= (best_val - own).abs() + 0.04;
+                    }
+                    cand[nc] = (nv(jx, jy), w);
+                    nc += 1;
+                    wtot += w;
+                }
+                if nc == 0 {
+                    0.0
+                } else {
+                    let c = &mut cand[..nc];
+                    c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut acc = 0.0f32;
+                    let mut dm = c[nc - 1].0;
+                    for &(d, w) in c.iter() {
+                        acc += w;
+                        if acc >= wtot * 0.5 {
+                            dm = d;
+                            break;
+                        }
+                    }
+                    dm
+                }
+            };
+        }
+    }
+
+    // pass 2: difference planes dR = R-G, dB = B-G at every pixel
+    // (raw minus G at same-color sites, directional interpolation else)
+    let mut dr = vec![0.0f32; vw * vh];
+    let mut db = vec![0.0f32; vw * vh];
+    for vy in 0..vh {
+        let sy0 = m.top + vy;
+        for vx in 0..vw {
+            let sx0 = m.left + vx;
+            let phase = phase_at(sx0, sy0);
+            let col = m.cfa.cells[phase];
+            let cc = if col == 3 { 1usize } else { col as usize };
+            let gv = g[vy * vw + vx];
+            let dpl = [&mut dr[..], &mut db[..]];
+            for (ci, ch) in [0usize, 2usize].iter().enumerate() {
+                let ch = *ch;
+                dpl[ci][vy * vw + vx] = if cc == ch {
+                    nv(sx0 as i32, sy0 as i32) - gv
+                } else {
+                    let (off, cnt) = taps.idx[phase * 3 + ch];
+                    // weighted median of same-channel C-G diffs, weighted
+                    // by green similarity — taps on the same side of an
+                    // edge as us have similar greens, so the median snaps
+                    // to the correct side instead of averaging across it
+                    // (kills zipper ticks on saturated edges).
+                    let mut cand: [(f32, f32); 24] = [(0.0, 0.0); 24];
+                    let mut nc = 0usize;
+                    let mut wtot = 0.0f32;
+                    for k in off..off + cnt {
+                        let (dx, dy) = taps.taps[k as usize];
+                        let jx = (sx0 as i32 + dx).clamp(0, rw - 1);
+                        let jy = (sy0 as i32 + dy).clamp(0, rh - 1);
+                        let dj = nv(jx, jy) - g_at(&g, jx, jy);
+                        let w = 1.0
+                            / ((g_at(&g, jx, jy) - gv).abs() + 0.04)
+                            / ((dx * dx + dy * dy) as f32 + 0.5);
+                        if nc < cand.len() {
+                            cand[nc] = (dj, w);
+                            nc += 1;
+                            wtot += w;
+                        }
+                    }
+                    if nc == 0 {
+                        0.0
+                    } else {
+                        // weighted median: smallest d whose cumulative
+                        // weight (sorted by d) reaches half the total
+                        let n = nc;
+                        let c = &mut cand[..n];
+                        c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        let mut acc = 0.0f32;
+                        let mut dm = c[n - 1].0;
+                        for &(d, w) in c.iter() {
+                            acc += w;
+                            if acc >= wtot * 0.5 {
+                                dm = d;
+                                break;
+                            }
+                        }
+                        dm
+                    }
+                };
+            }
+        }
+    }
+
+    // pass 3: reconstruct — G + 5x5 median of the difference plane.
+    // isolated zipper ticks are 1-px outliers in the (smooth) diff
+    // channel; the median kills them while real colour detail — which
+    // is coherent across several pixels — survives.
+    let mut out = vec![[0.0f32; 3]; vw * vh];
+    for vy in 0..vh {
+        let sy0 = m.top + vy;
+        for vx in 0..vw {
+            let sx0 = m.left + vx;
+            let phase = phase_at(sx0, sy0);
+            let col = m.cfa.cells[phase];
+            let cc = if col == 3 { 1usize } else { col as usize };
+            let gv = g[vy * vw + vx];
+            let mut px = [0.0f32; 3];
+            px[1] = gv;
+            for (ci, ch) in [0usize, 2usize].iter().enumerate() {
+                let ch = *ch;
+                let dp = if ci == 0 { &dr } else { &db };
+                px[ch] = if cc == ch {
+                    nv(sx0 as i32, sy0 as i32)
+                } else {
+                    let mut nb = [0.0f32; 25];
+                    let mut n = 0usize;
+                    for oy in -2i32..=2 {
+                        for ox in -2i32..=2 {
+                            let jx = (vx as i32 + ox).clamp(0, vw as i32 - 1) as usize;
+                            let jy = (vy as i32 + oy).clamp(0, vh as i32 - 1) as usize;
+                            nb[n] = dp[jy * vw + jx];
+                            n += 1;
+                        }
+                    }
+                    nb[..n].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    gv + nb[n / 2]
+                };
+            }
+            out[vy * vw + vx] = px;
+        }
+    }
+    out
+}
+
 /// generic same-colour-mean demosaic (works for bayer & xtrans).
 /// Each virtual pixel covers a `stride`x`stride` block of sensor pixels at
 /// (left + vx*stride, top + vy*stride). The CFA phase is computed on raw
@@ -1217,10 +1486,22 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
     };
     let p = build_params(m, r, stats.as_ref());
 
+    // full-res (stride 1) gets the color-difference demosaic — the real
+    // per-pixel interpolation; stride>1 previews keep the block mean,
+    // which is the correct downsample anyway
+    let plane = if stride == 1 {
+        Some(demosaic_plane(m, &norm, &build_demosaic_taps(&m.cfa)))
+    } else {
+        None
+    };
+
     let mut lin = vec![[0.0f32; 3]; vw * vh];
     for vy in 0..vh {
         for vx in 0..vw {
-            let cam = demosaic_pixel(m, vx, vy, stride, &norm);
+            let cam = match &plane {
+                Some(pl) => pl[vy * vw + vx],
+                None => demosaic_pixel(m, vx, vy, stride, &norm),
+            };
             // WB in camera space, clip at sensor white -> neutral highlights
             let cw = [
                 (cam[0] * p.wb[0]).clamp(0.0, 1.0),
