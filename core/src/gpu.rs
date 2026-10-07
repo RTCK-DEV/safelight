@@ -1570,7 +1570,12 @@ impl Gpu {
         let mut stride = 1u32;
         if max_px > 0 {
             let ratio = (m.w.max(m.h) as f32 / max_px as f32).max(1.0);
-            stride = ((ratio / period as f32).floor() as u32).max(1) * period;
+            // ratio < period: real (chroma-diff) demosaic — see develop.rs
+            stride = if ratio < period as f32 {
+                1
+            } else {
+                ((ratio / period as f32).floor() as u32).max(1) * period
+            };
         }
         let vw = (m.w as u32 / stride).max(1);
         let vh = (m.h as u32 / stride).max(1);
