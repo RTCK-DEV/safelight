@@ -10,6 +10,12 @@ struct LibraryView: View {
                 HStack(spacing: 10) {
                     RatingFilter(rating: $store.minRating)
                     LabelFilter(label: $store.labelFilter)
+                    if !store.cameras.isEmpty {
+                        FilterMenu(title: "Camera", options: store.cameras, sel: $store.cameraFilter)
+                    }
+                    if !store.lenses.isEmpty {
+                        FilterMenu(title: "Lens", options: store.lenses, sel: $store.lensFilter)
+                    }
                     Spacer()
                     Text("\(store.filtered.count)/\(store.photos.count)")
                         .font(.system(size: 10).monospacedDigit())
@@ -107,6 +113,40 @@ struct RatingFilter: View {
             }
             if rating > 0 { Text("+").font(.system(size: 9)).foregroundStyle(Ara.text3) }
         }
+    }
+}
+
+/// Dropdown text filter for camera/lens metadata.
+struct FilterMenu: View {
+    let title: String
+    let options: [String]
+    @Binding var sel: String
+
+    var body: some View {
+        Menu {
+            Button("All") { sel = "" }
+            Divider()
+            ForEach(options, id: \.self) { o in
+                Button(o) { sel = (sel == o) ? "" : o }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(sel.isEmpty ? title : sel)
+                    .font(.system(size: 10, weight: sel.isEmpty ? .regular : .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+            }
+            .foregroundStyle(sel.isEmpty ? Ara.text3 : Ara.accent)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(sel.isEmpty ? Color.clear : Ara.accent.opacity(0.12))
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(sel.isEmpty ? Ara.border : Ara.accent.opacity(0.6), lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
     }
 }
 

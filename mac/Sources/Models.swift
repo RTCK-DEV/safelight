@@ -11,6 +11,28 @@ struct Photo: Identifiable, Codable, Hashable {
     var label: String
     let pair: String?
     let has_sidecar: Bool
+    /// "make model" + lens from the file header/EXIF ("" when unknown)
+    let camera: String
+    let lens: String
+
+    enum CodingKeys: String, CodingKey {
+        case path, name, kind, size, mtime, rating, label, pair, has_sidecar, camera, lens
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        name = try c.decode(String.self, forKey: .name)
+        kind = try c.decode(String.self, forKey: .kind)
+        size = try c.decode(Int64.self, forKey: .size)
+        mtime = try c.decode(Int64.self, forKey: .mtime)
+        rating = try c.decode(Int.self, forKey: .rating)
+        label = try c.decode(String.self, forKey: .label)
+        pair = try? c.decode(String.self, forKey: .pair)
+        has_sidecar = (try? c.decode(Bool.self, forKey: .has_sidecar)) ?? false
+        camera = (try? c.decode(String.self, forKey: .camera)) ?? ""
+        lens = (try? c.decode(String.self, forKey: .lens)) ?? ""
+    }
 }
 
 enum WbMode: String, Codable, CaseIterable {
@@ -130,6 +152,16 @@ struct Recipe: Codable, Equatable {
     var deband: Double = 0
     var glow: Double = 0
     var flare: [Double] = [0, 0, 0, 0]  // cx, cy, strength, hue
+    // tone equalizer: 9 log2-luma zones centered at -4..+4 EV
+    var zones_ev: [Double] = [Double](repeating: 0, count: 9)
+    // WB eyedropper half-width as a fraction of the frame (0.002..0.2)
+    var wb_pick_size: Double = 0.025
+    // imported .cube 3D LUT ("" = none) + blend amount
+    var lut_file: String = ""
+    var lut_amount: Double = 1
+    // keystone: vertical/horizontal trapezoid warp -0.4..0.4
+    var key_v: Double = 0
+    var key_h: Double = 0
 
 }
 
@@ -153,6 +185,7 @@ extension Recipe {
         case pivot, highlight_rolloff, shadow_rolloff
         case mixer, mono, clones
         case beauty, noise_chroma, ca_fix, deband, glow, flare
+        case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
     }
 
     init(from decoder: Decoder) throws {
@@ -227,6 +260,14 @@ extension Recipe {
         deband = opt(.deband, Double.self) ?? 0
         glow = opt(.glow, Double.self) ?? 0
         flare = opt(.flare, [Double].self) ?? [0, 0, 0, 0]
+        var z = opt(.zones_ev, [Double].self) ?? [Double](repeating: 0, count: 9)
+        if z.count != 9 { z = [Double](repeating: 0, count: 9) }
+        zones_ev = z
+        wb_pick_size = opt(.wb_pick_size, Double.self) ?? 0.025
+        lut_file = opt(.lut_file, String.self) ?? ""
+        lut_amount = opt(.lut_amount, Double.self) ?? 1
+        key_v = opt(.key_v, Double.self) ?? 0
+        key_h = opt(.key_h, Double.self) ?? 0
         q_enabled = qh[1] > 0
     }
 }

@@ -92,6 +92,11 @@ struct Uni {
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
     qf2: [f32; 4],
+    /// tone equalizer zones: ze0 = EV for zones 0..3, ze1 = 4..7,
+    /// ze2 = [zone 8, has_zones, key_v, key_h]
+    ze0: [f32; 4],
+    ze1: [f32; 4],
+    ze2: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -143,6 +148,9 @@ struct Uni {
     wins: array<vec4<f32>, 16>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
+    ze0: vec4<f32>,
+    ze1: vec4<f32>,
+    ze2: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -492,11 +500,66 @@ fn srgb_encode(v: f32) -> f32 {
     return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
+fn srgb_decode(v: f32) -> f32 {
+    let c = clamp(v, 0.0, 1.0);
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+// imported 3D LUT lives in `lut` past the curve region:
+// [2304]=size (0=off) [2305]=amount [2306..9]=domain_min [2309..12]=domain_scale
+// data from 2312, R fastest
+fn l3at(n: u32, x: u32, y: u32, z: u32) -> vec3<f32> {
+    let o = 2312u + ((z * n + y) * n + x) * 3u;
+    return vec3<f32>(lut[o], lut[o + 1u], lut[o + 2u]);
+}
+
+fn lut3d_apply(x: vec3<f32>) -> vec3<f32> {
+    let n = u32(lut[2304u]);
+    if (n < 2u) { return x; }
+    let amt = lut[2305u];
+    let enc = vec3<f32>(
+        srgb_encode(clamp(x.x, 0.0, 1.0)),
+        srgb_encode(clamp(x.y, 0.0, 1.0)),
+        srgb_encode(clamp(x.z, 0.0, 1.0)));
+    let dmin = vec3<f32>(lut[2306u], lut[2307u], lut[2308u]);
+    let dscl = vec3<f32>(lut[2309u], lut[2310u], lut[2311u]);
+    let f = clamp((enc - dmin) * dscl, vec3<f32>(0.0), vec3<f32>(1.0)) * f32(n - 1u);
+    let i0 = vec3<u32>(floor(f));
+    let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(n - 1u));
+    let t = f - vec3<f32>(i0);
+    let c000 = l3at(n, i0.x, i0.y, i0.z);
+    let c100 = l3at(n, i1.x, i0.y, i0.z);
+    let c010 = l3at(n, i0.x, i1.y, i0.z);
+    let c110 = l3at(n, i1.x, i1.y, i0.z);
+    let c001 = l3at(n, i0.x, i0.y, i1.z);
+    let c101 = l3at(n, i1.x, i0.y, i1.z);
+    let c011 = l3at(n, i0.x, i1.y, i1.z);
+    let c111 = l3at(n, i1.x, i1.y, i1.z);
+    let v0 = mix(mix(c000, c100, t.x), mix(c010, c110, t.x), t.y);
+    let v1 = mix(mix(c001, c101, t.x), mix(c011, c111, t.x), t.y);
+    let v = mix(v0, v1, t.z);
+    let bl = mix(enc, v, vec3<f32>(amt));
+    return vec3<f32>(srgb_decode(bl.x), srgb_decode(bl.y), srgb_decode(bl.z));
+}
+
 fn adjust(px: vec3<f32>) -> vec3<f32> {
     var x = px * u.a1.x;
     // auto-contrast percentile remap
     if (u.misc.y - u.misc.x < 0.999 || u.misc.x > 0.001) {
         x = (x - vec3<f32>(u.misc.x)) / max(u.misc.y - u.misc.x, 0.02);
+    }
+    // tone equalizer: per-zone EV (9 log2-luma zones, centers -4..+4)
+    if (u.ze2.y > 0.5) {
+        let zz = array<f32, 9>(
+            u.ze0.x, u.ze0.y, u.ze0.z, u.ze0.w,
+            u.ze1.x, u.ze1.y, u.ze1.z, u.ze1.w, u.ze2.x);
+        let e = log2(max(luma(x), 1e-6));
+        let t = clamp(e + 4.0, 0.0, 8.0);
+        let zi = min(u32(t), 7u);
+        x = x * pow(2.0, zz[zi] * (1.0 - fract(t)) + zz[zi + 1u] * fract(t));
     }
     // lift/gamma/gain
     x = u.lgg2.xyz * pow(max(x + u.lgg0.xyz, vec3<f32>(0.0)), 1.0 / u.lgg1.xyz);
@@ -644,6 +707,8 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
             x = mix(x, xq, mask);
         }
     }
+    // imported .cube LUT (display-referred, last colour op)
+    x = lut3d_apply(x);
     return x;
 }
 
@@ -691,6 +756,11 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     // undo straighten rotation about crop centre
     let cx = u.crop.x + u.crop.z * 0.5 - 0.5;
     let cy = u.crop.y + u.crop.w * 0.5 - 0.5;
+    // keystone: trapezoid warp about the crop centre
+    if (u.ze2.z != 0.0 || u.ze2.w != 0.0) {
+        fx = cx + (fx - cx) * (1.0 + u.ze2.z * (ny * 2.0 - 1.0));
+        fy = cy + (fy - cy) * (1.0 + u.ze2.w * (nx * 2.0 - 1.0));
+    }
     let px = fx - cx;
     let py = fy - cy;
     fx = cx + px * u.a4.z + py * u.a4.y;
@@ -1012,15 +1082,23 @@ impl Gpu {
         });
         // master 256 + per-channel 768 + hue-curves 1280
         const LUT_N: u64 = 2304;
+        // .cube 3D LUT (loaded once for sizing; build_params hits the cache)
+        let lut3d = if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
+            crate::lut::load(&r.lut_file)
+        } else {
+            None
+        };
+        // header after the curve region: [size, amt, dmin*3, dscale*3] then data
+        let lut_len = LUT_N + 8 + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0);
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lut"),
-            size: LUT_N * 4,
+            size: lut_len * 4,
             usage: storage_in,
             mapped_at_creation: false,
         });
         // WB pick rect (virtual src px) for the stats pass
         let pick0 = if r.wb_mode == crate::recipe::WbMode::Pick {
-            pick_rect(r.wb_pick, vw as usize, vh as usize, m.info.flip)
+            pick_rect(r.wb_pick, vw as usize, vh as usize, m.info.flip, r.wb_pick_size)
         } else {
             [-1.0; 4]
         };
@@ -1138,6 +1216,14 @@ impl Gpu {
                 p.q_blur,
                 if p.q_show { 1.0 } else { 0.0 },
             ],
+            ze0: [p.zone_ev[0], p.zone_ev[1], p.zone_ev[2], p.zone_ev[3]],
+            ze1: [p.zone_ev[4], p.zone_ev[5], p.zone_ev[6], p.zone_ev[7]],
+            ze2: [
+                p.zone_ev[8],
+                if p.zone_ev.iter().any(|&v| v != 0.0) { 1.0 } else { 0.0 },
+                p.key_v,
+                p.key_h,
+            ],
         };
 
         let bind = |pipe: &Pipe| {
@@ -1250,6 +1336,16 @@ impl Gpu {
             } else {
                 lut_buf[off..off + 256].copy_from_slice(&p.hue_luts[k * 256..(k + 1) * 256]);
             }
+        }
+        // 3D LUT header + data (shader: size==0 => passthrough)
+        lut_buf.resize(lut_len as usize, 0.0);
+        if let Some(c) = &p.lut3d {
+            lut_buf[LUT_N as usize] = c.size as f32;
+            lut_buf[LUT_N as usize + 1] = p.lut_amt;
+            lut_buf[LUT_N as usize + 2..LUT_N as usize + 5].copy_from_slice(&c.dmin);
+            lut_buf[LUT_N as usize + 5..LUT_N as usize + 8].copy_from_slice(&c.dscale);
+            lut_buf[LUT_N as usize + 8..LUT_N as usize + 8 + c.data.len()]
+                .copy_from_slice(&c.data);
         }
         self.queue.write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         self.queue

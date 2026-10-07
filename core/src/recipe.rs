@@ -146,6 +146,22 @@ pub struct Recipe {
     pub glow: f32,
     /// lens flare [cx, cy, strength, hue] frame-normalized
     pub flare: [f32; 4],
+    // ---- darktable tone equalizer + LUT import + keystone ----
+    /// per-zone exposure in EV for log2-luma zones centered at -4..+4 EV
+    /// (index 0 = deepest shadows, 8 = brightest highlights), -4..4 each
+    pub zones_ev: [f32; 9],
+    /// WB eyedropper sample radius as a fraction of the frame, 0.002..0.2
+    pub wb_pick_size: f32,
+    /// path to a .cube 3D LUT file (empty = none); applied display-referred
+    /// at the end of the adjust chain
+    pub lut_file: String,
+    /// 0..1 blend amount of the LUT
+    pub lut_amount: f32,
+    /// keystone correction: vertical trapezoid warp -0.4..0.4
+    /// (>0 widens the bottom — fixes converging verticals shot from below)
+    pub key_v: f32,
+    /// keystone correction: horizontal trapezoid warp -0.4..0.4
+    pub key_h: f32,
 }
 
 /// parametric spatial mask + local adjustment (DaVinci power window).
@@ -260,6 +276,12 @@ impl Default for Recipe {
             deband: 0.0,
             glow: 0.0,
             flare: [0.0; 4],
+            zones_ev: [0.0; 9],
+            wb_pick_size: 0.025,
+            lut_file: String::new(),
+            lut_amount: 1.0,
+            key_v: 0.0,
+            key_h: 0.0,
         }
     }
 }

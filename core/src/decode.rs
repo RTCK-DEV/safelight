@@ -236,6 +236,38 @@ fn estimate_black_floor(
     }
 }
 
+/// Header-only camera info without unpacking pixels — fast enough for
+/// catalog scans. Rasters get EXIF make/model/lens.
+pub fn probe(path: &Path) -> Option<CameraInfo> {
+    if is_raw(path) {
+        let (_h, info) = open_raw(path).ok()?;
+        return Some(info_of(&info));
+    }
+    if is_raster(path) {
+        let f = std::fs::File::open(path).ok()?;
+        let ex = exif::Reader::new()
+            .read_from_container(&mut std::io::BufReader::new(f))
+            .ok()?;
+        let get = |t: exif::Tag| {
+            ex.get_field(t, exif::In::PRIMARY)
+                .map(|f| f.display_value().to_string())
+                .unwrap_or_default()
+        };
+        return Some(CameraInfo {
+            make: get(exif::Tag::Make),
+            model: get(exif::Tag::Model),
+            lens: get(exif::Tag::LensModel),
+            iso: 0.0,
+            shutter: 0.0,
+            aperture: 0.0,
+            focal: 0.0,
+            timestamp: 0,
+            flip: 0,
+        });
+    }
+    None
+}
+
 /// Reference render via libraw's own dcraw pipeline (rgb8).
 pub fn reference_render(path: &Path) -> Result<(Vec<u8>, usize, usize)> {
     let (h, _info) = open_raw(path)?;

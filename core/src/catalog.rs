@@ -23,6 +23,9 @@ pub struct AssetEntry {
     /// path of the sibling file (raw<->jpeg pair) if present
     pub pair: Option<String>,
     pub has_sidecar: bool,
+    /// camera "make model" + lens from header/EXIF (empty when unknown)
+    pub camera: String,
+    pub lens: String,
 }
 
 pub struct Catalog {
@@ -107,6 +110,7 @@ impl Catalog {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
+            let ci = decode::probe(p);
             let entry = AssetEntry {
                 path: p.to_string_lossy().into_owned(),
                 name,
@@ -121,6 +125,11 @@ impl Catalog {
                 label: sc.label.clone(),
                 pair,
                 has_sidecar: has_sc,
+                camera: ci
+                    .as_ref()
+                    .map(|i| format!("{} {}", i.make, i.model).trim().to_string())
+                    .unwrap_or_default(),
+                lens: ci.map(|i| i.lens).unwrap_or_default(),
             };
             let _ = self.db.execute(
                 "INSERT INTO files(path,name,folder,kind,size,mtime,rating,label,pair,added)

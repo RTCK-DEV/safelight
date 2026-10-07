@@ -20,7 +20,9 @@ enum Ara {
 
 /// Custom slider track: thin rail, amber fill drawn from the default (reset)
 /// position toward the knob, white knob ringed with accent. Drag or click to
-/// set; double-click resets. `reset` defaults to 0 when the range contains it.
+/// set; double-click resets; hovering adjusts with the scroll wheel
+/// (DaVinci/Lightroom behaviour). `reset` defaults to 0 when the range
+/// contains it.
 struct TrackSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
@@ -30,6 +32,7 @@ struct TrackSlider: View {
 
     @State private var dragActive = false
     @State private var lastStart = Date.distantPast
+    @State private var scrollMon = SliderScrollMonitor()
 
     private var def: Double {
         reset ?? (range.contains(0) ? 0 : range.lowerBound)
@@ -79,12 +82,46 @@ struct TrackSlider: View {
                     value = v.clamped(to: range)
                 }
                 .onEnded { _ in dragActive = false })
+            .onHover { h in
+                if h {
+                    scrollMon.handler = { ev in
+                        let d = Double(ev.scrollingDeltaY + ev.scrollingDeltaX)
+                        let span = range.upperBound - range.lowerBound
+                        // ~200 scroll-units traverse the full range; snapped to step
+                        value = (((value + d * span / 200) / step).rounded() * step)
+                            .clamped(to: range)
+                        return false   // consumed — don't scroll the panel too
+                    }
+                    scrollMon.install()
+                } else {
+                    scrollMon.uninstall()
+                }
+            }
+            .onDisappear { scrollMon.uninstall() }
         }
         .frame(height: height)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("slider")
         .accessibilityValue(String(format: "%.2f", value))
     }
+}
+
+/// Per-slider scroll monitor, installed only while hovered.
+final class SliderScrollMonitor {
+    private var monitor: Any?
+    /// true = let the event pass through; false = consumed
+    var handler: (NSEvent) -> Bool = { _ in true }
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] ev in
+            guard let self else { return ev }
+            return self.handler(ev) ? ev : nil
+        }
+    }
+    func uninstall() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+    }
+    deinit { uninstall() }
 }
 
 /// Monospaced numeric readout that turns into an editable TextField on click
@@ -142,6 +179,108 @@ struct NumValue: View {
             value = v.clamped(to: range)
         }
         editing = false
+    }
+}
+
+/// Vertical slider for the zone equalizer: same drag + dblclick-reset +
+/// scroll-adjust behaviour as TrackSlider, oriented bottom→top.
+struct VSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var step: Double = 0.25
+    var reset: Double = 0
+    var height: CGFloat = 64
+
+    @State private var dragActive = false
+    @State private var lastStart = Date.distantPast
+    @State private var scrollMon = SliderScrollMonitor()
+
+    var body: some View {
+        GeometryReader { geo in
+            let h = geo.size.height
+            let w = geo.size.width
+            let span = range.upperBound - range.lowerBound
+            let fy = { (v: Double) -> CGFloat in
+                (1 - CGFloat((v - range.lowerBound) / span).clampedTo01()) * h
+            }
+            let ky = fy(value)
+            let zy = fy(reset)
+            ZStack {
+                Capsule().fill(Ara.track)
+                    .frame(width: 4, height: h)
+                Capsule().fill(Ara.accent.opacity(0.85))
+                    .frame(width: 4, height: max(abs(ky - zy), 2))
+                    .offset(y: (min(ky, zy) + max(ky, zy)) / 2 - h / 2)
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().stroke(Ara.accent.opacity(0.95), lineWidth: 1.5))
+                    .shadow(color: .black.opacity(0.5), radius: 1, y: 0.5)
+                    .position(x: w / 2, y: ky.clamped(to: 4.5...(h - 4.5)))
+            }
+            .frame(width: w, height: h)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { g in
+                    if !dragActive {
+                        dragActive = true
+                        if g.time.timeIntervalSince(lastStart) < 0.3 {
+                            value = reset
+                            lastStart = .distantPast
+                            return
+                        }
+                        lastStart = g.time
+                    }
+                    let f = (1 - Double(g.location.y / h)).clamped(to: 0...1)
+                    let v = range.lowerBound + f * span
+                    value = ((v / step).rounded() * step).clamped(to: range)
+                }
+                .onEnded { _ in dragActive = false })
+            .onHover { h in
+                if h {
+                    scrollMon.handler = { ev in
+                        let d = Double(ev.scrollingDeltaY + ev.scrollingDeltaX)
+                        let v = value + d * span / 200
+                        value = ((v / step).rounded() * step).clamped(to: range)
+                        return false
+                    }
+                    scrollMon.install()
+                } else {
+                    scrollMon.uninstall()
+                }
+            }
+            .onDisappear { scrollMon.uninstall() }
+        }
+        .frame(height: height)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("zone slider")
+        .accessibilityValue(String(format: "%.2f", value))
+    }
+}
+
+/// darktable tone equalizer: bank of 9 vertical EV sliders, one per
+/// log2-luminance band centred at -4..+4 EV.
+struct ZoneEQ: View {
+    @Binding var zones: [Double]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<9, id: \.self) { i in
+                VStack(spacing: 3) {
+                    VSlider(value: Binding(
+                        get: { i < zones.count ? zones[i] : 0 },
+                        set: { v in
+                            while zones.count < 9 { zones.append(0) }
+                            zones[i] = v
+                        }),
+                        range: -4...4, step: 0.25, reset: 0, height: 62)
+                    Text("\(i - 4)")
+                        .font(.system(size: 7.5).monospacedDigit())
+                        .foregroundStyle(zones.count > i && zones[i] != 0 ? Ara.accent : Ara.text3)
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
     }
 }
 

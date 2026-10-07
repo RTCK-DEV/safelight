@@ -99,6 +99,14 @@ pub struct Params {
     pub glow: f32,
     /// lens flare [cx, cy, strength, hue] in dst-normalized coords
     pub flare: [f32; 4],
+    /// tone equalizer: EV per log2-luma zone (centers -4..+4 EV, 9 zones)
+    pub zone_ev: [f32; 9],
+    /// imported .cube 3D LUT (applied display-referred) + amount
+    pub lut3d: Option<crate::lut::CubeLut>,
+    pub lut_amt: f32,
+    /// keystone trapezoid warps -0.4..0.4
+    pub key_v: f32,
+    pub key_h: f32,
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -675,6 +683,21 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             r.flare[2].clamp(0.0, 1.0),
             r.flare[3] - r.flare[3].floor(),
         ],
+        zone_ev: {
+            let mut z = r.zones_ev;
+            for v in &mut z {
+                *v = v.clamp(-4.0, 4.0);
+            }
+            z
+        },
+        lut3d: if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
+            crate::lut::load(&r.lut_file)
+        } else {
+            None
+        },
+        lut_amt: r.lut_amount.clamp(0.0, 1.0),
+        key_v: r.key_v.clamp(-0.4, 0.4),
+        key_h: r.key_h.clamp(-0.4, 0.4),
     };
     apply_look(&mut p, &r.look);
     p
@@ -695,6 +718,26 @@ fn srgb_encode(v: f32) -> f32 {
     }
 }
 
+fn srgb_decode(v: f32) -> f32 {
+    let c = v.clamp(0.0, 1.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// tone equalizer: interpolated EV for a pixel of linear luma `l`.
+/// Zones are centered at log2 EV -4..+4 (9 zones); linear interp between
+/// centers == unit-partitioned triangle weights.
+fn zone_ev_at(l: f32, z: &[f32; 9]) -> f32 {
+    let e = l.max(1e-6).log2();
+    let t = (e + 4.0).clamp(0.0, 8.0);
+    let i = (t as usize).min(7);
+    let f = t - i as f32;
+    z[i] * (1.0 - f) + z[i + 1] * f
+}
+
 /// apply tone+color adjustments on linear sRGB triple. Shared logic with gpu shader.
 /// order: exposure -> auto-contrast remap -> lift/gamma/gain -> blacks/whites ->
 ///        contrast -> shadows/highlights -> saturation/vibrance -> split tone -> LUT
@@ -708,6 +751,14 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     if p.white_pt - p.black_pt < 0.999 || p.black_pt > 0.001 {
         for c in &mut x {
             *c = (*c - p.black_pt) / (p.white_pt - p.black_pt).max(0.02);
+        }
+    }
+    // tone equalizer: per-zone exposure on the post-exposure luma
+    if p.zone_ev.iter().any(|&v| v != 0.0) {
+        let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        let evg = 2.0f32.powf(zone_ev_at(l, &p.zone_ev));
+        for c in &mut x {
+            *c *= evg;
         }
     }
     // lift/gamma/gain: out = gain * pow(x + lift, 1/gamma)
@@ -900,6 +951,19 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             }
         }
     }
+    // imported .cube LUT: run display-referred (encode -> lut -> decode back
+    // to linear so grain/vignette/windows keep working in the linear domain)
+    if let Some(cube) = &p.lut3d {
+        let enc = [
+            srgb_encode(x[0]),
+            srgb_encode(x[1]),
+            srgb_encode(x[2]),
+        ];
+        let v = cube.sample(enc[0], enc[1], enc[2]);
+        for c in 0..3 {
+            x[c] = srgb_decode(enc[c] + (v[c] - enc[c]) * p.lut_amt);
+        }
+    }
     x
 }
 
@@ -995,7 +1059,7 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
         let step = 4usize; // sparse sample
         // WB pick rectangle (virtual src px); empty when not picking
         let pr = if r.wb_mode == WbMode::Pick {
-            pick_rect(r.wb_pick, vw, vh, m.info.flip)
+            pick_rect(r.wb_pick, vw, vh, m.info.flip, r.wb_pick_size)
         } else {
             [-1.0; 4]
         };
@@ -1194,14 +1258,15 @@ pub fn spot_to_src(s: [f32; 4], w: usize, h: usize, flip: i32) -> (f32, f32, f32
     (sx, sy, (s[2] * fw.max(fh) as f32).max(2.0))
 }
 
-/// WB pick rectangle in virtual-src px: ~5% box around the tapped point
-pub fn pick_rect(pick: [f32; 2], w: usize, h: usize, flip: i32) -> [f32; 4] {
+/// WB pick rectangle in virtual-src px: `size` is the half-width as a
+/// fraction of the longer frame side (default ~0.025 = 5% box)
+pub fn pick_rect(pick: [f32; 2], w: usize, h: usize, flip: i32, size: f32) -> [f32; 4] {
     let (cx, cy) = frame_to_src(pick[0], pick[1], w, h, flip);
     let (fw, fh) = match flip {
         5 | 6 => (h, w),
         _ => (w, h),
     };
-    let r = 0.025 * fw.max(fh) as f32;
+    let r = size.clamp(0.002, 0.2) * fw.max(fh) as f32;
     [cx - r, cy - r, cx + r, cy + r]
 }
 
@@ -1325,6 +1390,11 @@ fn finish_linear(
             let ny = (dy as f32 + 0.5) / dh as f32;
             let mut fx = cl + nx * ew - 0.5;
             let mut fy = ct + ny * eh - 0.5;
+            // keystone: trapezoid warp about the crop centre
+            if p.key_v != 0.0 || p.key_h != 0.0 {
+                fx = cx + (fx - cx) * (1.0 + p.key_v * (ny * 2.0 - 1.0));
+                fy = cy + (fy - cy) * (1.0 + p.key_h * (nx * 2.0 - 1.0));
+            }
             let px = fx - cx;
             let py = fy - cy;
             fx = cx + px * cos + py * sin;

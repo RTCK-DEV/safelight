@@ -723,6 +723,10 @@ struct EditorView: View {
                 SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
                            (.manual, "Manual"), (.pick, "Pick")],
                           selection: $recipe.wb_mode)
+                if recipe.wb_mode == .pick || retouchMode == "wbpick" {
+                    SliderRow("Pick Area", $recipe.wb_pick_size, 0.002...0.2, reset: 0.025)
+                        .help("Sampling half-width of the WB eyedropper as a fraction of the frame")
+                }
                 SliderRow("Temp", $recipe.temperature, -1...1)
                 SliderRow("Tint", $recipe.tint, -1...1)
             }
@@ -760,12 +764,31 @@ struct EditorView: View {
 
     private var wheelsPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Panel("Primaries", trailing: { LookPicker(look: $recipe.look) }) {
+            Panel("Primaries", trailing: { LookPicker(look: $recipe.look, photo: photo, recipe: recipe) }) {
                 HStack(spacing: 6) {
                     ColorWheel(title: "Lift", v: $recipe.lift, center: 0)
                     ColorWheel(title: "Gamma", v: $recipe.gamma, center: 1)
                     ColorWheel(title: "Gain", v: $recipe.gain, center: 1)
                     ColorWheel(title: "Offset", v: $recipe.offset, center: 0)
+                }
+                HStack(spacing: 6) {
+                    Text("LUT")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(Ara.text2)
+                        .frame(width: 60, alignment: .leading)
+                    ToolChip(label: recipe.lut_file.isEmpty
+                             ? "Choose .cube…"
+                             : URL(fileURLWithPath: recipe.lut_file)
+                                .deletingPathExtension().lastPathComponent,
+                             icon: "doc.badge.plus") { pickLut() }
+                    if !recipe.lut_file.isEmpty {
+                        ToolChip(label: "", icon: "xmark") { recipe.lut_file = "" }
+                            .help("Clear LUT")
+                    }
+                    Spacer()
+                }
+                if !recipe.lut_file.isEmpty {
+                    SliderRow("Amount", $recipe.lut_amount, 0...1, reset: 1)
                 }
             }
             Panel("Split Tone") {
@@ -802,6 +825,15 @@ struct EditorView: View {
 
     private var zonesPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Panel("Tone Equalizer", trailing: {
+                ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
+                    recipe.zones_ev = [Double](repeating: 0, count: 9)
+                }
+            }) {
+                ZoneEQ(zones: $recipe.zones_ev)
+                Text("EV gain per luminance band (−4…+4 EV around mid grey)")
+                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+            }
             Panel("HDR Zones") {
                 ZoneRow("Dark", $recipe.z_dark)
                 ZoneRow("Shadow", $recipe.z_shadow)
@@ -1034,8 +1066,20 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Transform") {
                 SliderRow("Straighten", $recipe.rotation_deg, -10...10, step: 0.1)
+                SliderRow("Keystone V", $recipe.key_v, -0.4...0.4)
+                SliderRow("Keystone H", $recipe.key_h, -0.4...0.4)
             }
             Panel("Crop") {
+                HStack(spacing: 4) {
+                    Text("Aspect")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(Ara.text2)
+                        .frame(width: 60, alignment: .leading)
+                    ForEach([(name: "Free", k: 0.0), ("1:1", 1.0), ("4:3", 4.0 / 3.0),
+                             ("3:2", 1.5), ("16:9", 16.0 / 9.0)], id: \.name) { a in
+                        ToolChip(label: a.name) { applyAspect(a.k) }
+                    }
+                }
                 SliderRow("Left", $recipe.crop[0], 0...0.45)
                 SliderRow("Top", $recipe.crop[1], 0...0.45)
                 SliderRow("Right", $recipe.crop[2], 0...0.45)
@@ -1094,6 +1138,44 @@ struct EditorView: View {
     }
 
     // MARK: data plumbing (unchanged logic)
+
+    /// .cube LUT file open panel; stores the path (parser rejects junk).
+    private func pickLut() {
+        let p = NSOpenPanel()
+        p.canChooseFiles = true
+        p.canChooseDirectories = false
+        p.allowsMultipleSelection = false
+        if let cube = UniformTypeIdentifiers.UTType(filenameExtension: "cube") {
+            p.allowedContentTypes = [cube]
+        }
+        if p.runModal() == .OK, let u = p.url {
+            recipe.lut_file = u.path
+            if recipe.lut_amount == 0 { recipe.lut_amount = 1 }
+        }
+    }
+
+    /// Crop aspect preset: shrink/grow the current crop (centre-preserving)
+    /// to the given w:h ratio. k == 0 resets to the full frame.
+    private func applyAspect(_ k: Double) {
+        if k == 0 { recipe.crop = [0, 0, 0, 0]; return }
+        guard let img = image else { return }
+        let remW = 1 - recipe.crop[0] - recipe.crop[2]
+        let remH = 1 - recipe.crop[1] - recipe.crop[3]
+        guard remW > 0.02, remH > 0.02 else { return }
+        // frame aspect ≈ dst aspect corrected back for the current crop
+        let fa = (Double(img.width) / Double(img.height)) * remH / remW
+        let cx = recipe.crop[0] + remW / 2
+        let cy = recipe.crop[1] + remH / 2
+        var w = remW
+        var h = w * fa / k
+        if h > remH { h = remH; w = h * k / fa }
+        w = min(w, 1); h = min(h, 1)
+        let l = (cx - w / 2).clamped(to: 0...1)
+        let t = (cy - h / 2).clamped(to: 0...1)
+        recipe.crop = [l, t,
+                       (1 - (l + w)).clamped(to: 0...1),
+                       (1 - (t + h)).clamped(to: 0...1)]
+    }
 
     private func curveBinding(_ ch: Int) -> Binding<[[Double]]> {
         switch ch {
@@ -1566,18 +1648,29 @@ struct FilmCell: View {
     }
 }
 
-/// Look preset menu (chip-style).
+/// Look preset chooser with live thumbnails: the popover renders each look
+/// over the current recipe at thumbnail size, cached per photo (DaVinci LUT
+/// gallery / darktable preset style).
 struct LookPicker: View {
     @Binding var look: String
+    let photo: Photo
+    let recipe: Recipe
+
+    @State private var open = false
+    @State private var thumbs: [String: CGImage] = [:]
+    @State private var thumbPath = ""
+    @State private var loading = false
+
     private let options: [(String, String)] = [
         ("", "None"), ("teal_orange", "Teal & Orange"), ("film_fade", "Film Fade"),
         ("bleach", "Bleach Bypass"), ("noir", "Noir"), ("matte", "Matte"),
     ]
+
     var body: some View {
-        Menu {
-            ForEach(options, id: \.0) { v, name in
-                Button(name) { look = v }
-            }
+        Button {
+            if thumbPath != photo.path { thumbs = [:]; thumbPath = photo.path }
+            open.toggle()
+            if open { loadThumbs() }
         } label: {
             HStack(spacing: 4) {
                 Text(options.first(where: { $0.0 == look })?.1 ?? "Look")
@@ -1590,9 +1683,70 @@ struct LookPicker: View {
             .background(Capsule().fill(look.isEmpty ? Ara.bg3 : Ara.accentSoft)
                 .overlay(Capsule().stroke(look.isEmpty ? Ara.hairline : Ara.accent.opacity(0.4), lineWidth: 0.5)))
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
+        .buttonStyle(.plain)
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("LOOKS")
+                    .font(.system(size: 9, weight: .semibold)).tracking(1.2)
+                    .foregroundStyle(Ara.text3)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
+                          spacing: 8) {
+                    ForEach(options, id: \.0) { v, name in
+                        VStack(spacing: 3) {
+                            ZStack {
+                                Ara.bg3
+                                if let img = thumbs[v] {
+                                    Image(img, scale: 1, label: Text(name))
+                                        .resizable().scaledToFill()
+                                } else {
+                                    ProgressView().controlSize(.mini).tint(Ara.text3)
+                                }
+                            }
+                            .aspectRatio(1.5, contentMode: .fit)
+                            .clipped()
+                            Text(name)
+                                .font(.system(size: 8, weight: v == look ? .semibold : .regular))
+                                .foregroundStyle(v == look ? Ara.accent : Ara.text3)
+                                .lineLimit(1)
+                        }
+                        .padding(4)
+                        .background(Ara.bg2)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(v == look ? Ara.accent : Ara.hairline,
+                                    lineWidth: v == look ? 1.5 : 0.5))
+                        .contentShape(Rectangle())
+                        .onTapGesture { look = v; open = false }
+                    }
+                }
+            }
+            .padding(10)
+            .frame(width: 300)
+            .background(Ara.bg1)
+        }
+    }
+
+    /// One render per look at 220px; engine cache makes this fast enough.
+    private func loadThumbs() {
+        if loading { return }
+        loading = true
+        let path = photo.path
+        let base = recipe
+        Task.detached {
+            var out: [String: CGImage] = [:]
+            for (v, _) in options {
+                var r = base
+                r.look = v
+                let (img, _) = await AraEngine.shared.work {
+                    $0.render(path: path, recipe: r, maxPx: 220)
+                }
+                if let img { out[v] = img }
+            }
+            await MainActor.run {
+                thumbs.merge(out) { _, n in n }
+                loading = false
+            }
+        }
     }
 }
 

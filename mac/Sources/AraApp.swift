@@ -27,6 +27,8 @@ final class LibraryStore: ObservableObject {
     @Published var scanning = false
     @Published var minRating = 0
     @Published var labelFilter = ""
+    @Published var cameraFilter = ""
+    @Published var lensFilter = ""
 
     /// Recipes edited but not yet saved, keyed by photo path — keeps unsaved
     /// work alive when switching photos. Cleared when the folder reloads.
@@ -35,9 +37,16 @@ final class LibraryStore: ObservableObject {
     /// Same idea for grade-version lists (they live in the sidecar file).
     var unsavedVersions: [String: [GradeVersion]] = [:]
 
+    /// distinct camera/lens names seen in the current folder (filter menus)
+    var cameras: [String] { Array(Set(photos.map(\.camera).filter { !$0.isEmpty })).sorted() }
+    var lenses: [String] { Array(Set(photos.map(\.lens).filter { !$0.isEmpty })).sorted() }
+
     var filtered: [Photo] {
         photos.filter {
-            $0.rating >= minRating && (labelFilter.isEmpty || $0.label == labelFilter)
+            $0.rating >= minRating
+                && (labelFilter.isEmpty || $0.label == labelFilter)
+                && (cameraFilter.isEmpty || $0.camera == cameraFilter)
+                && (lensFilter.isEmpty || $0.lens == lensFilter)
         }
     }
 
