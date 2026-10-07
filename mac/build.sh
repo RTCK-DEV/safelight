@@ -25,6 +25,12 @@ if [ -f mac/AppIcon.png ]; then
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# bundle the vendored lensfun calibration DB (distortion/TCA/vignette)
+if [ -d lensfun/db ]; then
+  mkdir -p "$APP/Contents/Resources/lensfun"
+  cp -R lensfun/db "$APP/Contents/Resources/lensfun/db"
+fi
+
 # bundle libraw so the app is self-contained (LGPL dynamic linking preserved)
 LIBRAW_DYLIB=$(ls "$LIBRAW_PREFIX"/lib/libraw.*.dylib | head -1)
 cp "$LIBRAW_DYLIB" "$APP/Contents/Frameworks/"

@@ -99,6 +99,12 @@ struct Uni {
     ze2: [f32; 4],
     /// dehaze: veil strength w, atmospheric light A, 0, 0
     dh0: [f32; 4],
+    /// lens profile correction: [model,a,b,c], TCA [vr,br,vb,bb],
+    /// vignette [k1,k2,k3,scale], [0,0,0,amount]
+    lens0: [f32; 4],
+    lens1: [f32; 4],
+    lens2: [f32; 4],
+    lens3: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -155,6 +161,10 @@ struct Uni {
     ze2: vec4<f32>,
     // dh0 = [veil strength w, atmospheric light A, 0, 0]
     dh0: vec4<f32>,
+    lens0: vec4<f32>,
+    lens1: vec4<f32>,
+    lens2: vec4<f32>,
+    lens3: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -475,13 +485,157 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     }
 }
 
+// ---- lens profile correction (mirrors develop.rs) -------------------------
+// u.lens0 = [model, a, b, c]  model: 1=ptlens 2=poly3
+// u.lens1 = [vr, br, vb, bb]  TCA scales
+// u.lens2 = [k1, k2, k3, scale]   vignette pa coeffs + cam/lens crop ratio
+// u.lens3 = [0, 0, 0, amount]
+
+fn lens_f(model: u32, rd: f32) -> f32 {
+    if (model == 1u) {
+        let a = u.lens0.y;
+        let b = u.lens0.z;
+        let c = u.lens0.w;
+        return rd * (a * rd * rd * rd + b * rd * rd + c * rd + (1.0 - a - b - c));
+    }
+    return rd * (1.0 + u.lens0.y * rd * rd);
+}
+fn lens_fp(model: u32, rd: f32) -> f32 {
+    if (model == 1u) {
+        let a = u.lens0.y;
+        let b = u.lens0.z;
+        let c = u.lens0.w;
+        return 4.0 * a * rd * rd * rd + 3.0 * b * rd * rd + 2.0 * c * rd + (1.0 - a - b - c);
+    }
+    return 1.0 + 3.0 * u.lens0.y * rd * rd;
+}
+fn inv_dist(model: u32, ru: f32) -> f32 {
+    if (model == 0u || ru <= 0.0) { return ru; }
+    var rd = ru;
+    for (var k = 0u; k < 5u; k = k + 1u) {
+        rd = rd - (lens_f(model, rd) - ru) / max(lens_fp(model, rd), 1e-4);
+        if (rd < 0.0) { rd = ru * 0.5; }
+    }
+    return rd;
+}
+fn inv_tca(v: f32, b: f32, ru: f32) -> f32 {
+    if (ru <= 0.0 || (abs(v - 1.0) < 1e-6 && abs(b) < 1e-6)) { return ru; }
+    var rd = ru;
+    for (var k = 0u; k < 5u; k = k + 1u) {
+        rd = rd - (rd * (v + b * rd * rd) - ru) / max(v + 3.0 * b * rd * rd, 1e-4);
+        if (rd < 0.0) { rd = ru * 0.5; }
+    }
+    return rd;
+}
+fn lens_bilinear(sx: f32, sy: f32, ch: u32) -> f32 {
+    let sw = i32(u.g1.x);
+    let sh = i32(u.g1.y);
+    let x0 = u32(clamp(i32(floor(sx)), 0, sw - 1));
+    let y0 = u32(clamp(i32(floor(sy)), 0, sh - 1));
+    let x1 = min(x0 + 1u, u32(sw - 1));
+    let y1 = min(y0 + 1u, u32(sh - 1));
+    let tx = clamp(sx - f32(x0), 0.0, 1.0);
+    let ty = clamp(sy - f32(y0), 0.0, 1.0);
+    let a = mix(io_a[y0 * u.g1.x + x0][ch], io_a[y0 * u.g1.x + x1][ch], tx);
+    let b = mix(io_a[y1 * u.g1.x + x0][ch], io_a[y1 * u.g1.x + x1][ch], tx);
+    return mix(a, b, ty);
+}
+/// display px -> corrected source radius (cam-normalised) per channel + gain
+fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
+    // returns rd_per_channel(r,g,b cam-normalised) + vignette gain
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let halfd = max(sqrt(cx * cx + cy * cy), 1.0);
+    let dx = x - cx;
+    let dy = y - cy;
+    let rn = sqrt(dx * dx + dy * dy) / halfd;
+    if (rn < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+    let ru = rn * u.lens2.w;
+    let rd = inv_dist(u32(u.lens0.x), ru);
+    let amt = u.lens3.w;
+    let att = max(1.0 + u.lens2.x * ru * ru + u.lens2.y * ru * ru * ru * ru
+        + u.lens2.z * ru * ru * ru * ru * ru * ru, 0.05);
+    let gain = 1.0 + (1.0 / att - 1.0) * amt;
+    let rr = inv_tca(u.lens1.x, u.lens1.y, rd) / u.lens2.w;
+    let rg = rd / u.lens2.w;
+    let rb = inv_tca(u.lens1.z, u.lens1.w, rd) / u.lens2.w;
+    // blend to identity by amount
+    let f = 1.0 - amt;
+    return vec4<f32>(
+        rr + (rn - rr) * f,
+        rg + (rn - rg) * f,
+        rb + (rn - rb) * f,
+        gain,
+    );
+}
+
+// stride-1 + lens: reconstruct cam grid into io_a
+@compute @workgroup_size(256)
+fn recon_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    if (i >= u.g1.x * u.g1.y) { return; }
+    io_a[i] = vec4<f32>(demosaic_cd(i), 0.0);
+}
+
+// resample the cam grid at corrected radii (per channel, for lateral CA)
+@compute @workgroup_size(256)
+fn geom_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    if (i >= u.g1.x * u.g1.y) { return; }
+    let w = f32(u.g1.x);
+    let h = f32(u.g1.y);
+    let x = f32(i % u.g1.x);
+    let y = f32(i / u.g1.x);
+    let g = lens_geom(x, y, w, h);
+    if (g.x == 0.0 && g.y == 0.0 && g.z == 0.0) {
+        io_b[i] = vec4<f32>(io_a[i].xyz, 1.0);
+        return;
+    }
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let halfd = max(sqrt(cx * cx + cy * cy), 1.0);
+    let dx = x - cx;
+    let dy = y - cy;
+    let s = vec3<f32>(g.x, g.y, g.z) * halfd / sqrt(dx * dx + dy * dy);
+    var out3: vec3<f32>;
+    for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+        out3[ch] = lens_bilinear(cx + dx * s[ch], cy + dy * s[ch], ch);
+    }
+    io_b[i] = vec4<f32>(out3 * g.w, 1.0);
+}
+
 @compute @workgroup_size(256)
 fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
     let i = flat_index(gid, num);
     if (i >= u.g1.x * u.g1.y) { return; }
     var cam: vec3<f32>;
-    if (u.g4.w == 1u) {
+    let lens_on = u.g4.w >= 2u;
+    let full = (u.g4.w % 2u) == 1u;
+    if (full && lens_on) {
+        // geom pass already wrote corrected cam (gain folded in)
+        cam = io_b[i].xyz;
+    } else if (full) {
         cam = demosaic_cd(i);
+    } else if (lens_on) {
+        // preview: remap the sampling position, fold vignette gain
+        let w = f32(u.g1.x);
+        let h = f32(u.g1.y);
+        let x = f32(i % u.g1.x);
+        let y = f32(i / u.g1.x);
+        let g = lens_geom(x, y, w, h);
+        if (g.x == 0.0 && g.y == 0.0 && g.z == 0.0) {
+            cam = demosaic(u32(x), u32(y));
+        } else {
+            let cx = w * 0.5;
+            let cy = h * 0.5;
+            let halfd = max(sqrt(cx * cx + cy * cy), 1.0);
+            let dx = x - cx;
+            let dy = y - cy;
+            let sc = g.y * halfd / sqrt(dx * dx + dy * dy);
+            let sx = min(u32(round(cx + dx * sc)), u.g1.x - 1u);
+            let sy = min(u32(round(cy + dy * sc)), u.g1.y - 1u);
+            cam = demosaic(sx, sy) * g.w;
+        }
     } else {
         cam = demosaic(i % u.g1.x, i / u.g1.x);
     }
@@ -1222,6 +1376,8 @@ pub struct Gpu {
     demosaic: Pipe,
     green: Pipe,
     diff: Pipe,
+    recon: Pipe,
+    geom: Pipe,
     stats: Pipe,
     heal: Pipe,
     nrl: Pipe,
@@ -1326,6 +1482,8 @@ impl Gpu {
             demosaic: mk("demosaic_main"),
             green: mk("green_main"),
             diff: mk("diff_main"),
+            recon: mk("recon_main"),
+            geom: mk("geom_main"),
             stats: mk("stats_main"),
             heal: mk("heal_main"),
             nrl: mk("nrl_main"),
@@ -1449,6 +1607,20 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
+        // lens profile correction: same lookup as the CPU path
+        let corr = if r.lens_corr > 0.001 {
+            crate::lensdb::db().and_then(|d| {
+                let c = d.correction(
+                    &m.info.lens, &m.info.make, &m.info.model,
+                    m.info.focal, m.info.aperture,
+                );
+                if c.is_empty() { None } else { Some(c) }
+            })
+        } else {
+            None
+        };
+        let lens_amt = r.lens_corr.min(1.0);
+
         let mk_uni = |p: &Params, samp_step: u32| Uni {
             black: m.black,
             norm: norm_factors(m),
@@ -1469,7 +1641,14 @@ impl Gpu {
             g1: [vw, vh, stride, m.info.flip as u32],
             g2: [vw, vh, dw, dh],
             g3: [m.cfa.w as u32, m.cfa.h as u32, samp_step, fw],
-            g4: [fh, m.w as u32, m.h as u32, if stride == 1 { 1 } else { 0 }],
+            g4: [
+                fh,
+                m.w as u32,
+                m.h as u32,
+                // bit0: stride==1 chroma-diff demosaic; bit1: lens correction
+                (if stride == 1 { 1 } else { 0 })
+                    + if corr.is_some() { 2 } else { 0 },
+            ],
             lgg0: [p.lift[0], p.lift[1], p.lift[2], 0.0],
             lgg1: [p.gamma[0], p.gamma[1], p.gamma[2], 0.0],
             lgg2: [p.gain[0], p.gain[1], p.gain[2], 0.0],
@@ -1565,6 +1744,16 @@ impl Gpu {
                 p.key_h,
             ],
             dh0: [p.dehaze, p.dehaze_a, 0.0, 0.0],
+            lens0: corr
+                .as_ref()
+                .map(|c| [c.model as f32, c.abc[0], c.abc[1], c.abc[2]])
+                .unwrap_or([0.0; 4]),
+            lens1: corr.as_ref().map(|c| c.tca).unwrap_or([1.0, 0.0, 1.0, 0.0]),
+            lens2: corr
+                .as_ref()
+                .map(|c| [c.vig[0], c.vig[1], c.vig[2], c.scale])
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+            lens3: [0.0, 0.0, 0.0, if corr.is_some() { lens_amt } else { 0.0 }],
         };
 
         let bind = |pipe: &Pipe| {
@@ -1701,6 +1890,11 @@ impl Gpu {
         if stride == 1 {
             run(&mut enc, &self.green, n_px);
             run(&mut enc, &self.diff, n_px);
+            if corr.is_some() {
+                // cam grid -> io_a, then resample into io_b (r,g,b,gain)
+                run(&mut enc, &self.recon, n_px);
+                run(&mut enc, &self.geom, n_px);
+            }
         }
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.

@@ -130,6 +130,8 @@ struct EditorView: View {
     @State private var redoStack: [Recipe] = []
     @State private var lastEditTime = Date.distantPast
     @State private var applyingHistory = false
+    /// lensfun profile name matched to this file's EXIF lens ("" = none)
+    @State private var lensProfile = ""
     // palettes
     @State private var palette: Palette = .quick
     @State private var selWindow: UUID?
@@ -1395,6 +1397,24 @@ struct EditorView: View {
                 SliderRow("Keystone V", $recipe.key_v, -0.4...0.4)
                 SliderRow("Keystone H", $recipe.key_h, -0.4...0.4)
             }
+            Panel("Lens") {
+                HStack(spacing: 6) {
+                    Image(systemName: lensProfile.isEmpty ? "camera.metering.unknown" : "checkmark.circle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(lensProfile.isEmpty ? Ara.text3 : Ara.accent)
+                    Text(lensProfile.isEmpty ? "No lens profile" : lensProfile)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(lensProfile.isEmpty ? Ara.text3 : Ara.text1)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                }
+                .help(lensProfile.isEmpty
+                      ? "This lens has no profile in the bundled lensfun DB"
+                      : "lensfun profile: distortion + lateral CA + vignetting")
+                SliderRow("Correction", $recipe.lens_corr, 0...1)
+                    .disabled(lensProfile.isEmpty)
+                    .opacity(lensProfile.isEmpty ? 0.45 : 1)
+            }
             Panel("Crop") {
                 HStack(spacing: 4) {
                     Text("Aspect")
@@ -1658,6 +1678,14 @@ struct EditorView: View {
         cmp = .off
         zoom = 1
         pan = .zero
+        lensProfile = ""
+        Task {
+            let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
+            if let d = meta.data(using: .utf8),
+               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                lensProfile = (j["lens_profile"] as? String) ?? ""
+            }
+        }
         rerender()
     }
 
@@ -1869,6 +1897,7 @@ struct EditorView: View {
         case .xform:
             return recipe.rotation_deg != 0 || recipe.crop != d.crop
                 || recipe.key_v != 0 || recipe.key_h != 0
+                || recipe.lens_corr != d.lens_corr
         case .meters, .versions:
             return false
         }
@@ -1935,6 +1964,7 @@ struct EditorView: View {
         case .xform:
             recipe.rotation_deg = 0; recipe.crop = d.crop
             recipe.key_v = 0; recipe.key_h = 0
+            recipe.lens_corr = d.lens_corr
         case .meters, .versions:
             break
         }

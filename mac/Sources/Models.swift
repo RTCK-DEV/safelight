@@ -209,6 +209,8 @@ struct Recipe: Codable, Equatable {
     // keystone: vertical/horizontal trapezoid warp -0.4..0.4
     var key_v: Double = 0
     var key_h: Double = 0
+    // lensfun profile correction strength 0..1 (1 = on, LR-style default)
+    var lens_corr: Double = 1
 
 }
 
@@ -233,6 +235,7 @@ extension Recipe {
         case mixer, mono, clones
         case beauty, noise_chroma, dehaze, ca_fix, deband, glow, flare
         case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
+        case lens_corr
     }
 
     init(from decoder: Decoder) throws {
@@ -316,6 +319,7 @@ extension Recipe {
         lut_amount = opt(.lut_amount, Double.self) ?? 1
         key_v = opt(.key_v, Double.self) ?? 0
         key_h = opt(.key_h, Double.self) ?? 0
+        lens_corr = opt(.lens_corr, Double.self) ?? 1
         q_enabled = qh[1] > 0
     }
 }

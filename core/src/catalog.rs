@@ -565,6 +565,10 @@ impl Catalog {
     ///              lens_contains:"", keyword:"", name_contains:"", edited:true}
     pub fn smart_eval(&self, rules: &str) -> Result<Vec<AssetEntry>> {
         let r: Value = serde_json::from_str(rules).unwrap_or(json!({}));
+        // two phases: SQL pre-filters masters on columns variants share
+        // (camera/lens/name), then per-entry rules (rating/flag/label/
+        // keyword/edited) run in Rust so virtual copies can match even
+        // when their master does not.
         let mut sql = String::from(
             "SELECT path,name,kind,size,mtime,rating,label,flag,keywords,
                     stack,stack_seq,pair,ctime,iso,aperture,focal,shutter,camera,lens,
@@ -572,23 +576,6 @@ impl Catalog {
              FROM files WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(v) = r.get("rating_min").and_then(|v| v.as_i64()) {
-            if v > 0 {
-                sql.push_str(&format!(" AND rating>={}", v.clamp(0, 5)));
-            }
-        }
-        if let Some(v) = r.get("rating_eq").and_then(|v| v.as_i64()) {
-            sql.push_str(&format!(" AND rating={}", v.clamp(0, 5)));
-        }
-        if let Some(v) = r.get("flag").and_then(|v| v.as_i64()) {
-            sql.push_str(&format!(" AND flag={}", v.clamp(-1, 1)));
-        }
-        if let Some(s) = r.get("label").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                sql.push_str(" AND label=?");
-                args.push(Box::new(s.to_string()));
-            }
-        }
         for (key, col) in [("camera_contains", "camera"), ("lens_contains", "lens"), ("name_contains", "name")] {
             if let Some(s) = r.get(key).and_then(|v| v.as_str()) {
                 if !s.is_empty() {
@@ -596,15 +583,6 @@ impl Catalog {
                     args.push(Box::new(format!("%{s}%")));
                 }
             }
-        }
-        if let Some(s) = r.get("keyword").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                sql.push_str(" AND keywords LIKE ?");
-                args.push(Box::new(format!("%\"{s}\"%")));
-            }
-        }
-        if r.get("edited").and_then(|v| v.as_bool()).unwrap_or(false) {
-            sql.push_str(" AND (rating!=0 OR label!='' OR flag!=0 OR keywords!='[]')");
         }
         sql.push_str(" ORDER BY name");
         let mut st = self.db.prepare(&sql)?;
@@ -635,7 +613,42 @@ impl Catalog {
                 lens: r.get(18)?,
             })
         })?;
-        Ok(rows.flatten().collect())
+        let mut entries: Vec<AssetEntry> = rows.flatten().collect();
+        expand_variants(&mut entries);
+        let rating_min = r.get("rating_min").and_then(|v| v.as_i64()).unwrap_or(0);
+        let rating_eq = r.get("rating_eq").and_then(|v| v.as_i64());
+        let flag_eq = r.get("flag").and_then(|v| v.as_i64());
+        let label_eq = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        let keyword = r.get("keyword").and_then(|v| v.as_str()).unwrap_or("");
+        let edited = r.get("edited").and_then(|v| v.as_bool()).unwrap_or(false);
+        entries.retain(|e| {
+            if rating_min > 0 && (e.rating as i64) < rating_min {
+                return false;
+            }
+            if let Some(v) = rating_eq {
+                if e.rating as i64 != v {
+                    return false;
+                }
+            }
+            if let Some(v) = flag_eq {
+                if e.flag as i64 != v {
+                    return false;
+                }
+            }
+            if !label_eq.is_empty() && e.label != label_eq {
+                return false;
+            }
+            if !keyword.is_empty() && !e.keywords.iter().any(|k| k == keyword) {
+                return false;
+            }
+            if edited && e.rating == 0 && e.label.is_empty() && e.flag == 0
+                && e.keywords.is_empty()
+            {
+                return false;
+            }
+            true
+        });
+        Ok(entries)
     }
 }
 

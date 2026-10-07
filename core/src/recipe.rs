@@ -164,6 +164,12 @@ pub struct Recipe {
     pub key_v: f32,
     /// keystone correction: horizontal trapezoid warp -0.4..0.4
     pub key_h: f32,
+    /// lens profile correction amount 0..1. Defaults to 1 — profile
+    /// corrections on by default like Lightroom/darktable. When a lensfun
+    /// profile matches the file's EXIF lens this corrects geometric
+    /// distortion, lateral CA and vignetting at that strength.
+    #[serde(default = "default_one")]
+    pub lens_corr: f32,
 }
 
 /// parametric spatial mask + local adjustment (DaVinci power window).
@@ -290,6 +296,7 @@ impl Default for Recipe {
             lut_amount: 1.0,
             key_v: 0.0,
             key_h: 0.0,
+            lens_corr: 1.0,
         }
     }
 }

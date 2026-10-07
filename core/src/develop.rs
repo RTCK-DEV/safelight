@@ -1479,6 +1479,162 @@ fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32;
     out
 }
 
+// ---- lens profile correction (lensfun DB) ---------------------------------
+// distortion: given display radius ru (lens-normalised), find the recorded
+// radius rd such that f(rd) = ru, by Newton iteration. lensfun defines the
+// polynomial as distorted→undistorted, so rendering needs the inverse.
+
+fn lens_f(model: u32, abc: [f32; 3], rd: f32) -> f32 {
+    if model == 1 {
+        let (a, b, c) = (abc[0], abc[1], abc[2]);
+        rd * (a * rd * rd * rd + b * rd * rd + c * rd + (1.0 - a - b - c))
+    } else {
+        rd * (1.0 + abc[0] * rd * rd)
+    }
+}
+fn lens_fp(model: u32, abc: [f32; 3], rd: f32) -> f32 {
+    if model == 1 {
+        let (a, b, c) = (abc[0], abc[1], abc[2]);
+        4.0 * a * rd * rd * rd + 3.0 * b * rd * rd + 2.0 * c * rd + (1.0 - a - b - c)
+    } else {
+        1.0 + 3.0 * abc[0] * rd * rd
+    }
+}
+fn inv_dist(model: u32, abc: [f32; 3], ru: f32) -> f32 {
+    if model == 0 || ru <= 0.0 {
+        return ru;
+    }
+    let mut rd = ru;
+    for _ in 0..5 {
+        let f = lens_f(model, abc, rd) - ru;
+        let fp = lens_fp(model, abc, rd).max(1e-4);
+        rd -= f / fp;
+        if rd < 0.0 {
+            rd = ru * 0.5;
+        }
+    }
+    rd
+}
+/// TCA poly2 scale: ru = rd * (v + b rd^2) — inverse via the same solver.
+fn inv_tca(v: f32, b: f32, ru: f32) -> f32 {
+    if ru <= 0.0 || (v - 1.0).abs() < 1e-6 && b.abs() < 1e-6 {
+        return ru;
+    }
+    let mut rd = ru;
+    for _ in 0..5 {
+        let f = rd * (v + b * rd * rd) - ru;
+        let fp = (v + 3.0 * b * rd * rd).max(1e-4);
+        rd -= f / fp;
+        if rd < 0.0 {
+            rd = ru * 0.5;
+        }
+    }
+    rd
+}
+
+/// geometric remap + vignette compensation for the cam-space plane.
+/// Returns (corrected plane, per-pixel gain). Bilinear per channel —
+/// lateral CA gives R and B their own source radii.
+pub fn correct_plane(
+    plane: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    c: &crate::lensdb::Correction,
+    amount: f32,
+) -> Vec<[f32; 3]> {
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let halfd = (cx * cx + cy * cy).sqrt().max(1.0);
+    let mut out = vec![[0.0f32; 3]; w * h];
+    let vig_on = c.vig != [0.0; 3];
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let rn = (dx * dx + dy * dy).sqrt() / halfd;
+            let i = y * w + x;
+            if rn < 1e-6 {
+                out[i] = plane[i];
+                continue;
+            }
+            let (ux, uy) = (dx / (rn * halfd), dy / (rn * halfd));
+            let ru = rn * c.scale; // lens-normalised display radius
+            let rd = inv_dist(c.model, c.abc, ru);
+            let mut px = [0.0f32; 3];
+            for ch in 0..3usize {
+                let (v, b) = match ch {
+                    0 => (c.tca[0], c.tca[1]),
+                    1 => (1.0, 0.0),
+                    _ => (c.tca[2], c.tca[3]),
+                };
+                let rd_ch = inv_tca(v, b, rd) / c.scale;
+                // blend corrected position with identity by amount
+                let r_px = (rd_ch + (rn - rd_ch) * (1.0 - amount)) * halfd;
+                let (sx, sy) = (cx + ux * r_px, cy + uy * r_px);
+                px[ch] = bilinear3(plane, w, h, sx, sy, ch);
+            }
+            if vig_on {
+                let att = (1.0 + c.vig[0] * ru * ru + c.vig[1] * ru * ru * ru * ru
+                    + c.vig[2] * ru * ru * ru * ru * ru * ru)
+                    .max(0.05);
+                let g = 1.0 + (1.0 / att - 1.0) * amount;
+                for ch in px.iter_mut() {
+                    *ch *= g;
+                }
+            }
+            out[i] = px;
+        }
+    }
+    out
+}
+
+/// map an output pixel to its source position + vignette gain
+/// (single-channel green path — preview quality is fine without TCA)
+pub fn lens_map(
+    c: &crate::lensdb::Correction,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    amount: f32,
+) -> (f32, f32, f32) {
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let halfd = (cx * cx + cy * cy).sqrt().max(1.0);
+    let dx = x as f32 - cx;
+    let dy = y as f32 - cy;
+    let rn = (dx * dx + dy * dy).sqrt() / halfd;
+    if rn < 1e-6 {
+        return (x as f32, y as f32, 1.0);
+    }
+    let ru = rn * c.scale;
+    let rd = inv_dist(c.model, c.abc, ru) / c.scale;
+    let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
+    let g = if c.vig != [0.0; 3] {
+        let att = (1.0 + c.vig[0] * ru * ru + c.vig[1] * ru * ru * ru * ru
+            + c.vig[2] * ru * ru * ru * ru * ru * ru)
+            .max(0.05);
+        1.0 + (1.0 / att - 1.0) * amount
+    } else {
+        1.0
+    };
+    // src = centre + unit_direction * corrected_radius
+    let s = r_px / (rn * halfd);
+    (cx + dx * s, cy + dy * s, g)
+}
+
+fn bilinear3(plane: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize) -> f32 {
+    let x0 = sx.floor().clamp(0.0, (w - 1) as f32) as usize;
+    let y0 = sy.floor().clamp(0.0, (h - 1) as f32) as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let tx = (sx - x0 as f32).clamp(0.0, 1.0);
+    let ty = (sy - y0 as f32).clamp(0.0, 1.0);
+    let a = plane[y0 * w + x0][ch] + tx * (plane[y0 * w + x1][ch] - plane[y0 * w + x0][ch]);
+    let b = plane[y1 * w + x0][ch] + tx * (plane[y1 * w + x1][ch] - plane[y1 * w + x0][ch]);
+    a + ty * (b - a)
+}
+
 /// generic same-colour-mean demosaic (works for bayer & xtrans).
 /// Each virtual pixel covers a `stride`x`stride` block of sensor pixels at
 /// (left + vx*stride, top + vy*stride). The CFA phase is computed on raw
@@ -1632,13 +1788,51 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
     } else {
         None
     };
+    // lens profile correction remaps the cam plane. Full-res remaps the
+    // demosaiced plane with bilinear per-channel sampling (TCA); previews
+    // remap the virtual sampling position instead, so the distortion is
+    // visible without paying for a second full-res plane.
+    let corr = if r.lens_corr > 0.001 {
+        crate::lensdb::db().and_then(|d| {
+            let c = d.correction(
+                &m.info.lens, &m.info.make, &m.info.model,
+                m.info.focal, m.info.aperture,
+            );
+            if c.is_empty() { None } else { Some(c) }
+        })
+    } else {
+        None
+    };
+    let plane = match (plane, &corr) {
+        (Some(pl), Some(c)) => {
+            Some(correct_plane(&pl, vw, vh, c, r.lens_corr.min(1.0)))
+        }
+        (pl, _) => pl,
+    };
 
     let mut lin = vec![[0.0f32; 3]; vw * vh];
     for vy in 0..vh {
         for vx in 0..vw {
             let cam = match &plane {
                 Some(pl) => pl[vy * vw + vx],
-                None => demosaic_pixel(m, vx, vy, stride, &norm),
+                None => match &corr {
+                    Some(c) => {
+                        let (sx, sy, g) =
+                            lens_map(c, vx, vy, vw, vh, r.lens_corr.min(1.0));
+                        let mut cc = demosaic_pixel(
+                            m,
+                            (sx.round() as usize).min(vw - 1),
+                            (sy.round() as usize).min(vh - 1),
+                            stride,
+                            &norm,
+                        );
+                        for v in cc.iter_mut() {
+                            *v *= g;
+                        }
+                        cc
+                    }
+                    None => demosaic_pixel(m, vx, vy, stride, &norm),
+                },
             };
             // WB in camera space, clip at sensor white -> neutral highlights
             let cw = [

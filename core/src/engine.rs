@@ -223,6 +223,14 @@ impl Engine {
                 v["rgb_cam"] = json!(m.rgb_cam);
                 v["cam_xyz"] = json!(m.cam_xyz);
                 v["pre_mul"] = json!(m.pre_mul);
+                // matched lensfun profile name, when one exists
+                v["lens_profile"] = match crate::lensdb::match_name(
+                    &m.info.lens, &m.info.make, &m.info.model,
+                    m.info.focal, m.info.aperture,
+                ) {
+                    Some(n) => json!(n),
+                    None => json!(null),
+                };
             }
             Decoded::Raster { w, h, .. } => {
                 v["width"] = json!(w);

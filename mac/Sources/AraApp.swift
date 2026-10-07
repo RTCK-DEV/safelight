@@ -89,7 +89,7 @@ final class LibraryStore: ObservableObject {
     }
 
     private func scopePhotos() -> [Photo] {
-        if scope == "folder" || folder == nil { return photos }
+        if scope == "folder" { return photos }
         if scope == "all" {
             // masters from every folder the catalog has seen
             var all = photos
@@ -342,6 +342,9 @@ final class LibraryStore: ObservableObject {
         Task.detached { [weak self] in
             let photos = await AraEngine.shared.work { $0.scan(folder: url.path) }
             await MainActor.run {
+                // a stale scan finishing after the user opened another
+                // folder must not overwrite the newer folder's list
+                guard self?.folder == url else { return }
                 self?.photos = photos
                 self?.scanning = false
                 self?.reloadCollections()
