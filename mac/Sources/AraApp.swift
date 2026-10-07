@@ -54,6 +54,12 @@ final class LibraryStore: ObservableObject {
     /// Same idea for grade-version lists (they live in the sidecar file).
     var unsavedVersions: [String: [GradeVersion]] = [:]
 
+    init() {
+        // collections + known folders exist independent of any open folder —
+        // load them at launch so the sidebar is populated immediately
+        reloadCollections()
+    }
+
     /// distinct camera/lens names seen in the current folder (filter menus)
     var cameras: [String] { Array(Set(photos.map(\.camera).filter { !$0.isEmpty })).sorted() }
     var lenses: [String] { Array(Set(photos.map(\.lens).filter { !$0.isEmpty })).sorted() }

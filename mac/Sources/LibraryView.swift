@@ -18,7 +18,7 @@ struct LibraryView: View {
                         ProgressView("Scanning…")
                             .tint(Ara.accent)
                             .foregroundStyle(Ara.text2)
-                    } else if store.photos.isEmpty {
+                    } else if store.filtered.isEmpty {
                         emptyState
                     } else if store.surveying {
                         SurveyView()
@@ -99,25 +99,34 @@ struct LibraryView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            List(selection: $store.scope) {
-                Section("Library") {
-                    Label("Current Folder", systemImage: "folder")
-                        .tag("folder")
-                    Label("All Photos", systemImage: "photo.stack")
-                        .tag("all")
+            // hand-rolled rows — SwiftUI List(selection:) rows stop being
+            // clickable once context menus/badges attach, so scope +
+            // highlight are managed directly (same look, no List quirks).
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    sectionHeader("Library")
+                    sideRow("folder", "Current Folder", "folder")
+                    sideRow("photo.stack", "All Photos", "all")
                     ForEach(store.knownFolders, id: \.self) { f in
-                        Label(URL(fileURLWithPath: f).lastPathComponent,
-                              systemImage: "externaldrive")
-                            .tag("folder:" + f)
-                            .foregroundStyle(Ara.text2)
+                        sideRow("externaldrive",
+                                URL(fileURLWithPath: f).lastPathComponent,
+                                "folder:" + f, dim: true)
                     }
-                }
-                Section("Collections") {
+
+                    sectionHeader("Collections")
                     ForEach(store.collections) { c in
-                        Label(c.name,
-                              systemImage: c.smart == 1 ? "sparkle.magnifyingglass" : "tray.full")
-                            .tag(String(c.id))
-                            .badge(c.count)
+                        sideRow(c.smart == 1 ? "sparkle.magnifyingglass" : "tray.full",
+                                c.name, String(c.id), badge: c.count)
+                            .contextMenu {
+                                Button("Rename…") { renameCollection(c) }
+                                if c.smart == 1 {
+                                    Button("Edit Rules…") { editSmart(c) }
+                                }
+                                Divider()
+                                Button("Delete", role: .destructive) {
+                                    store.deleteCollection(c)
+                                }
+                            }
                     }
                     HStack(spacing: 8) {
                         Button { showNewCollection = true } label: {
@@ -130,32 +139,58 @@ struct LibraryView: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(Ara.accent)
                     .font(.system(size: 11))
+                    .padding(.top, 4)
                 }
-            }
-            .listStyle(.sidebar)
-            // per-row .contextMenu on a selectable List eats primary clicks
-            // (SwiftUI quirk) — use the list-level selection context menu.
-            .contextMenu(forSelectionType: String.self) { sel in
-                if let s = sel.first, let cid = Int64(s),
-                   let c = store.collections.first(where: { $0.id == cid }) {
-                    Button("Rename…") { renameCollection(c) }
-                    if c.smart == 1 {
-                        Button("Edit Rules…") { editSmart(c) }
-                    }
-                    Divider()
-                    Button("Delete", role: .destructive) { store.deleteCollection(c) }
-                }
-            }
-            .onChange(of: store.scope) { _, s in
-                // "folder:<path>" rows switch the scanned folder itself
-                if s.hasPrefix("folder:") {
-                    store.open(URL(fileURLWithPath: String(s.dropFirst(7))))
-                }
+                .padding(.horizontal, 6)
+                .padding(.top, 4)
             }
 
             if let p = store.active {
                 Divider().background(Ara.hairline)
                 InfoCard(photo: p)
+            }
+        }
+    }
+
+    private func sectionHeader(_ t: String) -> some View {
+        Text(t.uppercased())
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(Ara.text3)
+            .padding(.horizontal, 8)
+            .padding(.top, 10)
+            .padding(.bottom, 3)
+    }
+
+    private func sideRow(_ icon: String, _ title: String, _ tag: String,
+                         badge: Int = 0, dim: Bool = false) -> some View {
+        let active = store.scope == tag
+        return HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 10))
+                .frame(width: 15)
+                .foregroundStyle(active ? Ara.accent : (dim ? Ara.text3 : Ara.text2))
+            Text(title)
+                .font(.system(size: 11, weight: active ? .semibold : .regular))
+                .foregroundStyle(active ? Ara.text1 : (dim ? Ara.text3 : Ara.text2))
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            if badge > 0 {
+                Text("\(badge)")
+                    .font(.system(size: 9, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(active ? Ara.accent : Ara.bg4)
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(active ? Ara.accent.opacity(0.14) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            store.scope = tag
+            if tag.hasPrefix("folder:") {
+                store.open(URL(fileURLWithPath: String(tag.dropFirst(7))))
             }
         }
     }
@@ -228,15 +263,18 @@ struct LibraryView: View {
         VStack(spacing: 14) {
             ZStack {
                 Circle().fill(Ara.bg3).frame(width: 72, height: 72)
-                Image(systemName: "photo.on.rectangle.angled")
+                Image(systemName: scopeIsCollection ? "tray" : "photo.on.rectangle.angled")
                     .font(.system(size: 28))
                     .foregroundStyle(Ara.accent)
             }
-            Text("Open a folder of RAW files")
+            Text(scopeIsCollection ? "No photos match"
+                 : (store.folder == nil ? "Open a folder of RAW files" : "No photos match the filters"))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Ara.text2)
-            Button("Open Folder…") { store.pickFolder() }
-                .buttonStyle(AraPrimaryButton())
+            if !scopeIsCollection {
+                Button("Open Folder…") { store.pickFolder() }
+                    .buttonStyle(AraPrimaryButton())
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
