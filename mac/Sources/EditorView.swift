@@ -1248,10 +1248,18 @@ struct EditorView: View {
                     ToolChip(label: "Grad", icon: "plus.rectangle", active: retouchMode == "grad") {
                         retouchMode = retouchMode == "grad" ? "off" : "grad"
                     }
+                    ToolChip(label: "Lum", icon: "circle.lefthalf.filled") {
+                        var w = PowerWindow()
+                        w.kind = "lum"
+                        w.p = [0.0, 0.6, 0.1, 0.1, 0, 0]
+                        recipe.windows.append(w)
+                        selWindow = w.id
+                    }
+                    .help("Luminance-range mask: selects a band of the image by brightness")
                 }
             }) {
                 if recipe.windows.isEmpty {
-                    Text("Add a circle or gradient window, then tap or drag on the image. " +
+                    Text("Add a circle, gradient, or luminance window, then tap or drag on the image. " +
                          "Select a window row, then drag on the image to move it.")
                         .font(.system(size: 10)).foregroundStyle(Ara.text3)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2768,7 +2776,9 @@ extension EditorView {
             let col: Color = sel ? Ara.accent : .cyan
             let alpha: Double = w.enabled ? (sel ? 1.0 : 0.85) : 0.25
             let lw: CGFloat = sel ? 2.5 : 1.5
-            if w.kind == "gradient" {
+            if w.kind == "lum" {
+                // luminance-range window has no geometry to draw
+            } else if w.kind == "gradient" {
                 var ln = Path()
                 ln.move(to: .init(x: rect.minX + w.p[0] * rect.width, y: rect.minY + w.p[1] * rect.height))
                 ln.addLine(to: .init(x: rect.minX + w.p[2] * rect.width, y: rect.minY + w.p[3] * rect.height))
@@ -2901,10 +2911,11 @@ struct WindowRow: View {
     var body: some View {
         VStack(spacing: 5) {
             HStack {
-                Image(systemName: w.kind == "gradient" ? "rectangle.lefthalf.filled" : "circle")
+                Image(systemName: w.kind == "gradient" ? "rectangle.lefthalf.filled"
+                        : w.kind == "lum" ? "circle.lefthalf.filled" : "circle")
                     .font(.system(size: 9))
                     .foregroundStyle(selected ? Ara.accent : .cyan)
-                Text(w.kind == "gradient" ? "Gradient" : "Circle")
+                Text(w.kind == "gradient" ? "Gradient" : w.kind == "lum" ? "Lum Range" : "Circle")
                     .font(.system(size: 10.5, weight: .medium)).foregroundStyle(Ara.text1)
                 Spacer()
                 // on/off eye (DaVinci per-window visibility)
@@ -2927,12 +2938,26 @@ struct WindowRow: View {
             SliderRow("Sat", $w.sat, -1...1)
             SliderRow("Temp", $w.temp, -1...1)
             SliderRow("Opacity", $w.opacity, 0...1, reset: 1)
-            if w.kind == "circle" {
-                SliderRow("Size", $w.p[2], 0.02...0.6, reset: 0.15)
-                SliderRow("Ratio", $w.p[3], 0.02...0.6, reset: 0.15)
-                SliderRow("Rot", $w.p[4], -90...90)
+            if w.kind == "lum" {
+                SliderRow("Lo", $w.p[0], 0...1)
+                SliderRow("Hi", $w.p[1], 0...1, reset: 0.6)
+                SliderRow("Lo Feather", $w.p[2], 0.01...0.4, reset: 0.1)
+                SliderRow("Hi Feather", $w.p[3], 0.01...0.4, reset: 0.1)
+            } else {
+                if w.kind == "circle" {
+                    SliderRow("Size", $w.p[2], 0.02...0.6, reset: 0.15)
+                    SliderRow("Ratio", $w.p[3], 0.02...0.6, reset: 0.15)
+                    SliderRow("Rot", $w.p[4], -90...90)
+                }
+                SliderRow("Soft", $w.p[5], 0.02...1, reset: 0.4)
             }
-            SliderRow("Soft", $w.p[5], 0.02...1, reset: 0.4)
+            HStack(spacing: 6) {
+                Text("Link Q").font(.system(size: 9.5)).foregroundStyle(Ara.text2)
+                Toggle("", isOn: $w.linkQ).labelsHidden().controlSize(.mini).tint(Ara.accent)
+                Text("gate by Qualifier matte")
+                    .font(.system(size: 9)).foregroundStyle(Ara.text3)
+                Spacer()
+            }
         }
         .padding(8)
         .background(selected ? Ara.accentSoft.opacity(0.5) : Ara.bg3)

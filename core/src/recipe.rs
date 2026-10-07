@@ -168,7 +168,8 @@ pub struct Recipe {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PowerWindow {
-    /// "circle" (p=[cx,cy,rx,ry,rot_deg,soft]) or "gradient" (p=[x1,y1,x2,y2,soft,0])
+    /// "circle" (p=[cx,cy,rx,ry,rot_deg,soft]), "gradient" (p=[x1,y1,x2,y2,soft,0])
+    /// or "lum" luminance range (p=[lo,hi,lo_feather,hi_feather,0,0])
     pub kind: String,
     pub p: [f32; 6],
     pub ev: f32,             // exposure offset in EV, -4..4
@@ -181,6 +182,9 @@ pub struct PowerWindow {
     /// adjustment strength 0..1 (DaVinci window opacity)
     #[serde(default = "default_one")]
     pub opacity: f32,
+    /// gate this window's mask by the HSL qualifier matte (intersect)
+    #[serde(default)]
+    pub link_q: bool,
 }
 
 fn default_true() -> bool {
@@ -198,6 +202,7 @@ impl Default for PowerWindow {
             ev: 0.0,
             sat: 0.0,
             temp: 0.0,
+            link_q: false,
             invert: false,
             enabled: true,
             opacity: 1.0,

@@ -107,6 +107,11 @@ pub struct Params {
     /// keystone trapezoid warps -0.4..0.4
     pub key_v: f32,
     pub key_h: f32,
+    /// EV-domain tone LUT (512 entries over linear y in 0..1.6): folds
+    /// shadows/highlights/whites/blacks + rolloff into one luminance-preserving
+    /// curve with an extended-Reinhard shoulder and soft-knee toe.
+    pub tone_lut: [f32; 512],
+    pub has_tone: bool,
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -263,6 +268,13 @@ fn curve_lut(points: &[[f32; 2]], default: impl Fn(f32) -> f32, maxy: f32) -> Ve
 fn lut_at(lut: &[f32], x: f32) -> f32 {
     let idx = (x.clamp(0.0, 1.0) * 255.0) as usize;
     lut[idx.min(255)]
+}
+
+/// linear-interpolated 512-entry tone LUT — mirrors gpu.rs `tone_at`
+fn tone_lut_at(lut: &[f32; 512], x: f32) -> f32 {
+    let f = x.clamp(0.0, 1.0) * 511.0;
+    let i0 = (f as usize).min(510);
+    lut[i0] + (lut[i0 + 1] - lut[i0]) * (f - i0 as f32)
 }
 
 /// rgb -> (hue 0..1, sat, v=max) — mirrored in the WGSL adjust
@@ -536,12 +548,16 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 w.p[3] / sh,
             )
         };
+        let lum = w.kind == "lum";
         wins[i] = [
-            (if grad { 1.0 } else { 0.0 }) + (if w.invert { 2.0 } else { 0.0 }),
-            p0,
-            p1,
-            p2,
-            p3,
+            (if grad { 1.0 } else { 0.0 })
+                + (if w.invert { 2.0 } else { 0.0 })
+                + (if lum { 4.0 } else { 0.0 })
+                + (if w.link_q { 8.0 } else { 0.0 }),
+            if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
+            if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
+            if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
+            if lum { w.p[3].clamp(0.0, 1.0) } else { p3 },
             w.p[4],
             w.p[5],
             w.ev.clamp(-4.0, 4.0),
@@ -698,9 +714,78 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         lut_amt: r.lut_amount.clamp(0.0, 1.0),
         key_v: r.key_v.clamp(-0.4, 0.4),
         key_h: r.key_h.clamp(-0.4, 0.4),
+        tone_lut: build_tone_lut(r),
+        has_tone: r.shadows != 0.0
+            || r.highlights != 0.0
+            || r.whites != 0.0
+            || r.blacks != 0.0
+            || r.highlight_rolloff != 1.0
+            || r.shadow_rolloff != 1.0,
     };
     apply_look(&mut p, &r.look);
     p
+}
+
+/// EV-domain tone curve: extended-Reinhard shoulder (white point from Whites,
+/// extra compression from Highlights and highlight_rolloff) plus a toe shaped
+/// by Blacks (soft-knee crush or fade lift), Shadows lift and shadow_rolloff.
+/// 512 samples over linear luma 0..1.6, monotone.
+fn build_tone_lut(r: &Recipe) -> [f32; 512] {
+    let sh = r.shadows;
+    let hl = r.highlights;
+    let mut wl = (1.0 + r.whites * 1.4).clamp(0.35, 3.0);
+    // highlight_rolloff > 1 compresses harder (smaller white point)
+    if r.highlight_rolloff > 1.0 {
+        wl /= 1.0 + 0.8 * (r.highlight_rolloff - 1.0);
+    }
+    let wl2 = wl * wl;
+    // scale so the shoulder maps y=1 to ~1
+    let norm = 1.0 * (1.0 + 1.0 / wl2) / 2.0;
+    let b = r.blacks;
+    let shr = r.shadow_rolloff;
+    let lut: Vec<f32> = (0..512)
+        .map(|i| {
+            let y0 = 1.6 * i as f32 / 511.0;
+            let mut y = y0;
+            // shadows lift (low band gain, linear domain)
+            if sh != 0.0 {
+                y += sh * 0.22 * (1.0 - sstep(0.0, 0.5, y0)) * (1.0 - y0 / 1.6).max(0.0);
+            }
+            // shadow rolloff shaping
+            if shr != 1.0 {
+                let w = 1.0 - sstep(0.0, 0.35, y0);
+                y *= 1.0 + (1.0 - shr) * 0.35 * w;
+                y *= 1.0 - (shr - 1.0).max(0.0) * 0.25 * w;
+            }
+            // blacks: >0 fades (lift toe), <0 crushes with a soft knee
+            if b > 0.0 {
+                let k = b * 0.10;
+                y = k + (1.0 - k) * y;
+            } else if b < 0.0 {
+                let k = -b * 0.05;
+                let e = 0.004f32;
+                let soft = |v: f32| ((v - k) + ((v - k) * (v - k) + e * e).sqrt()) * 0.5;
+                y = (soft(y) - soft(0.0)) / (soft(1.0) - soft(0.0));
+            }
+            // extended-Reinhard shoulder
+            y = y * (1.0 + y / wl2) / (1.0 + y);
+            y /= norm;
+            // highlights recovery: extra compression in the upper band
+            if hl != 0.0 {
+                y /= 1.0 + hl * 0.9 * sstep(0.45, 1.2, y);
+            }
+            y.clamp(0.0, 1.0)
+        })
+        .collect();
+    let mut out = [0.0f32; 512];
+    out.copy_from_slice(&lut);
+    // enforce monotonicity
+    for i in 1..512 {
+        if out[i] < out[i - 1] {
+            out[i] = out[i - 1];
+        }
+    }
+    out
 }
 
 /// smoothstep(edge0, edge1, x) helper
@@ -771,46 +856,23 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     for c in 0..3 {
         x[c] += p.offset[c];
     }
-    // blacks / whites remap
-    for c in &mut x {
-        if p.blacks > 0.0 {
-            *c += p.blacks * 0.15 * (1.0 - *c);
-        } else {
-            *c *= 1.0 + p.blacks * 0.20;
+    // EV-domain tone map (luminance-preserving): folds shadows/highlights/
+    // whites/blacks + rolloff into one curve — hue stays put, highlights
+    // roll off on an extended-Reinhard shoulder instead of clipping
+    if p.has_tone {
+        let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
+        // clamp the evaluation luma so the y/l gain is bounded (~<=6x for
+        // extreme lifts) — below ~0.04 the LUT is affine anyway, and an
+        // unbounded gain would amplify the noise floor by 100x+
+        let le = l.max(0.04);
+        let g = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+        for c in &mut x {
+            *c *= g;
         }
-        *c *= 1.0 + p.whites * 0.20;
     }
     // contrast around adjustable pivot
     for c in &mut x {
         *c = (*c - p.pivot) * (1.0 + p.contrast * 0.9) + p.pivot;
-    }
-    // shadows lift / highlights recovery in upper/lower bands
-    for c in &mut x {
-        if p.shadows != 0.0 {
-            let w = (1.0 - sstep(0.0, 0.45, *c)) * sstep(0.0, 0.06, *c);
-            *c += p.shadows * w * 0.30;
-        }
-        if p.highlights != 0.0 {
-            let w = sstep(0.45, 1.2, *c);
-            *c += -p.highlights * w * 0.5 * *c;
-        }
-    }
-    // highlight/shadow rolloff shaping (camera-raw style)
-    if p.hl_roll != 1.0 {
-        for c in &mut x {
-            if p.hl_roll > 1.0 {
-                *c = *c / (1.0 + (p.hl_roll - 1.0) * sstep(0.8, 1.6, *c));
-            } else {
-                *c *= 1.0 + (1.0 - p.hl_roll) * 0.5 * sstep(0.8, 1.6, *c);
-            }
-        }
-    }
-    if p.sh_roll != 1.0 {
-        for c in &mut x {
-            let w = 1.0 - sstep(0.0, 0.35, *c);
-            *c *= 1.0 + (1.0 - p.sh_roll) * 0.4 * w;
-            *c *= 1.0 - (p.sh_roll - 1.0).max(0.0) * 0.3 * w;
-        }
     }
     // saturation / vibrance
     if p.saturation != 0.0 || p.vibrance != 0.0 {
@@ -909,25 +971,7 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     if p.has_qual || p.q_show {
         let (h, s, _v) = rgb_to_hsv(x);
         let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
-        // matte finesse "blur" ≈ dilate soft edges on every channel
-        let qb = p.q_blur * 0.25;
-        let mh = 1.0 - sstep(p.qh[1], p.qh[1] + (p.qh[2] + qb).max(1e-4), hue_dist(h, p.qh[0]));
-        let qs2 = p.qs[2] + qb;
-        let ms = sstep(p.qs[0] - qs2, p.qs[0] + qs2, s)
-            * (1.0 - sstep(p.qs[1] - qs2, p.qs[1] + qs2, s));
-        let ql2 = p.ql[2] + qb;
-        let ml = sstep(p.ql[0] - ql2, p.ql[0] + ql2, l)
-            * (1.0 - sstep(p.ql[1] - ql2, p.ql[1] + ql2, l));
-        let mut mask = mh * ms * ml;
-        // clean black/white: remap the matte to push mid-tones to 0/1
-        let cb = p.q_clean[0];
-        let cw = p.q_clean[1];
-        if cb > 0.0 || cw < 1.0 {
-            mask = ((mask - cb) / (cw - cb).max(1e-4)).clamp(0.0, 1.0);
-        }
-        if p.q_invert {
-            mask = 1.0 - mask;
-        }
+        let mask = qual_mask(x, p);
         // highlight/isolate: desaturate everything outside the key
         if p.q_show {
             for c in 0..3 {
@@ -965,6 +1009,32 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         }
     }
     x
+}
+
+/// HSL qualifier matte for `x` (hue range / sat range / lum range, blur-dilated
+/// edges, black/white clean remap, invert). Shared by the qualifier block and
+/// power-window `link_q` gating. Same math lives in gpu.rs `qual_mask`.
+pub fn qual_mask(x: [f32; 3], p: &Params) -> f32 {
+    let (h, s, _v) = rgb_to_hsv(x);
+    let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+    let qb = p.q_blur * 0.25;
+    let mh = 1.0 - sstep(p.qh[1], p.qh[1] + (p.qh[2] + qb).max(1e-4), hue_dist(h, p.qh[0]));
+    let qs2 = p.qs[2] + qb;
+    let ms = sstep(p.qs[0] - qs2, p.qs[0] + qs2, s)
+        * (1.0 - sstep(p.qs[1] - qs2, p.qs[1] + qs2, s));
+    let ql2 = p.ql[2] + qb;
+    let ml = sstep(p.ql[0] - ql2, p.ql[0] + ql2, l)
+        * (1.0 - sstep(p.ql[1] - ql2, p.ql[1] + ql2, l));
+    let mut mask = mh * ms * ml;
+    let cb = p.q_clean[0];
+    let cw = p.q_clean[1];
+    if cb > 0.0 || cw < 1.0 {
+        mask = ((mask - cb) / (cw - cb).max(1e-4)).clamp(0.0, 1.0);
+    }
+    if p.q_invert {
+        mask = 1.0 - mask;
+    }
+    mask
 }
 
 /// generic same-colour-mean demosaic (works for bayer & xtrans).
@@ -1322,16 +1392,13 @@ fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: 
     };
     for s in spots.iter().take(n as usize) {
         let (sx, sy, r) = spot_to_src(*s, w, h, flip);
-        // ring mean just outside the spot
-        let mut ring = [0.0f32; 3];
-        let ring_r = r * 1.4;
-        for k in 0..8 {
-            let a = k as f32 * std::f32::consts::TAU / 8.0;
-            let v = sample(sx + ring_r * a.cos(), sy + ring_r * a.sin());
-            for c in 0..3 {
-                ring[c] += v[c] / 8.0;
-            }
-        }
+        // auto-select the source patch: candidate centres on two rings at
+        // 2.1r and 3.0r, scored by how well the annulus around the candidate
+        // matches the target's annulus (sqrt-domain RGB distance — same
+        // search as the gpu.rs heal_src pass)
+        let (ox, oy) = heal_find_source(&sample, sx, sy, r);
+        // frequency separation (LightCraft-style): healed = src + blur(target-src)
+        // so the donor's fine texture lands in the target's colour/tonal field
         let x0 = (sx - r).max(0.0) as i32;
         let x1 = (sx + r).min(w as f32 - 1.0) as i32;
         let y0 = (sy - r).max(0.0) as i32;
@@ -1340,16 +1407,75 @@ fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: 
             for x in x0..=x1 {
                 let d = ((x as f32 - sx).hypot(y as f32 - sy)) / r;
                 if d < 1.0 {
-                    // soft edge + slight texture preservation via neighbor noise
+                    // low-freq diff = mean of (target-src) over centre + 8 taps at r*0.5
+                    let mut acc = [0.0f32; 3];
+                    for k in 0..9 {
+                        let (tx, ty) = if k == 0 {
+                            (x as f32, y as f32)
+                        } else {
+                            let a = (k - 1) as f32 * std::f32::consts::TAU / 8.0;
+                            (x as f32 + r * 0.5 * a.cos(), y as f32 + r * 0.5 * a.sin())
+                        };
+                        let t = sample(tx, ty);
+                        let sv = sample(tx + ox, ty + oy);
+                        for c in 0..3 {
+                            acc[c] += (t[c] - sv[c]) / 9.0;
+                        }
+                    }
+                    let tms = acc;
+                    let sv = sample(x as f32 + ox, y as f32 + oy);
                     let blend = 1.0 - sstep(0.7, 1.0, d);
                     let i = y as usize * w + x as usize;
                     for c in 0..3 {
-                        lin[i][c] = lin[i][c] * (1.0 - blend) + ring[c] * blend;
+                        let healed = sv[c] + tms[c];
+                        lin[i][c] = lin[i][c] * (1.0 - blend) + healed * blend;
                     }
                 }
             }
         }
     }
+}
+
+/// pick the donor offset for one heal spot. `sample` is clamped nearest.
+/// Same candidate set + scoring as gpu.rs `heal_src` — keep in sync.
+fn heal_find_source(
+    sample: &dyn Fn(f32, f32) -> [f32; 3],
+    sx: f32,
+    sy: f32,
+    r: f32,
+) -> (f32, f32) {
+    let tau = std::f32::consts::TAU;
+    // target annulus: 8 taps just outside the spot edge
+    let mut targ = [[0.0f32; 3]; 8];
+    for (k, t) in targ.iter_mut().enumerate() {
+        let a = k as f32 * tau / 8.0;
+        *t = sample(sx + r * 1.15 * a.cos(), sy + r * 1.15 * a.sin());
+    }
+    let mut best = (0.0f32, 0.0f32);
+    let mut best_score = f32::MAX;
+    // candidate offsets: 16 on ring 2.1r, 8 on ring 3.0r
+    for k in 0..24 {
+        let (a, dist) = if k < 16 {
+            (k as f32 * tau / 16.0, r * 2.1)
+        } else {
+            ((k - 16) as f32 * tau / 8.0 + tau / 32.0, r * 3.0)
+        };
+        let ox = a.cos() * dist;
+        let oy = a.sin() * dist;
+        let mut score = 0.0f32;
+        for (kk, t) in targ.iter().enumerate() {
+            let aa = kk as f32 * tau / 8.0;
+            let sv = sample(sx + ox + r * 1.15 * aa.cos(), sy + oy + r * 1.15 * aa.sin());
+            for c in 0..3 {
+                score += (t[c].max(0.0).sqrt() - sv[c].max(0.0).sqrt()).abs();
+            }
+        }
+        if score < best_score {
+            best_score = score;
+            best = (ox, oy);
+        }
+    }
+    best
 }
 
 /// shared tail: spatial ops -> straighten/flip/crop/fit-resize -> adjust ->
@@ -1364,9 +1490,11 @@ fn finish_linear(
 ) -> RgbaImage {
     heal_lin(&mut lin, w, h, &p.spots, p.n_spots, flip);
     clone_lin(&mut lin, w, h, &p.clones, p.n_clones, flip);
-    let nr = p.noise_luma.max(p.noise_chroma);
-    if nr > 0.0 {
-        lin = chroma_smooth(&lin, w, h, nr);
+    if p.noise_luma > 0.0 {
+        lin = guided_nr_lum(&lin, w, h, p.noise_luma);
+    }
+    if p.noise_chroma > 0.0 {
+        lin = chroma_smooth(&lin, w, h, p.noise_chroma);
     }
     if p.beauty > 0.0 || p.deband > 0.0 {
         lin = beauty_deband(&lin, w, h, p.beauty, p.deband);
@@ -1431,7 +1559,11 @@ fn finish_linear(
             }
             // power windows: local ev/sat/temp inside the mask
             for win in p.wins.iter().take(p.n_wins as usize) {
-                let mask = window_mask(win, nx, ny) * win[10];
+                let mut mask = window_mask(win, nx, ny, col) * win[10];
+                // link_q: gate the window by the HSL qualifier matte
+                if (win[0] as i32) & 8 != 0 {
+                    mask *= qual_mask(col, p);
+                }
                 if mask <= 0.001 {
                     continue;
                 }
@@ -1491,11 +1623,21 @@ fn finish_linear(
 }
 
 /// power-window mask value at dst-normalized (nx,ny)
-/// packed [kind(+2=invert), a,b,c,d, rot, soft, ev, sat, temp, strength]
-fn window_mask(w: &[f32], nx: f32, ny: f32) -> f32 {
-    let kind = w[0] as i32 % 2;
-    let inv = w[0] >= 2.0;
-    let mask = if kind == 1 {
+/// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q, a,b,c,d, rot, soft, ev, sat, temp, strength]
+/// `col` = the sampled pre-adjust colour (lum range + qualifier gating need it)
+fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3]) -> f32 {
+    let base = w[0] as i32;
+    let kind = base % 2;
+    let inv = base & 2 != 0;
+    let lum = base & 4 != 0;
+    let mask = if lum {
+        // luminance range: p=[lo,hi,lo_feather,hi_feather] over display luma
+        let l = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+        let (lo, hi) = (w[1], w[2]);
+        let lf = w[3].max(0.005);
+        let hf = w[4].max(0.005);
+        sstep(lo - lf, lo + lf, l) * (1.0 - sstep(hi - hf, hi + hf, l))
+    } else if kind == 1 {
         // gradient: [x1,y1,x2,y2,*,soft] — full cover before the p1..p2 span
         let (ax, ay, bx, by) = (w[1], w[2], w[3], w[4]);
         let soft = w[6].max(0.02);
@@ -1725,6 +1867,49 @@ fn box3(chan: &[f32], w: usize, h: usize, x: usize, y: usize) -> f32 {
 }
 
 /// simple chroma smoothing (colour NR): blur R-B residuals only.
+/// guided-filter luma NR (single-pass "guided-lite"): q = mean + a·(l−mean)
+/// with a = var/(var+eps) — flat areas get pulled to the mean, edges keep
+/// their value. Applied as a per-channel exp2 gain so detail survives.
+/// Identical math to gpu.rs `nr_main` luma path — keep in sync.
+fn guided_nr_lum(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> Vec<[f32; 3]> {
+    let guide: Vec<f32> = lin
+        .iter()
+        .map(|c| (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] + 0.01).log2())
+        .collect();
+    let rad = (1.0 + amt * 4.0).round() as i32;
+    let eps = 0.002 + amt * amt * 0.25;
+    let mut out = vec![[0.0f32; 3]; lin.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut mean = 0.0f32;
+            let mut sq = 0.0f32;
+            let mut n = 0u32;
+            for dy in -rad..=rad {
+                for dx in -rad..=rad {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        let v = guide[ny as usize * w + nx as usize];
+                        mean += v;
+                        sq += v * v;
+                        n += 1;
+                    }
+                }
+            }
+            mean /= n.max(1) as f32;
+            let var = (sq / n.max(1) as f32 - mean * mean).max(0.0);
+            let a = var / (var + eps);
+            let q = mean + a * (guide[i] - mean);
+            let g = ((q - guide[i]) * amt).exp2();
+            for c in 0..3 {
+                out[i][c] = lin[i][c] * g;
+            }
+        }
+    }
+    out
+}
+
 fn chroma_smooth(lin: &[[f32; 3]], w: usize, h: usize, amount: f32) -> Vec<[f32; 3]> {
     let luma: Vec<f32> = lin
         .iter()

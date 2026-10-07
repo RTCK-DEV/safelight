@@ -256,6 +256,42 @@ fn luma(c: vec3<f32>) -> f32 {
 }
 
 // chroma smoothing: blur R/B residuals vs luma
+// guided-filter luma NR: q = mean + a*(l-mean) with a = var/(var+eps)
+// applied as a per-channel exp2 gain — mirrors develop.rs guided_nr_lum
+@compute @workgroup_size(256)
+fn nrl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let i = flat_index(gid, num);
+    let w = u.g2.x;
+    let h = u.g2.y;
+    if (i >= w * h) { return; }
+    let x = i % w;
+    let y = i / w;
+    let nl = u.a3.y;
+    let l0 = log2(luma(io_a[i].xyz) + 0.01);
+    let rad = i32(round(1.0 + nl * 4.0));
+    let eps = 0.002 + nl * nl * 0.25;
+    var mean = 0.0;
+    var sq = 0.0;
+    var n = 0.0;
+    for (var dy = -rad; dy <= rad; dy = dy + 1) {
+        for (var dx = -rad; dx <= rad; dx = dx + 1) {
+            let nx = i32(x) + dx;
+            let ny = i32(y) + dy;
+            if (nx >= 0 && ny >= 0 && nx < i32(w) && ny < i32(h)) {
+                let g = log2(luma(io_a[u32(ny) * w + u32(nx)].xyz) + 0.01);
+                mean = mean + g;
+                sq = sq + g * g;
+                n = n + 1.0;
+            }
+        }
+    }
+    mean = mean / n;
+    let va = max(sq / n - mean * mean, 0.0);
+    let a = va / (va + eps);
+    let q = mean + a * (l0 - mean);
+    io_b[i] = vec4<f32>(io_a[i].xyz * exp2((q - l0) * nl), 0.0);
+}
+// chroma NR: cr/cb box smooth preserving luma
 @compute @workgroup_size(256)
 fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
     let i = flat_index(gid, num);
@@ -284,7 +320,7 @@ fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
             }
         }
     }
-    let amt = max(u.a3.y, u.fx0.z);
+    let amt = u.fx0.z;
     let nr = mix(cr0, sr / n, amt);
     let nb = mix(cb0, sb / n, amt);
     io_b[i] = vec4<f32>(
@@ -319,7 +355,8 @@ fn px_at(x: i32, y: i32) -> vec3<f32> {
     return io_a[u32(cy) * u.g2.x + u32(cx)].xyz;
 }
 
-// spot heal: interior pixels take the mean of a ring at 1.4x radius
+// spot heal: frequency separation src + blur(target-src), source auto-picked
+// by annulus match — mirrors develop.rs heal_lin/heal_find_source
 @compute @workgroup_size(256)
 fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
     let i = flat_index(gid, num);
@@ -330,19 +367,52 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let n = u32(u.misc.z);
     for (var s = 0u; s < n; s = s + 1u) {
         let sp = u.heal[s];
-        let d = distance(vec2<f32>(f32(i % w), f32(i / w)), sp.xy) / max(sp.z, 1.0);
+        let pxf = vec2<f32>(f32(i % w), f32(i / w));
+        let d = distance(pxf, sp.xy) / max(sp.z, 1.0);
         if (d < 1.0) {
-            var ring = vec3<f32>(0.0);
-            for (var k = 0u; k < 8u; k = k + 1u) {
-                let a = f32(k) * 6.2832 / 8.0;
-                ring = ring + px_at(
-                    i32(sp.x + sp.z * 1.4 * cos(a) + 0.5),
-                    i32(sp.y + sp.z * 1.4 * sin(a) + 0.5),
-                );
+            // auto source: 24 candidate offsets on rings at 2.1r / 3.0r,
+            // scored by annulus match in sqrt domain
+            var best = vec2<f32>(0.0);
+            var best_score = 1e30;
+            for (var k = 0u; k < 24u; k = k + 1u) {
+                var a = f32(k) * 6.2832 / 16.0;
+                var dist = sp.z * 2.1;
+                if (k >= 16u) {
+                    a = f32(k - 16u) * 6.2832 / 8.0 + 6.2832 / 32.0;
+                    dist = sp.z * 3.0;
+                }
+                let off = vec2<f32>(cos(a), sin(a)) * dist;
+                var score = 0.0;
+                for (var kk = 0u; kk < 8u; kk = kk + 1u) {
+                    let aa = f32(kk) * 6.2832 / 8.0;
+                    let tap = vec2<f32>(cos(aa), sin(aa)) * sp.z * 1.15;
+                    let t = px_at(i32(sp.x + tap.x + 0.5), i32(sp.y + tap.y + 0.5));
+                    let sv = px_at(i32(sp.x + off.x + tap.x + 0.5), i32(sp.y + off.y + tap.y + 0.5));
+                    score = score
+                        + abs(sqrt(max(t.x, 0.0)) - sqrt(max(sv.x, 0.0)))
+                        + abs(sqrt(max(t.y, 0.0)) - sqrt(max(sv.y, 0.0)))
+                        + abs(sqrt(max(t.z, 0.0)) - sqrt(max(sv.z, 0.0)));
+                }
+                if (score < best_score) {
+                    best_score = score;
+                    best = off;
+                }
             }
-            ring = ring / 8.0;
+            // low-freq diff = mean of (target-src) over centre + 8 taps at r*0.5
+            var acc = vec3<f32>(0.0);
+            for (var k = 0u; k < 9u; k = k + 1u) {
+                var tp = pxf;
+                if (k > 0u) {
+                    let a = f32(k - 1u) * 6.2832 / 8.0;
+                    tp = pxf + vec2<f32>(cos(a), sin(a)) * sp.z * 0.5;
+                }
+                let t = px_at(i32(tp.x + 0.5), i32(tp.y + 0.5));
+                let sv = px_at(i32(tp.x + best.x + 0.5), i32(tp.y + best.y + 0.5));
+                acc = acc + (t - sv) / 9.0;
+            }
+            let sv = px_at(i32(pxf.x + best.x + 0.5), i32(pxf.y + best.y + 0.5));
             let blend = 1.0 - sstep(0.7, 1.0, d);
-            c = mix(c, ring, blend);
+            c = mix(c, sv + acc, blend);
         }
     }
     // clone stamps: copy the source patch into the destination circle
@@ -509,23 +579,29 @@ fn srgb_decode(v: f32) -> f32 {
 }
 
 // imported 3D LUT lives in `lut` past the curve region:
-// [2304]=size (0=off) [2305]=amount [2306..9]=domain_min [2309..12]=domain_scale
-// data from 2312, R fastest
+// tone LUT: 512 entries at [2304..2816] over linear luma 0..1.6
+fn tone_at(t: f32) -> f32 {
+    let f = clamp(t, 0.0, 1.0) * 511.0;
+    let i0 = min(u32(f), 510u);
+    return mix(lut[2304u + i0], lut[2304u + i0 + 1u], f - f32(i0));
+}
+// [2816]=size (0=off) [2817]=amount [2818..21]=domain_min [2821..24]=domain_scale
+// data from 2824, R fastest
 fn l3at(n: u32, x: u32, y: u32, z: u32) -> vec3<f32> {
-    let o = 2312u + ((z * n + y) * n + x) * 3u;
+    let o = 2824u + ((z * n + y) * n + x) * 3u;
     return vec3<f32>(lut[o], lut[o + 1u], lut[o + 2u]);
 }
 
 fn lut3d_apply(x: vec3<f32>) -> vec3<f32> {
-    let n = u32(lut[2304u]);
+    let n = u32(lut[2816u]);
     if (n < 2u) { return x; }
-    let amt = lut[2305u];
+    let amt = lut[2817u];
     let enc = vec3<f32>(
         srgb_encode(clamp(x.x, 0.0, 1.0)),
         srgb_encode(clamp(x.y, 0.0, 1.0)),
         srgb_encode(clamp(x.z, 0.0, 1.0)));
-    let dmin = vec3<f32>(lut[2306u], lut[2307u], lut[2308u]);
-    let dscl = vec3<f32>(lut[2309u], lut[2310u], lut[2311u]);
+    let dmin = vec3<f32>(lut[2818u], lut[2819u], lut[2820u]);
+    let dscl = vec3<f32>(lut[2821u], lut[2822u], lut[2823u]);
     let f = clamp((enc - dmin) * dscl, vec3<f32>(0.0), vec3<f32>(1.0)) * f32(n - 1u);
     let i0 = vec3<u32>(floor(f));
     let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(n - 1u));
@@ -543,6 +619,26 @@ fn lut3d_apply(x: vec3<f32>) -> vec3<f32> {
     let v = mix(v0, v1, t.z);
     let bl = mix(enc, v, vec3<f32>(amt));
     return vec3<f32>(srgb_decode(bl.x), srgb_decode(bl.y), srgb_decode(bl.z));
+}
+
+// HSL qualifier matte for `c` — mirrors develop.rs qual_mask
+fn qual_mask(c: vec3<f32>) -> f32 {
+    let hsv = rgb_to_hsv(c);
+    let l = luma(c);
+    let qb = u.qf2.z * 0.25;
+    let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z + qb, 1e-4), hue_dist(hsv.x, u.qh.x));
+    let qs2 = u.qs.z + qb;
+    let ms = sstep(u.qs.x - qs2, u.qs.x + qs2, hsv.y)
+        * (1.0 - sstep(u.qs.y - qs2, u.qs.y + qs2, hsv.y));
+    let ql2 = u.ql.z + qb;
+    let ml = sstep(u.ql.x - ql2, u.ql.x + ql2, l)
+        * (1.0 - sstep(u.ql.y - ql2, u.ql.y + ql2, l));
+    var mask = mh * ms * ml;
+    if (u.qf2.x > 0.0 || u.qf2.y < 1.0) {
+        mask = clamp((mask - u.qf2.x) / max(u.qf2.y - u.qf2.x, 1e-4), 0.0, 1.0);
+    }
+    if (u.qf.y > 0.5) { mask = 1.0 - mask; }
+    return mask;
 }
 
 fn adjust(px: vec3<f32>) -> vec3<f32> {
@@ -565,45 +661,15 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     x = u.lgg2.xyz * pow(max(x + u.lgg0.xyz, vec3<f32>(0.0)), 1.0 / u.lgg1.xyz);
     // offset wheel
     x = x + u.off0.xyz;
-    if (u.a2.y > 0.0) {
-        x = x + u.a2.y * 0.15 * (vec3<f32>(1.0) - x);
-    } else {
-        x = x * (1.0 + u.a2.y * 0.20);
+    // EV-domain tone map (luminance-preserving): shadows/highlights/whites/
+    // blacks + rolloff folded into one curve — mirrors develop.rs build_tone_lut
+    if (u.qf.w > 0.5) {
+        let tl = clamp(luma(x), 0.0, 1.6);
+        // clamp evaluation luma to bound the y/l gain — mirrors develop.rs
+        let le = max(tl, 0.04);
+        x = x * (tone_at(le / 1.6) / le);
     }
-    x = x * (1.0 + u.a2.x * 0.20);
     x = (x - vec3<f32>(u.pv.x)) * (1.0 + u.a1.y * 0.9) + vec3<f32>(u.pv.x);
-    if (u.a1.w != 0.0) {
-        let w = (vec3<f32>(1.0) - vec3<f32>(
-            sstep(0.0, 0.45, x.x), sstep(0.0, 0.45, x.y), sstep(0.0, 0.45, x.z),
-        )) * vec3<f32>(
-            sstep(0.0, 0.06, x.x), sstep(0.0, 0.06, x.y), sstep(0.0, 0.06, x.z),
-        );
-        x = x + u.a1.w * w * 0.30;
-    }
-    if (u.a1.z != 0.0) {
-        let w = vec3<f32>(
-            sstep(0.45, 1.2, x.x), sstep(0.45, 1.2, x.y), sstep(0.45, 1.2, x.z),
-        );
-        x = x - u.a1.z * w * 0.5 * x;
-    }
-    // highlight/shadow rolloff
-    if (u.pv.y != 1.0) {
-        let sw = vec3<f32>(
-            sstep(0.8, 1.6, x.x), sstep(0.8, 1.6, x.y), sstep(0.8, 1.6, x.z),
-        );
-        if (u.pv.y > 1.0) {
-            x = x / (vec3<f32>(1.0) + (u.pv.y - 1.0) * sw);
-        } else {
-            x = x * (vec3<f32>(1.0) + (1.0 - u.pv.y) * 0.5 * sw);
-        }
-    }
-    if (u.pv.z != 1.0) {
-        let wv = vec3<f32>(1.0) - vec3<f32>(
-            sstep(0.0, 0.35, x.x), sstep(0.0, 0.35, x.y), sstep(0.0, 0.35, x.z),
-        );
-        x = x * (vec3<f32>(1.0) + (1.0 - u.pv.z) * 0.4 * wv);
-        x = x * (vec3<f32>(1.0) - max(u.pv.z - 1.0, 0.0) * 0.3 * wv);
-    }
     if (u.a2.z != 0.0 || u.a2.w != 0.0) {
         let luma2 = luma(x);
         let mx = max(x.x, max(x.y, x.z));
@@ -829,9 +895,16 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let w0 = u.wins[wi * 4u];
         let w1 = u.wins[wi * 4u + 1u];
         let w2 = u.wins[wi * 4u + 2u];
-        let kind = u32(w2.y) % 2u;
+        let kb = u32(w2.y);
+        let kind = kb & 1u;
         var mask = 0.0;
-        if (kind == 1u) {
+        if ((kb & 4u) != 0u) {
+            // luminance range over the pre-adjust sample: p=[lo,hi,lof,hif]
+            let l = luma(col);
+            let lf = max(w0.z, 0.005);
+            let hf = max(w0.w, 0.005);
+            mask = sstep(w0.x - lf, w0.x + lf, l) * (1.0 - sstep(w0.y - hf, w0.y + hf, l));
+        } else if (kind == 1u) {
             // gradient: full cover before the p1..p2 span, soft ramp across
             let dvec = w0.zw - w0.xy;
             let len2 = max(dot(dvec, dvec), 1e-6);
@@ -848,7 +921,8 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
             let d = length(vec2<f32>(ux, uy));
             mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
         }
-        if (w2.y >= 2.0) { mask = 1.0 - mask; }
+        if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
+        if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
         mask = mask * w2.z;
         if (mask > 0.001) {
             let evg = pow(2.0, w1.z * mask);
@@ -904,6 +978,7 @@ pub struct Gpu {
     demosaic: Pipe,
     stats: Pipe,
     heal: Pipe,
+    nrl: Pipe,
     nr: Pipe,
     soft: Pipe,
     glow: Pipe,
@@ -1004,6 +1079,7 @@ impl Gpu {
             demosaic: mk("demosaic_main"),
             stats: mk("stats_main"),
             heal: mk("heal_main"),
+            nrl: mk("nrl_main"),
             nr: mk("nr_main"),
             soft: mk("soft_main"),
             glow: mk("glow_main"),
@@ -1080,8 +1156,8 @@ impl Gpu {
             usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
             mapped_at_creation: false,
         });
-        // master 256 + per-channel 768 + hue-curves 1280
-        const LUT_N: u64 = 2304;
+        // master 256 + per-channel 768 + hue-curves 1280 + tone 512
+        const LUT_N: u64 = 2816;
         // .cube 3D LUT (loaded once for sizing; build_params hits the cache)
         let lut3d = if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
             crate::lut::load(&r.lut_file)
@@ -1171,7 +1247,7 @@ impl Gpu {
                 if p.has_qual { 1.0 } else { 0.0 },
                 if p.q_invert { 1.0 } else { 0.0 },
                 if p.mixer != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] { 1.0 } else { 0.0 },
-                0.0,
+                if p.has_tone { 1.0 } else { 0.0 },
             ],
             mx0: [p.mixer[0], p.mixer[1], p.mixer[2], 0.0],
             mx1: [p.mixer[3], p.mixer[4], p.mixer[5], 0.0],
@@ -1337,6 +1413,7 @@ impl Gpu {
                 lut_buf[off..off + 256].copy_from_slice(&p.hue_luts[k * 256..(k + 1) * 256]);
             }
         }
+        lut_buf[2304..2816].copy_from_slice(&p.tone_lut);
         // 3D LUT header + data (shader: size==0 => passthrough)
         lut_buf.resize(lut_len as usize, 0.0);
         if let Some(c) = &p.lut3d {
@@ -1358,7 +1435,11 @@ impl Gpu {
             run(&mut enc, &self.heal, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
-        if p.noise_luma > 0.0 || p.noise_chroma > 0.0 {
+        if p.noise_luma > 0.0 {
+            run(&mut enc, &self.nrl, n_px);
+            enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
+        if p.noise_chroma > 0.0 {
             run(&mut enc, &self.nr, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }

@@ -45,7 +45,7 @@ enum WbMode: String, Codable, CaseIterable {
 /// Mirrors araware_core::recipe::PowerWindow (serde).
 struct PowerWindow: Codable, Equatable, Identifiable {
     var id = UUID()
-    var kind: String = "circle"      // "circle" [cx,cy,rx,ry,rot_deg,soft] | "gradient" [x1,y1,x2,y2,soft,0]
+    var kind: String = "circle"      // "circle" [cx,cy,rx,ry,rot_deg,soft] | "gradient" [x1,y1,x2,y2,soft,0] | "lum" [lo,hi,lof,hif,0,0]
     var p: [Double] = [0.5, 0.5, 0.2, 0.2, 0, 0.4]
     var ev: Double = 0
     var sat: Double = 0
@@ -53,8 +53,12 @@ struct PowerWindow: Codable, Equatable, Identifiable {
     var invert: Bool = false
     var enabled: Bool = true         // per-window on/off
     var opacity: Double = 1          // adjustment strength 0..1
+    var linkQ: Bool = false          // gate mask by the HSL qualifier matte
 
-    enum CodingKeys: String, CodingKey { case kind, p, ev, sat, temp, invert, enabled, opacity }
+    enum CodingKeys: String, CodingKey {
+        case kind, p, ev, sat, temp, invert, enabled, opacity
+        case linkQ = "link_q"
+    }
 
     init() {}
 
@@ -68,6 +72,7 @@ struct PowerWindow: Codable, Equatable, Identifiable {
         invert = (try? c.decode(Bool.self, forKey: .invert)) ?? false
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
         opacity = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        linkQ = (try? c.decode(Bool.self, forKey: .linkQ)) ?? false
     }
 }
 
