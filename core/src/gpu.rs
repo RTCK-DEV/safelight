@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 
 use crate::decode::Mosaic;
-use crate::develop::{build_params, frame_geometry, frame_to_src, pick_rect, spot_to_src, Params, RgbaImage, Stats};
+use crate::develop::{
+    build_params, frame_geometry, frame_to_src, pick_rect, spot_to_src, Params, RgbaImage, Stats,
+};
 use crate::recipe::Recipe;
 
 #[repr(C)]
@@ -1461,7 +1463,6 @@ fn norm_factors(m: &Mosaic) -> [f32; 4] {
     n
 }
 
-
 impl Gpu {
     pub fn try_new() -> Option<Gpu> {
         if std::env::var_os("ARA_DISABLE_GPU").is_some() {
@@ -1599,16 +1600,8 @@ impl Gpu {
         let cfa_b = mk_buf("cfa", bytemuck::cast_slice(&cfa32), storage_in);
         // color-difference demosaic tap tables (stride == 1 only)
         let dt = crate::develop::build_demosaic_taps(&m.cfa);
-        let idx32: Vec<u32> = dt
-            .idx
-            .iter()
-            .flat_map(|&(o, c)| [o, c])
-            .collect();
-        let tap32: Vec<i32> = dt
-            .taps
-            .iter()
-            .flat_map(|&(x, y)| [x, y])
-            .collect();
+        let idx32: Vec<u32> = dt.idx.iter().flat_map(|&(o, c)| [o, c]).collect();
+        let tap32: Vec<i32> = dt.taps.iter().flat_map(|&(x, y)| [x, y]).collect();
         let idx_b = mk_buf("tap_idx", bytemuck::cast_slice(&idx32), storage_in);
         let tap_b = mk_buf("taps", bytemuck::cast_slice(&tap32), storage_in);
         let io_a = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -1624,13 +1617,8 @@ impl Gpu {
             usage: U::STORAGE | U::COPY_SRC,
             mapped_at_creation: false,
         });
-        let (fw, fh, cl, ct, ew, eh, dw, dh) = frame_geometry(
-            vw as usize,
-            vh as usize,
-            m.info.flip,
-            r.crop,
-            max_px,
-        );
+        let (fw, fh, cl, ct, ew, eh, dw, dh) =
+            frame_geometry(vw as usize, vh as usize, m.info.flip, r.crop, max_px);
         let (fw, fh) = (fw as u32, fh as u32);
         let (dw, dh) = (dw as u32, dh as u32);
         let out_b = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -1666,7 +1654,13 @@ impl Gpu {
         });
         // WB pick rect (virtual src px) for the stats pass
         let pick0 = if r.wb_mode == crate::recipe::WbMode::Pick {
-            pick_rect(r.wb_pick, vw as usize, vh as usize, m.info.flip, r.wb_pick_size)
+            pick_rect(
+                r.wb_pick,
+                vw as usize,
+                vh as usize,
+                m.info.flip,
+                r.wb_pick_size,
+            )
         } else {
             [-1.0; 4]
         };
@@ -1681,10 +1675,17 @@ impl Gpu {
         let corr = if r.lens_corr > 0.001 {
             crate::lensdb::db().and_then(|d| {
                 let c = d.correction(
-                    &m.info.lens, &m.info.make, &m.info.model,
-                    m.info.focal, m.info.aperture,
+                    &m.info.lens,
+                    &m.info.make,
+                    &m.info.model,
+                    m.info.focal,
+                    m.info.aperture,
                 );
-                if c.is_empty() { None } else { Some(c) }
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
             })
         } else {
             None
@@ -1716,21 +1717,20 @@ impl Gpu {
                 m.w as u32,
                 m.h as u32,
                 // bit0: stride==1 chroma-diff demosaic; bit1: lens correction
-                (if stride == 1 { 1 } else { 0 })
-                    + if corr.is_some() { 2 } else { 0 },
+                (if stride == 1 { 1 } else { 0 }) + if corr.is_some() { 2 } else { 0 },
             ],
             lgg0: [p.lift[0], p.lift[1], p.lift[2], 0.0],
             lgg1: [p.gamma[0], p.gamma[1], p.gamma[2], 0.0],
             lgg2: [p.gain[0], p.gain[1], p.gain[2], 0.0],
-            st0: [p.shadow_col[0], p.shadow_col[1], p.shadow_col[2], p.shadow_sat],
+            st0: [
+                p.shadow_col[0],
+                p.shadow_col[1],
+                p.shadow_col[2],
+                p.shadow_sat,
+            ],
             st1: [p.high_col[0], p.high_col[1], p.high_col[2], p.high_sat],
             crop: [cl, ct, ew as f32, eh as f32],
-            misc: [
-                p.black_pt,
-                p.white_pt,
-                p.n_spots as f32,
-                p.n_lights as f32,
-            ],
+            misc: [p.black_pt, p.white_pt, p.n_spots as f32, p.n_lights as f32],
             heal: {
                 let mut a = [[0.0f32; 4]; 8];
                 for (i, s) in p.spots.iter().enumerate() {
@@ -1759,7 +1759,11 @@ impl Gpu {
             qf: [
                 if p.has_qual { 1.0 } else { 0.0 },
                 if p.q_invert { 1.0 } else { 0.0 },
-                if p.mixer != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] { 1.0 } else { 0.0 },
+                if p.mixer != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
+                    1.0
+                } else {
+                    0.0
+                },
                 if p.has_tone { 1.0 } else { 0.0 },
             ],
             mx0: [p.mixer[0], p.mixer[1], p.mixer[2], 0.0],
@@ -1773,7 +1777,12 @@ impl Gpu {
                 if p.hue_luts.is_empty() { 0.0 } else { 1.0 },
                 p.deband,
             ],
-            fx0: [p.ca_fix, p.glow, p.noise_chroma, if p.chan_luts.is_empty() { 0.0 } else { 1.0 }],
+            fx0: [
+                p.ca_fix,
+                p.glow,
+                p.noise_chroma,
+                if p.chan_luts.is_empty() { 0.0 } else { 1.0 },
+            ],
             flare: p.flare,
             wins: {
                 let mut a = [[0.0f32; 4]; 16];
@@ -1809,7 +1818,11 @@ impl Gpu {
             ze1: [p.zone_ev[4], p.zone_ev[5], p.zone_ev[6], p.zone_ev[7]],
             ze2: [
                 p.zone_ev[8],
-                if p.zone_ev.iter().any(|&v| v != 0.0) { 1.0 } else { 0.0 },
+                if p.zone_ev.iter().any(|&v| v != 0.0) {
+                    1.0
+                } else {
+                    0.0
+                },
                 p.key_v,
                 p.key_h,
             ],
@@ -1840,7 +1853,11 @@ impl Gpu {
         // pass's params below.
         let p0 = build_params(m, r, None);
         let segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
-        let segs32 = if segs32.is_empty() { vec![0.0f32; 4] } else { segs32 };
+        let segs32 = if segs32.is_empty() {
+            vec![0.0f32; 4]
+        } else {
+            segs32
+        };
         let brush_b = mk_buf("brushsegs", bytemuck::cast_slice(&segs32), storage_in);
 
         let bind = |pipe: &Pipe| {
@@ -1883,11 +1900,16 @@ impl Gpu {
         let stats = if Stats::needs(r) {
             // keep total samples under ~64K so the u32 accumulators can't overflow
             let step = ((n_px as f64 / 65536.0).sqrt().ceil() as u32).max(2);
-            self.queue.write_buffer(&stats_b, 0, &vec![0u8; STATS_N as usize * 4]);
+            self.queue
+                .write_buffer(&stats_b, 0, &vec![0u8; STATS_N as usize * 4]);
             self.queue
                 .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p0, step)));
             let mut enc = dev.create_command_encoder(&Default::default());
-            run(&mut enc, &self.stats, (vw.div_ceil(step) * vh.div_ceil(step)) as u64);
+            run(
+                &mut enc,
+                &self.stats,
+                (vw.div_ceil(step) * vh.div_ceil(step)) as u64,
+            );
             let stg = dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stg_stats"),
                 size: STATS_N * 4,
@@ -1942,13 +1964,7 @@ impl Gpu {
                 lut_buf[off..off + 256].copy_from_slice(&p.chan_luts[c * 256..(c + 1) * 256]);
             }
         }
-        let hue_defaults: [fn(f32) -> f32; 5] = [
-            |x| x,
-            |_| 1.0,
-            |_| 1.0,
-            |_| 1.0,
-            |x| x,
-        ];
+        let hue_defaults: [fn(f32) -> f32; 5] = [|x| x, |_| 1.0, |_| 1.0, |_| 1.0, |x| x];
         for k in 0..5 {
             let off = 1024 + k * 256;
             if p.hue_luts.is_empty() {
@@ -1967,10 +1983,10 @@ impl Gpu {
             lut_buf[LUT_N as usize + 1] = p.lut_amt;
             lut_buf[LUT_N as usize + 2..LUT_N as usize + 5].copy_from_slice(&c.dmin);
             lut_buf[LUT_N as usize + 5..LUT_N as usize + 8].copy_from_slice(&c.dscale);
-            lut_buf[LUT_N as usize + 8..LUT_N as usize + 8 + c.data.len()]
-                .copy_from_slice(&c.data);
+            lut_buf[LUT_N as usize + 8..LUT_N as usize + 8 + c.data.len()].copy_from_slice(&c.data);
         }
-        self.queue.write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
+        self.queue
+            .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         self.queue
             .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p, 0)));
 

@@ -31,7 +31,10 @@ impl<'a> Reader<'a> {
         a | (b << 16)
     }
     fn at(&self, off: usize) -> Reader<'a> {
-        Reader { d: self.d, pos: off }
+        Reader {
+            d: self.d,
+            pos: off,
+        }
     }
     fn utf16(&self, off: usize, max: usize) -> String {
         let mut s = String::new();
@@ -66,7 +69,12 @@ struct Bits<'a> {
 }
 impl<'a> Bits<'a> {
     fn new(d: &'a [u8], pos: usize) -> Self {
-        Bits { d, pos, bitbuf: 0, vbits: 0 }
+        Bits {
+            d,
+            pos,
+            bitbuf: 0,
+            vbits: 0,
+        }
     }
     fn get(&mut self, nbits: i32) -> u32 {
         if nbits <= 0 {
@@ -180,8 +188,7 @@ fn parse_container(d: &[u8]) -> Result<X3f> {
                     x.height = high;
                     x.data_offset = off + 28;
                 }
-                if d.get(off + 28).copied() == Some(0xff)
-                    && d.get(off + 29).copied() == Some(0xd8)
+                if d.get(off + 28).copied() == Some(0xff) && d.get(off + 29).copied() == Some(0xd8)
                 {
                     let jl = len.saturating_sub(28);
                     if x.jpeg_thumb.map_or(true, |(_, l)| jl > l) {
@@ -246,7 +253,10 @@ fn dp_load_raw(d: &[u8], x: &X3f) -> Vec<[i16; 3]> {
     let w = x.width;
     let h = x.height;
     let mut image = vec![[0i16; 3]; w * h];
-    let mut r = Reader { d, pos: x.data_offset + 8 };
+    let mut r = Reader {
+        d,
+        pos: x.data_offset + 8,
+    };
     let huff = read_huff(&mut r);
     let mut roff = [0usize; 4];
     roff[0] = 48;
@@ -288,7 +298,10 @@ fn foveon_decoder(r: &mut Reader, size: usize) -> Vec<DNode> {
     for _ in 0..size {
         huff.push(r.g4le());
     }
-    let mut out = vec![DNode { leaf: 0, branch: [0; 2] }];
+    let mut out = vec![DNode {
+        leaf: 0,
+        branch: [0; 2],
+    }];
     let mut stack = vec![(0usize, 0u32)];
     while let Some((cur, code)) = stack.pop() {
         if code != 0 {
@@ -303,9 +316,15 @@ fn foveon_decoder(r: &mut Reader, size: usize) -> Vec<DNode> {
         }
         let ncode = ((len + 1) << 27) | ((code & 0x3ff_ffff) << 1);
         let b0 = out.len();
-        out.push(DNode { leaf: 0, branch: [0; 2] });
+        out.push(DNode {
+            leaf: 0,
+            branch: [0; 2],
+        });
         let b1 = out.len();
-        out.push(DNode { leaf: 0, branch: [0; 2] });
+        out.push(DNode {
+            leaf: 0,
+            branch: [0; 2],
+        });
         out[cur].branch = [b0, b1];
         stack.push((b0, ncode));
         stack.push((b1, ncode + 1));
@@ -318,7 +337,10 @@ fn sd_load_raw(d: &[u8], x: &X3f, packed: bool, model_num: i32) -> Vec<[i16; 3]>
     let w = x.width;
     let h = x.height;
     let mut image = vec![[0i16; 3]; w * h];
-    let mut r = Reader { d, pos: x.data_offset };
+    let mut r = Reader {
+        d,
+        pos: x.data_offset,
+    };
     let mut diff = [0i16; 1024];
     for e in diff.iter_mut() {
         *e = r.g2le() as u16 as i16;
@@ -356,8 +378,7 @@ fn sd_load_raw(d: &[u8], x: &X3f, packed: bool, model_num: i32) -> Vec<[i16; 3]>
                         di = nodes[di].branch[b];
                     }
                     let leaf = nodes.get(di).map(|n| n.leaf).unwrap_or(0) as usize;
-                    pred[c] =
-                        pred[c].wrapping_add(diff[leaf.min(1023)] as i32);
+                    pred[c] = pred[c].wrapping_add(diff[leaf.min(1023)] as i32);
                 }
             }
             for c in 0..3 {
@@ -372,7 +393,10 @@ fn load_camf(d: &[u8], x: &X3f) -> Option<Vec<u8>> {
     if x.meta_offset == 0 || x.meta_length == 0 {
         return None;
     }
-    let mut r = Reader { d, pos: x.meta_offset };
+    let mut r = Reader {
+        d,
+        pos: x.meta_offset,
+    };
     let typ = r.g4le();
     let _ = r.g4le();
     let _ = r.g4le();
@@ -648,7 +672,11 @@ fn foveon_interpolate(
     }
     if !have_drift {
         for i in 0..2 {
-            let name = if i == 0 { "DarkShieldTop" } else { "DarkShieldBottom" };
+            let name = if i == 0 {
+                "DarkShieldTop"
+            } else {
+                "DarkShieldBottom"
+            };
             let mut dstb = [0i32; 4];
             if camf.fixed_i32(&mut dstb, name) {
                 let mut acc = [0f64; 3];
@@ -765,7 +793,11 @@ fn foveon_interpolate(
     }
     let mut curve: Vec<Vec<i16>> = Vec::with_capacity(8);
     for c in 0..3 {
-        curve.push(foveon_make_curve(max.max(1.0), mul[c].max(1e-6), cfilt as f64));
+        curve.push(foveon_make_curve(
+            max.max(1.0),
+            mul[c].max(1e-6),
+            cfilt as f64,
+        ));
     }
     let mut mul3 = [0f64; 3];
     let mut max3 = 0f64;
@@ -777,12 +809,20 @@ fn foveon_interpolate(
         }
     }
     for c in 0..3 {
-        curve.push(foveon_make_curve(max3.max(1.0), mul3[c].max(1e-6), cfilt as f64));
+        curve.push(foveon_make_curve(
+            max3.max(1.0),
+            mul3[c].max(1e-6),
+            cfilt as f64,
+        ));
     }
     for c in 0..3 {
         dsum += (chroma_dq[c] / div[c].max(1e-6)) as f64;
     }
-    curve.push(foveon_make_curve(dsum.max(1.0), dsum.max(1.0), cfilt as f64));
+    curve.push(foveon_make_curve(
+        dsum.max(1.0),
+        dsum.max(1.0),
+        cfilt as f64,
+    ));
     curve.push(foveon_make_curve(
         (dsum * 2.0).max(1.0),
         (dsum * 2.0).max(1.0),
@@ -904,8 +944,8 @@ fn foveon_interpolate(
         }
         let base = row * w;
         let mut prev = image[base];
-        let frow = row as f32 / (h.saturating_sub(1).max(1)) as f32
-            * (sgdim[2].saturating_sub(1)) as f32;
+        let frow =
+            row as f32 / (h.saturating_sub(1).max(1)) as f32 * (sgdim[2].saturating_sub(1)) as f32;
         let irow = (frow as usize).min(sgdim[2].saturating_sub(2));
         let fr = frow - irow as f32;
         for i in 0..sgdim[1] {
@@ -953,8 +993,7 @@ fn foveon_interpolate(
                 let sg1 = sgrow[(gi + 1).min(sgrow.len() - 1)][c];
                 let rem = (col % sgx) as f32;
                 let gain = (sg0 * (sgx as f32 - rem) + sg1 * rem) / sgx as f32;
-                let o = ((ipix[c] as f32 + v.floor()) * gain / div[c].max(1e-6)).floor()
-                    as i32;
+                let o = ((ipix[c] as f32 + v.floor()) * gain / div[c].max(1e-6)).floor() as i32;
                 image[idx][c] = (o.min(32000) as u16) as i16;
             }
         }
@@ -1014,7 +1053,8 @@ fn foveon_interpolate(
         }
         let mut smred_p = 0i32;
         for col in 2..w.saturating_sub(2) {
-            let smred = (6 * ring[2][col] + 4 * (ring[1][col] + ring[3][col])
+            let smred = (6 * ring[2][col]
+                + 4 * (ring[1][col] + ring[3][col])
                 + ring[0][col]
                 + ring[4][col]
                 + 8)
@@ -1160,8 +1200,7 @@ fn foveon_interpolate(
             };
             for c in 0..3 {
                 let tgt = ((j * totalc[c] + 0x8000) >> 16) as i32;
-                let nv =
-                    image[idx][c] as i32 + apply_curve(&curve[6], tgt - image[idx][c] as i32);
+                let nv = image[idx][c] as i32 + apply_curve(&curve[6], tgt - image[idx][c] as i32);
                 image[idx][c] = nv.clamp(0, i16::MAX as i32) as i16;
             }
         }
@@ -1254,7 +1293,11 @@ fn foveon_interpolate(
                 isum += sm2[col][c];
                 jsum += image[idx][c] as i64;
             }
-            let jj = if isum != 0 { ((jsum << 16) / isum as i64) as i32 } else { 0 };
+            let jj = if isum != 0 {
+                ((jsum << 16) / isum as i64) as i32
+            } else {
+                0
+            };
             let mut sum = 0i32;
             let mut ip = [0i32; 3];
             for c in 0..3 {
@@ -1295,13 +1338,21 @@ fn foveon_interpolate(
 /// camera→linear-sRGB for the detected Sigma model (adobe_coeff-derived).
 fn sigma_rgb_cam(model: &str) -> [[f32; 3]; 3] {
     let cam_xyz: [f32; 9] = if model.contains("Quattro") {
-        [11648.0, -4868.0, -1108.0, -3779.0, 12520.0, 2734.0, 105.0, -1227.0, 10993.0]
+        [
+            11648.0, -4868.0, -1108.0, -3779.0, 12520.0, 2734.0, 105.0, -1227.0, 10993.0,
+        ]
     } else if model.contains("Merrill") || model.contains("SD1") {
-        [5133.0, -1895.0, -353.0, 4978.0, 744.0, 144.0, 3837.0, 3069.0, 2777.0]
+        [
+            5133.0, -1895.0, -353.0, 4978.0, 744.0, 144.0, 3837.0, 3069.0, 2777.0,
+        ]
     } else if model.contains("SD15") || model.contains("SD14") {
-        [11748.0, -3767.0, -1033.0, -2770.0, 10770.0, 2075.0, -3266.0, -544.0, 5968.0]
+        [
+            11748.0, -3767.0, -1033.0, -2770.0, 10770.0, 2075.0, -3266.0, -544.0, 5968.0,
+        ]
     } else {
-        [11850.0, -4184.0, -1257.0, -3693.0, 11551.0, 2065.0, -3246.0, -383.0, 8200.0]
+        [
+            11850.0, -4184.0, -1257.0, -3693.0, 11551.0, 2065.0, -3246.0, -383.0, 8200.0,
+        ]
     };
     let mut m = [[0f32; 3]; 3];
     for i in 0..3 {

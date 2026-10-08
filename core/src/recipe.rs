@@ -94,15 +94,15 @@ pub struct Recipe {
     pub curve_g: Vec<[f32; 2]>,
     pub curve_b: Vec<[f32; 2]>,
     /// hue-domain curves, x = input hue 0..1
-    pub hue_hue: Vec<[f32; 2]>,  // y = output hue 0..1
-    pub hue_sat: Vec<[f32; 2]>,  // y = sat gain (1 = neutral)
-    pub hue_lum: Vec<[f32; 2]>,  // y = luma gain (1 = neutral)
-    pub lum_sat: Vec<[f32; 2]>,  // y = sat gain vs input luma
-    pub sat_sat: Vec<[f32; 2]>,  // y = output sat (remap)
+    pub hue_hue: Vec<[f32; 2]>, // y = output hue 0..1
+    pub hue_sat: Vec<[f32; 2]>, // y = sat gain (1 = neutral)
+    pub hue_lum: Vec<[f32; 2]>, // y = luma gain (1 = neutral)
+    pub lum_sat: Vec<[f32; 2]>, // y = sat gain vs input luma
+    pub sat_sat: Vec<[f32; 2]>, // y = output sat (remap)
     /// HSL qualifier (secondary): soft windows in each H/S/L channel
-    pub qh: [f32; 3],            // hue [center, half_width, soft] 0..1 cycle
-    pub qs: [f32; 3],            // sat [lo, hi, soft]
-    pub ql: [f32; 3],            // lum [lo, hi, soft]
+    pub qh: [f32; 3], // hue [center, half_width, soft] 0..1 cycle
+    pub qs: [f32; 3],           // sat [lo, hi, soft]
+    pub ql: [f32; 3],           // lum [lo, hi, soft]
     /// inside-mask adjustments [hue_shift, sat_gain, lum_gain, temp]
     pub qadj: [f32; 4],
     pub q_invert: bool,
@@ -245,9 +245,9 @@ pub struct PowerWindow {
     /// or "lum" luminance range (p=[lo,hi,lo_feather,hi_feather,0,0])
     pub kind: String,
     pub p: [f32; 6],
-    pub ev: f32,             // exposure offset in EV, -4..4
-    pub sat: f32,            // saturation offset -1..1
-    pub temp: f32,           // warm(+)/cool(-) -1..1
+    pub ev: f32,   // exposure offset in EV, -4..4
+    pub sat: f32,  // saturation offset -1..1
+    pub temp: f32, // warm(+)/cool(-) -1..1
     pub invert: bool,
     /// window on/off (DaVinci: per-window visibility eye)
     #[serde(default = "default_true")]

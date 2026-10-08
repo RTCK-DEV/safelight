@@ -117,9 +117,13 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
         for x in 1..w - 1 {
             let i = y * w + x;
             gx[i] = lum[i - w + 1] + 2.0 * lum[i + 1] + lum[i + w + 1]
-                - lum[i - w - 1] - 2.0 * lum[i - 1] - lum[i + w - 1];
+                - lum[i - w - 1]
+                - 2.0 * lum[i - 1]
+                - lum[i + w - 1];
             gy[i] = lum[i + w - 1] + 2.0 * lum[i + w] + lum[i + w + 1]
-                - lum[i - w - 1] - 2.0 * lum[i - w] - lum[i - w + 1];
+                - lum[i - w - 1]
+                - 2.0 * lum[i - w]
+                - lum[i - w + 1];
         }
     }
 
@@ -137,12 +141,12 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
     // pixels vote for (angle, offset) of global lines. Near-horizontal lines
     // fix rotation; near-vertical line tilts per side give keystone.
     let mut hpts: Vec<(f32, f32, f32)> = Vec::new(); // near-horizontal edges
-    // near-vertical edges per half: (line tilt from vertical, magnitude).
-    // The tilt is measured per pixel directly: a line x = y*tan(phi) + c has
-    // dx/dy = -gy/gx, so phi = atan2(-gy, gx). Per-pixel values are noisy
-    // but the median over a half is a sharp estimate of the side's tilt.
-    let mut vl_pts: Vec<(f32, f32)> = Vec::new();   // left half
-    let mut vr_pts: Vec<(f32, f32)> = Vec::new();   // right half
+                                                     // near-vertical edges per half: (line tilt from vertical, magnitude).
+                                                     // The tilt is measured per pixel directly: a line x = y*tan(phi) + c has
+                                                     // dx/dy = -gy/gx, so phi = atan2(-gy, gx). Per-pixel values are noisy
+                                                     // but the median over a half is a sharp estimate of the side's tilt.
+    let mut vl_pts: Vec<(f32, f32)> = Vec::new(); // left half
+    let mut vr_pts: Vec<(f32, f32)> = Vec::new(); // right half
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let i = y * w + x;
@@ -200,8 +204,11 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
     }
     let med_peak = median(&mut angle_peaks);
     let mut rotation = -best_th;
-    let straighten_conf =
-        if best_votes > 0.0 { ((best_votes - med_peak) / best_votes).max(0.0) } else { 0.0 };
+    let straighten_conf = if best_votes > 0.0 {
+        ((best_votes - med_peak) / best_votes).max(0.0)
+    } else {
+        0.0
+    };
     if rotation.abs() < 0.3 || straighten_conf < 0.4 {
         rotation = 0.0;
     }
@@ -241,9 +248,17 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
             support[(ti + 1).min(96)],
         );
         let denom = v0 - 2.0 * v1 + v2;
-        let shift = if denom.abs() > 1e-6 { 0.5 * (v0 - v2) / denom } else { 0.0 };
+        let shift = if denom.abs() > 1e-6 {
+            0.5 * (v0 - v2) / denom
+        } else {
+            0.0
+        };
         let best_a = -12.0 + (ti as f32 + shift.clamp(-1.0, 1.0)) * 0.25;
-        let coh = if pts.is_empty() { 0.0 } else { v1 / pts.len() as f32 };
+        let coh = if pts.is_empty() {
+            0.0
+        } else {
+            v1 / pts.len() as f32
+        };
         (best_a, coh.min(1.0))
     }
     let mut key_v = 0f32;
@@ -296,7 +311,7 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
         }
     }
     let noise_sigma = mad_sigma(&residuals) * 255.0; // back to 8-bit units
-    // sigma ~1 = clean file; ~4+ = visible noise
+                                                     // sigma ~1 = clean file; ~4+ = visible noise
     let noise_luma = ((noise_sigma - 1.0) / 7.0).clamp(0.0, 0.6);
     let noise_chroma = (noise_luma * 1.2).min(0.7);
 
@@ -324,7 +339,11 @@ pub fn analyze(img: &RgbaImage) -> AutoResult {
         }
     }
     fringe.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ca_score = if fringe.is_empty() { 0.0 } else { fringe[fringe.len() * 3 / 4] };
+    let ca_score = if fringe.is_empty() {
+        0.0
+    } else {
+        fringe[fringe.len() * 3 / 4]
+    };
     // demosaic residue leaves a small bandpass floor; subtract it
     let ca_fix = ((ca_score - 0.02) * 6.0).clamp(0.0, 0.7);
 
@@ -433,7 +452,11 @@ mod tests {
                 d[i + 3] = 255;
             }
         }
-        RgbaImage { width: w, height: h, data: d }
+        RgbaImage {
+            width: w,
+            height: h,
+            data: d,
+        }
     }
 
     #[test]
@@ -450,7 +473,10 @@ mod tests {
     #[test]
     fn detects_tilt() {
         let r = analyze(&synthetic(160, 160, 4.0));
-        eprintln!("rot={} conf={} kv={} kconf={} zones={:?}", r.rotation_deg, r.straighten_conf, r.key_v, r.keystone_conf, r.zones_ev);
+        eprintln!(
+            "rot={} conf={} kv={} kconf={} zones={:?}",
+            r.rotation_deg, r.straighten_conf, r.key_v, r.keystone_conf, r.zones_ev
+        );
         // horizon tilts +4 -> suggestion should be roughly -4
         assert!(r.rotation_deg < -1.0, "rotation {}", r.rotation_deg);
         assert!(r.rotation_deg > -8.0, "rotation {}", r.rotation_deg);

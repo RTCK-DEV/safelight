@@ -137,9 +137,10 @@ impl LensDb {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(1.0);
                         let mut names = Vec::new();
-                        for m in el.children().filter(|c| {
-                            c.is_element() && c.tag_name().name() == "model"
-                        }) {
+                        for m in el
+                            .children()
+                            .filter(|c| c.is_element() && c.tag_name().name() == "model")
+                        {
                             if let Some(t) = m.text() {
                                 names.push(t.trim().to_string());
                             }
@@ -164,8 +165,7 @@ impl LensDb {
                                     }
                                 }
                                 "mount" => {
-                                    mount =
-                                        c.text().unwrap_or_default().trim().to_string();
+                                    mount = c.text().unwrap_or_default().trim().to_string();
                                 }
                                 "cropfactor" => {
                                     if let Some(t) = c.text() {
@@ -186,62 +186,41 @@ impl LensDb {
                                         match k.tag_name().name() {
                                             "distortion" => {
                                                 let kind = match attr(&k, "model") {
-                                                    Some("ptlens") => Some(
-                                                        Distortion::Ptlens {
-                                                            a: attrf(&k, "a")
-                                                                .unwrap_or(0.0),
-                                                            b: attrf(&k, "b")
-                                                                .unwrap_or(0.0),
-                                                            c: attrf(&k, "c")
-                                                                .unwrap_or(0.0),
-                                                        },
-                                                    ),
-                                                    Some("poly3") => Some(
-                                                        Distortion::Poly3 {
-                                                            k1: attrf(&k, "k1")
-                                                                .unwrap_or(0.0),
-                                                        },
-                                                    ),
+                                                    Some("ptlens") => Some(Distortion::Ptlens {
+                                                        a: attrf(&k, "a").unwrap_or(0.0),
+                                                        b: attrf(&k, "b").unwrap_or(0.0),
+                                                        c: attrf(&k, "c").unwrap_or(0.0),
+                                                    }),
+                                                    Some("poly3") => Some(Distortion::Poly3 {
+                                                        k1: attrf(&k, "k1").unwrap_or(0.0),
+                                                    }),
                                                     _ => None,
                                                 };
                                                 if let Some(kd) = kind {
-                                                    dists.push(DistCal {
-                                                        focal,
-                                                        kind: kd,
-                                                    });
+                                                    dists.push(DistCal { focal, kind: kd });
                                                 }
                                             }
                                             "tca" => {
                                                 tcas.push(TcaCal {
                                                     focal,
                                                     t: Tca {
-                                                        vr: attrf(&k, "vr")
-                                                            .unwrap_or(1.0),
-                                                        br: attrf(&k, "br")
-                                                            .unwrap_or(0.0),
-                                                        vb: attrf(&k, "vb")
-                                                            .unwrap_or(1.0),
-                                                        bb: attrf(&k, "bb")
-                                                            .unwrap_or(0.0),
+                                                        vr: attrf(&k, "vr").unwrap_or(1.0),
+                                                        br: attrf(&k, "br").unwrap_or(0.0),
+                                                        vb: attrf(&k, "vb").unwrap_or(1.0),
+                                                        bb: attrf(&k, "bb").unwrap_or(0.0),
                                                     },
                                                 });
                                             }
                                             "vignetting" => {
-                                                if attr(&k, "model") == Some("pa")
-                                                {
+                                                if attr(&k, "model") == Some("pa") {
                                                     vigs.push(VigCal {
                                                         focal,
-                                                        aperture: attrf(
-                                                            &k, "aperture",
-                                                        )
-                                                        .unwrap_or(0.0),
+                                                        aperture: attrf(&k, "aperture")
+                                                            .unwrap_or(0.0),
                                                         k: [
-                                                            attrf(&k, "k1")
-                                                                .unwrap_or(0.0),
-                                                            attrf(&k, "k2")
-                                                                .unwrap_or(0.0),
-                                                            attrf(&k, "k3")
-                                                                .unwrap_or(0.0),
+                                                            attrf(&k, "k1").unwrap_or(0.0),
+                                                            attrf(&k, "k2").unwrap_or(0.0),
+                                                            attrf(&k, "k3").unwrap_or(0.0),
                                                         ],
                                                     });
                                                 }
@@ -290,10 +269,20 @@ impl LensDb {
         while i < raw.len() {
             let t = &raw[i];
             // merge "f" + digit chain and "f<d>" + digits => aperture token
-            if t == "f" && i + 1 < raw.len() && raw[i + 1].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            if t == "f"
+                && i + 1 < raw.len()
+                && raw[i + 1]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            {
                 let mut j = i + 1;
                 let mut a = String::from("f");
-                while j < raw.len() && raw[j].chars().all(|c| c.is_ascii_digit()) && !raw[j].is_empty() {
+                while j < raw.len()
+                    && raw[j].chars().all(|c| c.is_ascii_digit())
+                    && !raw[j].is_empty()
+                {
                     a.push_str(&raw[j]);
                     j += 1;
                 }
@@ -353,7 +342,11 @@ impl LensDb {
                             digit_hit |= t.chars().any(|c| c.is_ascii_digit());
                         }
                     }
-                    if hit >= 2 && digit_hit { hit } else { continue; }
+                    if hit >= 2 && digit_hit {
+                        hit
+                    } else {
+                        continue;
+                    }
                 };
                 if best.map(|(_, s)| score > s).unwrap_or(true) {
                     best = Some((l, score));
@@ -388,13 +381,39 @@ impl LensDb {
     fn fixed_lens(&self, make: &str, model: &str) -> Option<&LensEntry> {
         let cam = self.cam_entry(make, model)?;
         const SYSTEM_MOUNTS: &[&str] = &[
-            "nikonf", "canonef", "canonefs", "pentaxk", "sonya", "sonye",
-            "fujifilmx", "leicam", "olympuse", "m43", "fourthirds",
-            "m42", "m39", "t2", "dkl", "generic", "tamronadaptall",
-            "nikonz", "canonrf", "canonfd", "minoltaa", "konicaminoltaa",
-            "pentax645", "pentaxq", "samsungnx", "sigmasa", "lmount",
-            "hasselbladv", "hasselbladx", "fujifilmg", "contax",
-            "mamiyazd", "ricohgxr",
+            "nikonf",
+            "canonef",
+            "canonefs",
+            "pentaxk",
+            "sonya",
+            "sonye",
+            "fujifilmx",
+            "leicam",
+            "olympuse",
+            "m43",
+            "fourthirds",
+            "m42",
+            "m39",
+            "t2",
+            "dkl",
+            "generic",
+            "tamronadaptall",
+            "nikonz",
+            "canonrf",
+            "canonfd",
+            "minoltaa",
+            "konicaminoltaa",
+            "pentax645",
+            "pentaxq",
+            "samsungnx",
+            "sigmasa",
+            "lmount",
+            "hasselbladv",
+            "hasselbladx",
+            "fujifilmg",
+            "contax",
+            "mamiyazd",
+            "ricohgxr",
         ];
         let m = norm(&cam.mount);
         if SYSTEM_MOUNTS.contains(&m.as_str()) {
@@ -407,8 +426,8 @@ impl LensDb {
             .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
             .map(|t| norm(t))
             .collect();
-        let tok_ok = model_tokens.iter().any(|t| t.len() >= 3 && m.contains(t))
-            || m.contains(&norm(model));
+        let tok_ok =
+            model_tokens.iter().any(|t| t.len() >= 3 && m.contains(t)) || m.contains(&norm(model));
         if !tok_ok {
             return None;
         }
@@ -498,8 +517,7 @@ impl LensDb {
                     .unwrap()
             });
             let f0 = vs[0].focal;
-            let mut near: Vec<VigCal> =
-                vs.iter().copied().filter(|v| v.focal == f0).collect();
+            let mut near: Vec<VigCal> = vs.iter().copied().filter(|v| v.focal == f0).collect();
             near.sort_by(|a, b| {
                 (a.aperture - aperture)
                     .abs()
@@ -546,15 +564,25 @@ fn lerp_dist(d: &[DistCal], f: f32) -> Distortion {
             };
             return match (lo.kind, hi.kind) {
                 (
-                    Distortion::Ptlens { a: a0, b: b0, c: c0 },
-                    Distortion::Ptlens { a: a1, b: b1, c: c1 },
+                    Distortion::Ptlens {
+                        a: a0,
+                        b: b0,
+                        c: c0,
+                    },
+                    Distortion::Ptlens {
+                        a: a1,
+                        b: b1,
+                        c: c1,
+                    },
                 ) => Distortion::Ptlens {
                     a: a0 + t * (a1 - a0),
                     b: b0 + t * (b1 - b0),
                     c: c0 + t * (c1 - c0),
                 },
                 (Distortion::Poly3 { k1: k0 }, Distortion::Poly3 { k1: k1_ }) => {
-                    Distortion::Poly3 { k1: k0 + t * (k1_ - k0) }
+                    Distortion::Poly3 {
+                        k1: k0 + t * (k1_ - k0),
+                    }
                 }
                 // mixed models: use nearer
                 (a, b) => {

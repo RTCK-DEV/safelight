@@ -116,7 +116,9 @@ impl Engine {
             "{}|{:?}|{}|{}",
             path.display(),
             file_stamp(path),
-            path.file_name().map(|n| n.to_string_lossy().len()).unwrap_or(0),
+            path.file_name()
+                .map(|n| n.to_string_lossy().len())
+                .unwrap_or(0),
             max_px
         );
         // stable 64-bit FNV-ish hash for the cache file name
@@ -188,8 +190,7 @@ impl Engine {
         });
         if decode::is_raster(path) {
             if let Ok(f) = std::fs::File::open(path) {
-                let ex = exif::Reader::new()
-                    .read_from_container(&mut std::io::BufReader::new(f));
+                let ex = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f));
                 if let Ok(ex) = ex {
                     let get = |t: exif::Tag| {
                         ex.get_field(t, exif::In::PRIMARY)
@@ -225,8 +226,11 @@ impl Engine {
                 v["pre_mul"] = json!(m.pre_mul);
                 // matched lensfun profile name, when one exists
                 v["lens_profile"] = match crate::lensdb::match_name(
-                    &m.info.lens, &m.info.make, &m.info.model,
-                    m.info.focal, m.info.aperture,
+                    &m.info.lens,
+                    &m.info.make,
+                    &m.info.model,
+                    m.info.focal,
+                    m.info.aperture,
                 ) {
                     Some(n) => json!(n),
                     None => json!(null),
@@ -311,14 +315,18 @@ impl Engine {
             }
             "stack_group" => Ok(json!({"stack": self.catalog.stack_group(&paths())?})),
             "stack_ungroup" => {
-                self.catalog.stack_ungroup(cmd.get("stack").and_then(|v| v.as_i64()).unwrap_or(0))?;
+                self.catalog
+                    .stack_ungroup(cmd.get("stack").and_then(|v| v.as_i64()).unwrap_or(0))?;
                 Ok(json!({"ok": true}))
             }
             "stack_cover" => {
-                self.catalog.stack_cover(cmd.get("path").and_then(|v| v.as_str()).unwrap_or(""))?;
+                self.catalog
+                    .stack_cover(cmd.get("path").and_then(|v| v.as_str()).unwrap_or(""))?;
                 Ok(json!({"ok": true}))
             }
-            "variant_create" => Ok(json!({"vslot": self.catalog.variant_create(&path()?, vslot())?})),
+            "variant_create" => {
+                Ok(json!({"vslot": self.catalog.variant_create(&path()?, vslot())?}))
+            }
             "variant_delete" => {
                 self.catalog.variant_delete(&path()?, vslot())?;
                 Ok(json!({"ok": true}))
@@ -334,12 +342,16 @@ impl Engine {
                     cmd.get("rules").and_then(|v| v.as_str()).unwrap_or(""))?})),
             "coll_rename" => {
                 self.catalog.collection_rename(
-                    id(), cmd.get("name").and_then(|v| v.as_str()).unwrap_or(""))?;
+                    id(),
+                    cmd.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                )?;
                 Ok(json!({"ok": true}))
             }
             "coll_rules" => {
                 self.catalog.collection_set_rules(
-                    id(), cmd.get("rules").and_then(|v| v.as_str()).unwrap_or(""))?;
+                    id(),
+                    cmd.get("rules").and_then(|v| v.as_str()).unwrap_or(""),
+                )?;
                 Ok(json!({"ok": true}))
             }
             "coll_delete" => {
@@ -360,8 +372,9 @@ impl Engine {
                 self.catalog.collection_set_items(id(), &paths())?;
                 Ok(json!({"ok": true}))
             }
-            "smart_eval" => Ok(json!(self.catalog.smart_eval(
-                cmd.get("rules").and_then(|v| v.as_str()).unwrap_or("{}"))?)),
+            "smart_eval" => Ok(json!(self
+                .catalog
+                .smart_eval(cmd.get("rules").and_then(|v| v.as_str()).unwrap_or("{}"))?)),
             "folders" => Ok(json!(self.catalog.folders()?)),
             "assets" => Ok(json!(self.catalog.assets(&path()?)?)),
             _ => anyhow::bail!("unknown library op: {op}"),

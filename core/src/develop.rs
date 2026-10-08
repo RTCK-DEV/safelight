@@ -191,9 +191,6 @@ impl Stats {
     }
 }
 
-
-
-
 fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     curve_lut(points, |x| x, 1.0)
 }
@@ -523,8 +520,20 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         if pm[1] > 0.0 && pm[0] > 0.0 && pm[2] > 0.0 {
             [pm[0] / pm[1], 1.0, pm[2] / pm[1]]
         } else {
-            let g = if m.cam_mul[1] > 0.0 { m.cam_mul[1] } else { 1.0 };
-            [m.cam_mul[0] / g, 1.0, if m.cam_mul[2] > 0.0 { m.cam_mul[2] / g } else { 1.0 }]
+            let g = if m.cam_mul[1] > 0.0 {
+                m.cam_mul[1]
+            } else {
+                1.0
+            };
+            [
+                m.cam_mul[0] / g,
+                1.0,
+                if m.cam_mul[2] > 0.0 {
+                    m.cam_mul[2] / g
+                } else {
+                    1.0
+                },
+            ]
         }
     };
     if r.wb_mode == WbMode::Auto {
@@ -593,14 +602,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             };
             let f = scene_gain * exposure_mul;
             black_pt = (s.luma_percentile(0.01) * f).clamp(0.0, 0.35);
-            white_pt = (s.luma_percentile(0.99) * f)
-                .clamp(black_pt + 0.02, 1.2);
+            white_pt = (s.luma_percentile(0.99) * f).clamp(black_pt + 0.02, 1.2);
         }
     }
 
     let mut spots = [[0.0; 4]; 8];
     for (i, s) in r.spots.iter().take(8).enumerate() {
-        spots[i] = [s[0].clamp(0.0, 1.0), s[1].clamp(0.0, 1.0), s[2].clamp(0.001, 0.3), 0.0];
+        spots[i] = [
+            s[0].clamp(0.0, 1.0),
+            s[1].clamp(0.0, 1.0),
+            s[2].clamp(0.001, 0.3),
+            0.0,
+        ];
     }
     let mut lights = [[0.0; 4]; 8];
     for (i, l) in r.lights.iter().take(8).enumerate() {
@@ -685,7 +698,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             w.ev.clamp(-4.0, 4.0),
             w.sat.clamp(-1.0, 1.0),
             w.temp.clamp(-1.0, 1.0),
-            if w.enabled { w.opacity.clamp(0.0, 1.0) } else { 0.0 },
+            if w.enabled {
+                w.opacity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             0.0,
         ];
     }
@@ -706,7 +723,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             b.ev.clamp(-4.0, 4.0),
             b.sat.clamp(-1.0, 1.0),
             b.temp.clamp(-1.0, 1.0),
-            if b.enabled { b.opacity.clamp(0.0, 1.0) } else { 0.0 },
+            if b.enabled {
+                b.opacity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
         ];
         if b.link_q {
             link_bits += (1u32 << li) as f32;
@@ -724,14 +745,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 if brush_segs.len() >= 4096 {
                     break;
                 }
-                let a = [
-                    (w[0][0] - r.crop[0]) / sw,
-                    (w[0][1] - r.crop[1]) / sh,
-                ];
-                let c = [
-                    (w[1][0] - r.crop[0]) / sw,
-                    (w[1][1] - r.crop[1]) / sh,
-                ];
+                let a = [(w[0][0] - r.crop[0]) / sw, (w[0][1] - r.crop[1]) / sh];
+                let c = [(w[1][0] - r.crop[0]) / sw, (w[1][1] - r.crop[1]) / sh];
                 x0 = x0.min(a[0].min(c[0]));
                 y0 = y0.min(a[1].min(c[1]));
                 x1 = x1.max(a[0].max(c[0]));
@@ -745,19 +760,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             brush_strokes.push([
                 (st.radius / sh).clamp(0.001, 1.0),
                 st.soft.clamp(0.0, 0.98),
-                if st.erase { -st.opacity.abs() } else { st.opacity.abs() },
+                if st.erase {
+                    -st.opacity.abs()
+                } else {
+                    st.opacity.abs()
+                },
                 li as f32,
             ]);
             brush_strokes.push([seg_start, nseg, 0.0, 0.0]);
             brush_strokes.push([x0, y0, x1, y1]);
         }
     }
-    let brush_misc = [
-        (brush_strokes.len() / 3) as f32,
-        link_bits,
-        0.0,
-        0.0,
-    ];
+    let brush_misc = [(brush_strokes.len() / 3) as f32, link_bits, 0.0, 0.0];
 
     let mut clones = [[0.0; 6]; 8];
     for (i, c) in r.clones.iter().take(8).enumerate() {
@@ -1208,11 +1222,7 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     // imported .cube LUT: run display-referred (encode -> lut -> decode back
     // to linear so grain/vignette/windows keep working in the linear domain)
     if let Some(cube) = &p.lut3d {
-        let enc = [
-            srgb_encode(x[0]),
-            srgb_encode(x[1]),
-            srgb_encode(x[2]),
-        ];
+        let enc = [srgb_encode(x[0]), srgb_encode(x[1]), srgb_encode(x[2])];
         let v = cube.sample(enc[0], enc[1], enc[2]);
         for c in 0..3 {
             x[c] = srgb_decode(enc[c] + (v[c] - enc[c]) * p.lut_amt);
@@ -1228,13 +1238,18 @@ pub fn qual_mask(x: [f32; 3], p: &Params) -> f32 {
     let (h, s, _v) = rgb_to_hsv(x);
     let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
     let qb = p.q_blur * 0.25;
-    let mh = 1.0 - sstep(p.qh[1], p.qh[1] + (p.qh[2] + qb).max(1e-4), hue_dist(h, p.qh[0]));
+    let mh = 1.0
+        - sstep(
+            p.qh[1],
+            p.qh[1] + (p.qh[2] + qb).max(1e-4),
+            hue_dist(h, p.qh[0]),
+        );
     let qs2 = p.qs[2] + qb;
-    let ms = sstep(p.qs[0] - qs2, p.qs[0] + qs2, s)
-        * (1.0 - sstep(p.qs[1] - qs2, p.qs[1] + qs2, s));
+    let ms =
+        sstep(p.qs[0] - qs2, p.qs[0] + qs2, s) * (1.0 - sstep(p.qs[1] - qs2, p.qs[1] + qs2, s));
     let ql2 = p.ql[2] + qb;
-    let ml = sstep(p.ql[0] - ql2, p.ql[0] + ql2, l)
-        * (1.0 - sstep(p.ql[1] - ql2, p.ql[1] + ql2, l));
+    let ml =
+        sstep(p.ql[0] - ql2, p.ql[0] + ql2, l) * (1.0 - sstep(p.ql[1] - ql2, p.ql[1] + ql2, l));
     let mut mask = mh * ms * ml;
     let cb = p.q_clean[0];
     let cw = p.q_clean[1];
@@ -1286,9 +1301,9 @@ pub fn build_demosaic_taps(cfa: &CfaPattern) -> DemosaicTaps {
                             if ((dx * dx + dy * dy) as f32) > r2 {
                                 continue;
                             }
-                            let cell = cfa.cells
-                                [(py as i32 + dy).rem_euclid(ph as i32) as usize * pw
-                                    + (px as i32 + dx).rem_euclid(pw as i32) as usize];
+                            let cell = cfa.cells[(py as i32 + dy).rem_euclid(ph as i32) as usize
+                                * pw
+                                + (px as i32 + dx).rem_euclid(pw as i32) as usize];
                             let cc = if cell == 3 { 1usize } else { cell as usize };
                             if cc == ch {
                                 taps.push((dx, dy));
@@ -1458,7 +1473,9 @@ fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32;
                         // weight (sorted by d) reaches half the total
                         let n = nc;
                         let c = &mut cand[..n];
-                        c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        c.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         let mut acc = 0.0f32;
                         let mut dm = c[n - 1].0;
                         for &(d, w) in c.iter() {
@@ -1611,7 +1628,9 @@ pub fn correct_plane(
                 px[ch] = bilinear3(plane, w, h, sx, sy, ch);
             }
             if vig_on {
-                let att = (1.0 + c.vig[0] * ru * ru + c.vig[1] * ru * ru * ru * ru
+                let att = (1.0
+                    + c.vig[0] * ru * ru
+                    + c.vig[1] * ru * ru * ru * ru
                     + c.vig[2] * ru * ru * ru * ru * ru * ru)
                     .max(0.05);
                 let g = 1.0 + (1.0 / att - 1.0) * amount;
@@ -1648,7 +1667,9 @@ pub fn lens_map(
     let rd = inv_dist(c.model, c.abc, ru) / c.scale;
     let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
     let g = if c.vig != [0.0; 3] {
-        let att = (1.0 + c.vig[0] * ru * ru + c.vig[1] * ru * ru * ru * ru
+        let att = (1.0
+            + c.vig[0] * ru * ru
+            + c.vig[1] * ru * ru * ru * ru
             + c.vig[2] * ru * ru * ru * ru * ru * ru)
             .max(0.05);
         1.0 + (1.0 / att - 1.0) * amount
@@ -1678,13 +1699,7 @@ fn bilinear3(plane: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize
 /// sensor coordinates, which is what libraw's filters/xtrans refer to.
 /// When a channel has no samples inside the block (small stride), the
 /// window is widened until every channel is covered.
-fn demosaic_pixel(
-    m: &Mosaic,
-    vx: usize,
-    vy: usize,
-    stride: usize,
-    norm: &[f32; 4],
-) -> [f32; 3] {
+fn demosaic_pixel(m: &Mosaic, vx: usize, vy: usize, stride: usize, norm: &[f32; 4]) -> [f32; 3] {
     let cfa = &m.cfa;
     let x0 = m.left + vx * stride;
     let y0 = m.top + vy * stride;
@@ -1768,7 +1783,7 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
         let mut acc = [0.0f64; 3];
         let mut luma = 0.0f64;
         let step = 4usize; // sparse sample
-        // WB pick rectangle (virtual src px); empty when not picking
+                           // WB pick rectangle (virtual src px); empty when not picking
         let pr = if r.wb_mode == WbMode::Pick {
             pick_rect(r.wb_pick, vw, vh, m.info.flip, r.wb_pick_size)
         } else {
@@ -1786,7 +1801,11 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
                 luma += l as f64;
                 s.luma_hist[(l * 255.0) as usize] += 1;
                 s.count += 1;
-                if vx as f32 >= pr[0] && vx as f32 <= pr[2] && vy as f32 >= pr[1] && vy as f32 <= pr[3] {
+                if vx as f32 >= pr[0]
+                    && vx as f32 <= pr[2]
+                    && vy as f32 >= pr[1]
+                    && vy as f32 <= pr[3]
+                {
                     for ch in 0..3 {
                         pacc[ch] += c[ch] as f64;
                     }
@@ -1809,7 +1828,10 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
         ];
         s.luma_mean = (luma / s.count as f64) as f32;
         if std::env::var_os("ARA_STATS").is_some() {
-            eprintln!("[stats] means={:?} luma_mean={:.4} count={}", s.means, s.luma_mean, s.count);
+            eprintln!(
+                "[stats] means={:?} luma_mean={:.4} count={}",
+                s.means, s.luma_mean, s.count
+            );
             eprintln!(
                 "[stats] p1={:.4} p50={:.4} p99={:.4}",
                 s.luma_percentile(0.01),
@@ -1838,18 +1860,23 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
     let corr = if r.lens_corr > 0.001 {
         crate::lensdb::db().and_then(|d| {
             let c = d.correction(
-                &m.info.lens, &m.info.make, &m.info.model,
-                m.info.focal, m.info.aperture,
+                &m.info.lens,
+                &m.info.make,
+                &m.info.model,
+                m.info.focal,
+                m.info.aperture,
             );
-            if c.is_empty() { None } else { Some(c) }
+            if c.is_empty() {
+                None
+            } else {
+                Some(c)
+            }
         })
     } else {
         None
     };
     let plane = match (plane, &corr) {
-        (Some(pl), Some(c)) => {
-            Some(correct_plane(&pl, vw, vh, c, r.lens_corr.min(1.0)))
-        }
+        (Some(pl), Some(c)) => Some(correct_plane(&pl, vw, vh, c, r.lens_corr.min(1.0))),
         (pl, _) => pl,
     };
 
@@ -1860,8 +1887,7 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
                 Some(pl) => pl[vy * vw + vx],
                 None => match &corr {
                     Some(c) => {
-                        let (sx, sy, g) =
-                            lens_map(c, vx, vy, vw, vh, r.lens_corr.min(1.0));
+                        let (sx, sy, g) = lens_map(c, vx, vy, vw, vh, r.lens_corr.min(1.0));
                         let mut cc = demosaic_pixel(
                             m,
                             (sx.round() as usize).min(vw - 1),
@@ -1914,7 +1940,11 @@ fn develop_raster(
         maximum: 65535,
         cam_mul: [1.0; 4],
         cam_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0; 3]],
-        rgb_cam: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        rgb_cam: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
         pre_mul: [1.0; 4],
         cfa: crate::decode::CfaPattern {
             w: 2,
@@ -1937,7 +1967,8 @@ fn develop_raster(
     let stats = if Stats::needs(r) {
         let mut s = Stats::default();
         for px in rgba.chunks_exact(4).step_by(4) {
-            let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 65535.0;
+            let l =
+                (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 65535.0;
             s.luma_hist[(l.clamp(0.0, 1.0) * 255.0) as usize] += 1;
             s.luma_mean += l;
             s.count += 1;
@@ -1986,7 +2017,16 @@ pub(crate) fn frame_geometry(
     } else {
         (ew.round().max(1.0) as u32, eh.round().max(1.0) as u32)
     };
-    (fw, fh, cl, ct, ew, eh, dw.max(1) as usize, dh.max(1) as usize)
+    (
+        fw,
+        fh,
+        cl,
+        ct,
+        ew,
+        eh,
+        dw.max(1) as usize,
+        dh.max(1) as usize,
+    )
 }
 
 /// spot heal on the demosaiced buffer: replace each spot's interior with the
@@ -2129,12 +2169,7 @@ fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: 
 
 /// pick the donor offset for one heal spot. `sample` is clamped nearest.
 /// Same candidate set + scoring as gpu.rs `heal_src` — keep in sync.
-fn heal_find_source(
-    sample: &dyn Fn(f32, f32) -> [f32; 3],
-    sx: f32,
-    sy: f32,
-    r: f32,
-) -> (f32, f32) {
+fn heal_find_source(sample: &dyn Fn(f32, f32) -> [f32; 3], sx: f32, sy: f32, r: f32) -> (f32, f32) {
     let tau = std::f32::consts::TAU;
     // target annulus: 8 taps just outside the spot edge
     let mut targ = [[0.0f32; 3]; 8];
@@ -2473,15 +2508,17 @@ fn bilin_ch(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize) -
 
 /// beauty (skin-masked smoothing) + deband (flat-gradient smoothing)
 fn beauty_deband(lin: &[[f32; 3]], w: usize, h: usize, beauty: f32, deband: f32) -> Vec<[f32; 3]> {
-    let chans: Vec<Vec<f32>> = (0..3)
-        .map(|c| lin.iter().map(|p| p[c]).collect())
-        .collect();
+    let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
     let mut out = vec![[0.0f32; 3]; lin.len()];
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
             let c = lin[i];
-            let m = [box3(&chans[0], w, h, x, y), box3(&chans[1], w, h, x, y), box3(&chans[2], w, h, x, y)];
+            let m = [
+                box3(&chans[0], w, h, x, y),
+                box3(&chans[1], w, h, x, y),
+                box3(&chans[2], w, h, x, y),
+            ];
             let skin = if beauty > 0.0 { skin_mask(c) } else { 0.0 };
             let flat = {
                 let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -2600,9 +2637,21 @@ pub fn scopes(rgba8: &[u8], w: u32, h: u32, wave: &mut [u32], vec: &mut [u32], c
             let cri = cr.clamp(0.0, 255.0) as usize;
             vec[cri * 256 + cbi] += 1;
             // sRGB -> CIE XYZ -> xy chromaticity
-            let lr = if r <= 0.04045 { r / 12.92 } else { ((r + 0.055) / 1.055).powf(2.4) };
-            let lg = if g <= 0.04045 { g / 12.92 } else { ((g + 0.055) / 1.055).powf(2.4) };
-            let lb = if b <= 0.04045 { b / 12.92 } else { ((b + 0.055) / 1.055).powf(2.4) };
+            let lr = if r <= 0.04045 {
+                r / 12.92
+            } else {
+                ((r + 0.055) / 1.055).powf(2.4)
+            };
+            let lg = if g <= 0.04045 {
+                g / 12.92
+            } else {
+                ((g + 0.055) / 1.055).powf(2.4)
+            };
+            let lb = if b <= 0.04045 {
+                b / 12.92
+            } else {
+                ((b + 0.055) / 1.055).powf(2.4)
+            };
             let xx = 0.4124 * lr + 0.3576 * lg + 0.1805 * lb;
             let yy = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
             let zz = 0.0193 * lr + 0.1192 * lg + 0.9505 * lb;
@@ -2635,7 +2684,10 @@ fn fit(w: u32, h: u32, max_px: u32) -> (u32, u32) {
         return (w.max(1), h.max(1));
     }
     let s = max_px as f32 / w.max(h) as f32;
-    (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
+    (
+        ((w as f32 * s).round() as u32).max(1),
+        ((h as f32 * s).round() as u32).max(1),
+    )
 }
 
 fn box3(chan: &[f32], w: usize, h: usize, x: usize, y: usize) -> f32 {
@@ -2736,9 +2788,7 @@ fn sharpen_clarity(
     sharpen: f32,
     clarity: f32,
 ) -> Vec<[f32; 3]> {
-    let chans: Vec<Vec<f32>> = (0..3)
-        .map(|c| lin.iter().map(|p| p[c]).collect())
-        .collect();
+    let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
     let boxn = |chan: &[f32], x: usize, y: usize, rad: i32| {
         let mut s = 0.0f32;
         let mut n = 0u32;
@@ -2758,8 +2808,8 @@ fn sharpen_clarity(
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
-            let lum = (0.2126 * lin[i][0] + 0.7152 * lin[i][1] + 0.0722 * lin[i][2])
-                .clamp(0.0, 1.0);
+            let lum =
+                (0.2126 * lin[i][0] + 0.7152 * lin[i][1] + 0.0722 * lin[i][2]).clamp(0.0, 1.0);
             let mid = 4.0 * lum * (1.0 - lum);
             for c in 0..3 {
                 let mut v = lin[i][c];

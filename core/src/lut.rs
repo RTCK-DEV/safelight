@@ -19,13 +19,16 @@ impl CubeLut {
     /// trilinear sample; inputs are display-domain (sRGB-encoded) 0..1
     pub fn sample(&self, r: f32, g: f32, b: f32) -> [f32; 3] {
         let n = self.size as f32;
-        let norm = |v: f32, c: usize| {
-            (v * self.dscale[c] + self.dmin[c]).clamp(0.0, 1.0) * (n - 1.0)
-        };
+        let norm =
+            |v: f32, c: usize| (v * self.dscale[c] + self.dmin[c]).clamp(0.0, 1.0) * (n - 1.0);
         let fx = norm(r, 0);
         let fy = norm(g, 1);
         let fz = norm(b, 2);
-        let (x0, y0, z0) = (fx.floor() as usize, fy.floor() as usize, fz.floor() as usize);
+        let (x0, y0, z0) = (
+            fx.floor() as usize,
+            fy.floor() as usize,
+            fz.floor() as usize,
+        );
         let (x1, y1, z1) = (
             (x0 + 1).min(self.size - 1),
             (y0 + 1).min(self.size - 1),
@@ -64,22 +67,30 @@ fn parse_cube(text: &str) -> Option<CubeLut> {
             size = line.split_whitespace().nth(1)?.parse().ok()?;
             continue;
         }
-        if up.starts_with("LUT_1D_SIZE") || up.starts_with("TITLE")
-            || up.starts_with("COMMENT") || up.starts_with("LUT_")
+        if up.starts_with("LUT_1D_SIZE")
+            || up.starts_with("TITLE")
+            || up.starts_with("COMMENT")
+            || up.starts_with("LUT_")
         {
             continue;
         }
         if up.starts_with("DOMAIN_MIN") {
-            let v: Vec<f32> = line.split_whitespace().skip(1)
-                .filter_map(|s| s.parse().ok()).collect();
+            let v: Vec<f32> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|s| s.parse().ok())
+                .collect();
             if v.len() == 3 {
                 dmin = [v[0], v[1], v[2]];
             }
             continue;
         }
         if up.starts_with("DOMAIN_MAX") {
-            let v: Vec<f32> = line.split_whitespace().skip(1)
-                .filter_map(|s| s.parse().ok()).collect();
+            let v: Vec<f32> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|s| s.parse().ok())
+                .collect();
             if v.len() == 3 {
                 dmax = [v[0], v[1], v[2]];
             }
@@ -125,7 +136,12 @@ static CACHE: Mutex<Option<HashMap<String, ((u128, u64), CubeLut)>>> = Mutex::ne
 pub fn load(path: &str) -> Option<CubeLut> {
     let stamp = {
         let m = std::fs::metadata(path).ok()?;
-        let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        let t = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
         (t, m.len())
     };
     {

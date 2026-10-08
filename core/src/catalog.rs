@@ -75,7 +75,10 @@ fn db_path() -> PathBuf {
 }
 
 pub fn thumbs_dir() -> PathBuf {
-    let base = db_path().parent().map(Path::to_path_buf).unwrap_or_default();
+    let base = db_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let d = base.join("thumbs");
     let _ = fs::create_dir_all(&d);
     d
@@ -164,11 +167,19 @@ impl Catalog {
         let mut entries: Vec<AssetEntry> = Vec::new();
         let raster_stems: HashMap<String, PathBuf> = rasters
             .iter()
-            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| (s.to_string(), p.clone())))
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| (s.to_string(), p.clone()))
+            })
             .collect();
         let raw_stems: HashSet<String> = raws
             .iter()
-            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         let now = std::time::SystemTime::now()
@@ -179,7 +190,9 @@ impl Catalog {
         // stack ids assigned by the catalog (survive rescans)
         let mut stacks: HashMap<String, (i64, i32)> = HashMap::new();
         {
-            let mut st = self.db.prepare("SELECT path, stack, stack_seq FROM files")?;
+            let mut st = self
+                .db
+                .prepare("SELECT path, stack, stack_seq FROM files")?;
             let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             for r in rows.flatten() {
                 stacks.insert(r.0, (r.1, r.2));
@@ -269,12 +282,22 @@ impl Catalog {
         };
 
         for p in &raws {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            let pair = raster_stems.get(&stem).map(|q| q.to_string_lossy().into_owned());
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let pair = raster_stems
+                .get(&stem)
+                .map(|q| q.to_string_lossy().into_owned());
             push(p, "raw", pair);
         }
         for p in &rasters {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             if raw_stems.contains(&stem) {
                 continue; // shown via raw entry
             }
@@ -331,7 +354,9 @@ impl Catalog {
 
     /// every folder ever scanned (for the library sidebar)
     pub fn folders(&self) -> Result<Vec<String>> {
-        let mut st = self.db.prepare("SELECT DISTINCT folder FROM files ORDER BY folder")?;
+        let mut st = self
+            .db
+            .prepare("SELECT DISTINCT folder FROM files ORDER BY folder")?;
         let rows = st.query_map([], |r| r.get(0))?;
         Ok(rows.flatten().collect())
     }
@@ -340,8 +365,10 @@ impl Catalog {
         // keep the DB mirror in sync when a sidecar field changes
         let sql = format!("UPDATE files SET {set}=?1 WHERE path=?2");
         let p = asset.to_string_lossy().into_owned();
-        let _ = self.db.execute(&sql, rusqlite::params_from_iter(
-            [v as &dyn rusqlite::ToSql, &p as &dyn rusqlite::ToSql]));
+        let _ = self.db.execute(
+            &sql,
+            rusqlite::params_from_iter([v as &dyn rusqlite::ToSql, &p as &dyn rusqlite::ToSql]),
+        );
     }
 
     pub fn set_rating(&self, asset: &Path, rating: i32) -> Result<()> {
@@ -376,7 +403,11 @@ impl Catalog {
         let mut sc = read_sidecar(&sp).unwrap_or_default();
         sc.keywords = keywords.to_vec();
         write_sidecar(&sp, &sc)?;
-        self.touch_row(asset, "keywords", &serde_json::to_string(&sc.keywords).unwrap_or_default());
+        self.touch_row(
+            asset,
+            "keywords",
+            &serde_json::to_string(&sc.keywords).unwrap_or_default(),
+        );
         Ok(())
     }
 
@@ -394,7 +425,9 @@ impl Catalog {
     pub fn stack_group(&self, paths: &[String]) -> Result<i64> {
         let next: i64 = self
             .db
-            .query_row("SELECT COALESCE(MAX(stack),0)+1 FROM files", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(stack),0)+1 FROM files", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(1);
         for (i, p) in paths.iter().enumerate() {
             let _ = self.db.execute(
@@ -419,10 +452,8 @@ impl Catalog {
             "UPDATE files SET stack_seq=stack_seq+1 WHERE stack=(SELECT stack FROM files WHERE path=?1)",
             params![path],
         );
-        self.db.execute(
-            "UPDATE files SET stack_seq=0 WHERE path=?1",
-            params![path],
-        )?;
+        self.db
+            .execute("UPDATE files SET stack_seq=0 WHERE path=?1", params![path])?;
         Ok(())
     }
 
@@ -486,7 +517,10 @@ impl Catalog {
         // smart collections report their live match count
         for c in out.iter_mut() {
             if c.smart == 1 {
-                c.count = self.smart_eval(&c.rules).map(|v| v.len() as u32).unwrap_or(0);
+                c.count = self
+                    .smart_eval(&c.rules)
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
             }
         }
         Ok(out)
@@ -501,21 +535,26 @@ impl Catalog {
     }
 
     pub fn collection_rename(&self, id: i64, name: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE collections SET name=?1 WHERE id=?2", params![name, id])?;
+        self.db.execute(
+            "UPDATE collections SET name=?1 WHERE id=?2",
+            params![name, id],
+        )?;
         Ok(())
     }
 
     pub fn collection_set_rules(&self, id: i64, rules: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE collections SET rules=?1 WHERE id=?2", params![rules, id])?;
+        self.db.execute(
+            "UPDATE collections SET rules=?1 WHERE id=?2",
+            params![rules, id],
+        )?;
         Ok(())
     }
 
     pub fn collection_delete(&self, id: i64) -> Result<()> {
         self.db
             .execute("DELETE FROM collection_items WHERE coll_id=?1", params![id])?;
-        self.db.execute("DELETE FROM collections WHERE id=?1", params![id])?;
+        self.db
+            .execute("DELETE FROM collections WHERE id=?1", params![id])?;
         Ok(())
     }
 
@@ -576,7 +615,11 @@ impl Catalog {
              FROM files WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        for (key, col) in [("camera_contains", "camera"), ("lens_contains", "lens"), ("name_contains", "name")] {
+        for (key, col) in [
+            ("camera_contains", "camera"),
+            ("lens_contains", "lens"),
+            ("name_contains", "name"),
+        ] {
             if let Some(s) = r.get(key).and_then(|v| v.as_str()) {
                 if !s.is_empty() {
                     sql.push_str(&format!(" AND {col} LIKE ?"));
@@ -641,8 +684,7 @@ impl Catalog {
             if !keyword.is_empty() && !e.keywords.iter().any(|k| k == keyword) {
                 return false;
             }
-            if edited && e.rating == 0 && e.label.is_empty() && e.flag == 0
-                && e.keywords.is_empty()
+            if edited && e.rating == 0 && e.label.is_empty() && e.flag == 0 && e.keywords.is_empty()
             {
                 return false;
             }
@@ -723,7 +765,8 @@ mod tests {
         fs::File::create(&raw).unwrap().write_all(b"x").unwrap();
         let c = Catalog::open_mem().unwrap();
         c.set_flag(&raw, 1).unwrap();
-        c.set_keywords(&raw, &["sunset".into(), "test".into()]).unwrap();
+        c.set_keywords(&raw, &["sunset".into(), "test".into()])
+            .unwrap();
         let sc = read_sidecar(&sidecar_path_for(&raw)).unwrap();
         assert_eq!(sc.flag, 1);
         assert_eq!(sc.keywords, vec!["sunset", "test"]);
@@ -744,14 +787,16 @@ mod tests {
         let id = c.stack_group(&["a".into(), "b".into()]).unwrap();
         assert!(id > 0);
         c.stack_cover("b").unwrap();
-        let seq: i32 = c.db
-            .query_row("SELECT stack_seq FROM files WHERE path='b'", [], |r| r.get(0))
+        let seq: i32 =
+            c.db.query_row("SELECT stack_seq FROM files WHERE path='b'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(seq, 0);
         c.stack_ungroup(id).unwrap();
-        let s: i64 = c.db
-            .query_row("SELECT stack FROM files WHERE path='a'", [], |r| r.get(0))
-            .unwrap();
+        let s: i64 =
+            c.db.query_row("SELECT stack FROM files WHERE path='a'", [], |r| r.get(0))
+                .unwrap();
         assert_eq!(s, 0);
     }
 
@@ -789,9 +834,11 @@ mod tests {
              VALUES('a','a','f','raw',5,'red',1,'[\"sun\"]','Canon R5','RF50'),
                     ('b','b','f','raw',1,'',0,'[]','Nikon Z9','Z24'),
                     ('c','c','f','raw',0,'blue',-1,'[\"sun\"]','Canon R5','RF85');",
-        ).unwrap();
+        )
+        .unwrap();
         let id = c.collection_add("favs", false, "").unwrap();
-        c.collection_add_items(id, &["a".into(), "c".into()]).unwrap();
+        c.collection_add_items(id, &["a".into(), "c".into()])
+            .unwrap();
         assert_eq!(c.collection_items(id).unwrap().len(), 2);
         c.collection_remove_items(id, &["c".into()]).unwrap();
         assert_eq!(c.collection_items(id).unwrap(), vec!["a"]);
@@ -806,7 +853,9 @@ mod tests {
         assert_eq!(hits.len(), 2);
         let hits = c.smart_eval(r#"{"flag":-1}"#).unwrap();
         assert_eq!(hits[0].name, "c");
-        let hits = c.smart_eval(r#"{"camera_contains":"canon","label":"blue"}"#).unwrap();
+        let hits = c
+            .smart_eval(r#"{"camera_contains":"canon","label":"blue"}"#)
+            .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -816,7 +865,8 @@ mod tests {
         c.db.execute_batch(
             "INSERT INTO files(path,name,folder,kind,rating,flag,keywords,stack,ctime,iso)
              VALUES('a','a','/f','raw',3,1,'[\"k\"]',7,100,800);",
-        ).unwrap();
+        )
+        .unwrap();
         let a = c.assets(Path::new("/f")).unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].rating, 3);

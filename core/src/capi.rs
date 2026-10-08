@@ -41,7 +41,9 @@ fn cstr(p: *const c_char) -> String {
 }
 
 fn into_raw_string(s: String) -> *mut c_char {
-    CString::new(s).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 fn into_raw_image(img: RgbaImage) -> AraImage {
@@ -95,7 +97,9 @@ pub unsafe extern "C" fn araware_free_engine(e: *mut c_void) {
 pub extern "C" fn araware_last_error() -> *mut c_char {
     LAST_ERROR.with(|s| {
         let guard = s.lock().unwrap();
-        CString::new(guard.as_bytes()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+        CString::new(guard.as_bytes())
+            .map(CString::into_raw)
+            .unwrap_or(std::ptr::null_mut())
     })
 }
 
@@ -109,14 +113,18 @@ pub unsafe extern "C" fn araware_free_string(s: *mut c_char) {
 #[no_mangle]
 pub unsafe extern "C" fn araware_free_image(img: AraImage) {
     if !img.data.is_null() && img.len > 0 {
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(img.data, img.len) as *mut [u8]));
+        drop(Box::from_raw(
+            std::slice::from_raw_parts_mut(img.data, img.len) as *mut [u8],
+        ));
     }
 }
 
 /// returns JSON array of assets
 #[no_mangle]
 pub unsafe extern "C" fn araware_scan_folder(e: *mut c_void, folder: *const c_char) -> *mut c_char {
-    let Some(eng) = engine(e) else { return std::ptr::null_mut() };
+    let Some(eng) = engine(e) else {
+        return std::ptr::null_mut();
+    };
     match eng.scan(Path::new(&cstr(folder))) {
         Ok(list) => into_raw_string(serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())),
         Err(err) => {
@@ -132,7 +140,9 @@ pub unsafe extern "C" fn araware_thumbnail(
     path: *const c_char,
     max_px: u32,
 ) -> AraImage {
-    let Some(eng) = engine(e) else { return null_image() };
+    let Some(eng) = engine(e) else {
+        return null_image();
+    };
     match eng.thumbnail(Path::new(&cstr(path)), max_px) {
         Ok(img) => into_raw_image(img),
         Err(err) => {
@@ -150,7 +160,9 @@ pub unsafe extern "C" fn araware_render(
     recipe_json: *const c_char,
     max_px: u32,
 ) -> AraImage {
-    let Some(eng) = engine(e) else { return null_image() };
+    let Some(eng) = engine(e) else {
+        return null_image();
+    };
     let recipe = cstr(recipe_json);
     let recipe = if recipe.is_empty() {
         Recipe::default()
@@ -220,11 +232,7 @@ pub unsafe extern "C" fn araware_scopes(
             std::ptr::copy_nonoverlapping(ce.as_ptr(), cie, ce.len());
         }
         if !hist.is_null() {
-            std::ptr::copy_nonoverlapping(
-                crate::develop::histogram(data).as_ptr(),
-                hist,
-                1024,
-            );
+            std::ptr::copy_nonoverlapping(crate::develop::histogram(data).as_ptr(), hist, 1024);
         }
     }
     img
@@ -242,7 +250,9 @@ pub unsafe extern "C" fn araware_export(
 
 #[no_mangle]
 pub unsafe extern "C" fn araware_metadata(e: *mut c_void, path: *const c_char) -> *mut c_char {
-    let Some(eng) = engine(e) else { return std::ptr::null_mut() };
+    let Some(eng) = engine(e) else {
+        return std::ptr::null_mut();
+    };
     match eng.metadata(Path::new(&cstr(path))) {
         Ok(v) => into_raw_string(v.to_string()),
         Err(err) => {
@@ -365,7 +375,9 @@ pub unsafe extern "C" fn araware_sidecar_write_v(
 /// Returns a JSON string (or null + last_error on failure).
 #[no_mangle]
 pub unsafe extern "C" fn araware_library(e: *mut c_void, cmd_json: *const c_char) -> *mut c_char {
-    let Some(eng) = engine(e) else { return std::ptr::null_mut() };
+    let Some(eng) = engine(e) else {
+        return std::ptr::null_mut();
+    };
     let cmd: serde_json::Value = match serde_json::from_str(&cstr(cmd_json)) {
         Ok(v) => v,
         Err(err) => {
