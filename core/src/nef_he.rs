@@ -831,7 +831,6 @@ const LB_SB: [(usize, usize); LBS] = [
 /// previous-precinct GCLI history.
 struct Pred {
     index: usize,
-    tile: usize,
     store: Vec<Vec<u8>>, // per-sub-band previous GCLIs
     cur12: Vec<u8>,      // this precinct's sb 12 (consumed by sb 23)
 }
@@ -840,7 +839,6 @@ impl Pred {
     fn new(lay: &Layout) -> Self {
         Self {
             index: 0,
-            tile: 0,
             store: lay.sb.iter().map(|s| vec![0u8; s.ng]).collect(),
             cur12: vec![0u8; lay.sb[12].ng],
         }
@@ -1259,7 +1257,6 @@ fn decode_tile(
     let kband = lift_st;
 
     let mut pred = Pred::new(lay);
-    pred.tile = tile_idx;
     let mut ver: Vec<VlState> = (0..4).map(|_| VlState::new(lift_st, first)).collect();
     let buf_len = 4 * pass_stride;
     let (mut buf_a, mut buf_b) = (vec![0i32; buf_len], vec![0i32; buf_len]);
@@ -2003,6 +2000,30 @@ mod tests {
         eprintln!("empty 256x256 zones: {empty}");
         assert!(mx > 1000, "no signal");
         assert_eq!(empty, 0, "dead zones present");
+    }
+}
+
+// quick check: does decode_nef_he succeed on these files directly?
+#[test]
+fn check_he_files() {
+    for f in [
+        "/Users/devin/real-raws/net/nikon_z9_he.nef",
+        "/Users/devin/real-raws/net/nikon_z8_he_high.nef",
+        "/Users/devin/real-raws/net/nikon_z9_he_star.nef",
+    ] {
+        if !std::path::Path::new(f).exists() {
+            continue;
+        }
+        let r = decode_nef_he(std::path::Path::new(f));
+        match &r {
+            Ok((b, w, h)) => {
+                let mn = b.iter().min().copied().unwrap_or(0);
+                let mx = b.iter().max().copied().unwrap_or(0);
+                let mean: u64 = b.iter().map(|&v| v as u64).sum::<u64>() / b.len() as u64;
+                eprintln!("{f}: OK {w}x{h} min={mn} max={mx} mean={mean}");
+            }
+            Err(e) => eprintln!("{f}: ERR {e}"),
+        }
     }
 }
 
