@@ -7,9 +7,9 @@ use anyhow::{bail, Context, Result};
 use crate::ffi;
 
 pub const RAW_EXTS: &[&str] = &[
-    "arw", "cr2", "cr3", "crw", "nef", "nrw", "raf", "orf", "ori", "rw2", "dng",
-    "pef", "srw", "x3f", "mrw", "erf", "raw", "rwl", "dcr", "kdc", "mos", "3fr",
-    "fff", "iiq", "r3d", "gpr", "ari", "srf", "sr2",
+    "arw", "cr2", "cr3", "crw", "nef", "nrw", "raf", "orf", "ori", "rw2", "dng", "pef", "srw",
+    "x3f", "mrw", "erf", "raw", "rwl", "dcr", "kdc", "mos", "3fr", "fff", "iiq", "r3d", "gpr",
+    "ari", "srf", "sr2",
 ];
 pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp"];
 
@@ -150,8 +150,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
                     rgba,
                     w,
                     h: hh,
-                    info: crate::x3f::probe_x3f(path)
-                        .unwrap_or_else(empty_camera_info),
+                    info: crate::x3f::probe_x3f(path).unwrap_or_else(empty_camera_info),
                     flip: 0,
                 });
             }
@@ -177,9 +176,17 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     }
     let rc = unsafe { ffi::ara_raw_unpack(h.ptr) };
     if rc != 0 {
-        // sensor compression libraw can't decode (Nikon HE/HE* "TicoRAW",
-        // etc.): try macOS ImageIO (system codec) then the largest embedded
-        // preview — degrade gracefully instead of refusing to open.
+        // Nikon HE/HE* ("TicoRAW"): our own decoder extracts the actual
+        // Bayer mosaic — real CFA data beats any sRGB fallback, so try it
+        // before the OS codec and the embedded preview.
+        if std::env::var_os("ARA_NO_HE").is_none() {
+            if let Ok((bayer, bw, bh)) = crate::nef_he::decode_nef_he(path) {
+                return mosaic_decoded(&info, bayer, bw, bh);
+            }
+        }
+        // other sensor compression libraw can't decode: try macOS ImageIO
+        // (system codec) then the largest embedded preview — degrade
+        // gracefully instead of refusing to open.
         if let Ok(d) = imgio_decode(path, &info) {
             return Ok(d);
         }
@@ -197,11 +204,27 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         bail!("ara_raw_cfa failed ({rc})");
     }
     let data = unsafe { Vec::from_raw_parts(out, count as usize, count as usize) };
+    mosaic_decoded(
+        &info,
+        data,
+        info.raw_width as usize,
+        info.raw_height as usize,
+    )
+}
 
+/// Shared Mosaic construction for CFA decodes (libraw unpack or our own
+/// Nikon HE decoder). `raw_w`/`raw_h` are the decoded buffer's dimensions;
+/// the visible frame/margins/CFA/color data come from libraw's metadata.
+fn mosaic_decoded(
+    info: &ffi::AraRawInfo,
+    data: Vec<u16>,
+    raw_w: usize,
+    raw_h: usize,
+) -> Result<Decoded> {
     let (w, hgt) = if info.width > 0 && info.height > 0 {
         (info.width as usize, info.height as usize)
     } else {
-        (info.raw_width as usize, info.raw_height as usize)
+        (raw_w, raw_h)
     };
     let cfa = CfaPattern {
         w: info.cfa_w as usize,
@@ -214,7 +237,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     let mut black = info.black;
     estimate_black_floor(
         &data,
-        info.raw_width as usize,
+        raw_w,
         info.left_margin as usize,
         info.top_margin as usize,
         w,
@@ -225,8 +248,8 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     );
     Ok(Decoded::Mosaic(Mosaic {
         data,
-        raw_w: info.raw_width as usize,
-        raw_h: info.raw_height as usize,
+        raw_w,
+        raw_h,
         left: info.left_margin as usize,
         top: info.top_margin as usize,
         w,
@@ -238,7 +261,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         rgb_cam: info.rgb_cam,
         pre_mul: info.pre_mul,
         cfa,
-        info: info_of(&info),
+        info: info_of(info),
     }))
 }
 
@@ -325,9 +348,7 @@ fn imgio_decode(path: &Path, info: &ffi::AraRawInfo) -> Result<Decoded> {
 fn embedded_preview(h: &RawHandle, info: &ffi::AraRawInfo) -> Result<Decoded> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);
-    let rc = unsafe {
-        ffi::ara_thumb_best(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt)
-    };
+    let rc = unsafe { ffi::ara_thumb_best(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
     if rc != 0 || out.is_null() || len <= 0 {
         bail!("no embedded preview ({rc})");
     }
@@ -562,4 +583,34 @@ pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
         rgba,
         flip: info.flip,
     }))
+}
+
+#[cfg(test)]
+mod heinfo {
+    use super::*;
+    #[test]
+    fn print_info() {
+        for f in [
+            "real-raws/net/nikon_z9_he_star.nef",
+            "real-raws/net/nikon_z8_lossless.nef",
+        ] {
+            let fp = format!("/Users/devin/{f}");
+            let p = Path::new(&fp);
+            match decode(p) {
+                Ok(Decoded::Mosaic(m)) => {
+                    eprintln!(
+                        "{f}: black={:?} max={} cam_mul={:?} pre_mul={:?}",
+                        m.black, m.maximum, m.cam_mul, m.pre_mul
+                    );
+                    eprintln!("  rgb_cam={:?}", m.rgb_cam);
+                    eprintln!(
+                        "  cfa={:?} w={}x{} raw={}x{} margins={}/{}",
+                        m.cfa.cells, m.w, m.h, m.raw_w, m.raw_h, m.left, m.top
+                    );
+                }
+                Ok(_) => eprintln!("{f}: raster"),
+                Err(e) => eprintln!("{f}: ERR {e}"),
+            }
+        }
+    }
 }

@@ -13,6 +13,7 @@ pub mod ffi;
 pub mod gpu;
 pub mod lensdb;
 pub mod lut;
+pub mod nef_he;
 pub mod recipe;
 pub mod x3f;
 
