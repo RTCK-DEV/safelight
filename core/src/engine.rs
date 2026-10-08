@@ -305,6 +305,10 @@ impl Engine {
             "kind": if decode::is_raw(path) { "raw" } else { "raster" },
         });
         if decode::is_raster(path) {
+            if let Ok((w, h)) = image::image_dimensions(path) {
+                v["width"] = json!(w);
+                v["height"] = json!(h);
+            }
             if let Ok(f) = std::fs::File::open(path) {
                 let ex = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f));
                 if let Ok(ex) = ex {

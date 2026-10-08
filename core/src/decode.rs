@@ -31,7 +31,7 @@ pub fn is_raster(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CameraInfo {
     pub make: String,
     pub model: String,
