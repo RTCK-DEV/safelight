@@ -124,7 +124,7 @@ struct Uni {
     /// ColorSlice: 7 wedges [hue_shift, sat_delta, lum_delta, enabled]
     cs: [[f32; 4]; 7],
     /// ColorWarper: 8 points × 2 vec4 ([h,s,dh,ds] then [radius,0,0,0])
-    warp: [[f32; 4]; 10],
+    warp: [[f32; 4]; 16],
     /// [n_warp, has_cs, 0, 0]
     csn: [f32; 4],
 }
@@ -198,7 +198,7 @@ struct Uni {
     misc3: vec4<f32>,
     // ColorSlice wedges + ColorWarper points; csn = [n_warp, has_cs, 0, 0]
     cs: array<vec4<f32>, 7>,
-    warp: array<vec4<f32>, 10>,
+    warp: array<vec4<f32>, 16>,
     csn: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
@@ -2160,7 +2160,7 @@ impl Gpu {
             misc3: [0.0; 4],
             cs: p.cs,
             warp: {
-                let mut w = [[0.0f32; 4]; 10];
+                let mut w = [[0.0f32; 4]; 16];
                 for (i, wp) in p.warper.iter().take(8).enumerate() {
                     w[i * 2] = [wp[0], wp[1], wp[2], wp[3]];
                     w[i * 2 + 1] = [wp[4], 0.0, 0.0, 0.0];
