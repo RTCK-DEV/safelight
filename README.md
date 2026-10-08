@@ -166,6 +166,10 @@ sidecars; the SQLite catalog indexes scans and owns stacks + collections.
   app, so the closed-source option stays open.
 - GPL/AGPL codebases (darktable, Exiv2, RapidRAW) were used as references only;
   no code was copied. EXIF is read via kamadak-exif (BSD).
+- GoPro GPR SDK (vendored in `third_party/gpr/`): MIT OR Apache-2.0, © GoPro —
+  decodes VC-5-compressed GPR (HERO5-12) into uncompressed DNG for LibRaw.
+- Sigma X3F (Foveon): own decoder derived from dcraw (public domain).
+- Nikon NEF HE/HE* (TicoRAW): own bit-exact decoder (`core/src/nef_he.rs`).
 
 ## Roadmap / known limits
 

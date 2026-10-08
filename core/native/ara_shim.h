@@ -55,6 +55,8 @@ int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
                    int* format);
 /* macOS ImageIO decode (full-res via system RAW codecs) -> malloc'ed rgba16 */
 int ara_imgio_decode(const char* path, unsigned short** out, int* w, int* h);
+/* GoPro GPR (VC-5 DNG) -> uncompressed DNG file at out_path. 0 = ok */
+int ara_gpr_to_dng(const char* in_path, const char* out_path);
 void ara_raw_close(AraRaw* r);
 void ara_free(void* p);
 

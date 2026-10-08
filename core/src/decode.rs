@@ -11,7 +11,11 @@ pub const RAW_EXTS: &[&str] = &[
     "x3f", "mrw", "erf", "raw", "rwl", "dcr", "kdc", "mos", "3fr", "fff", "iiq", "r3d", "gpr",
     "ari", "srf", "sr2",
 ];
-pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp"];
+// .insp = Insta360 still: a plain JPEG holding both lenses in one 2:1
+// frame — readable as a normal raster for browsing/equirect export.
+pub const RASTER_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "tif", "tiff", "webp", "insp",
+];
 
 pub fn is_raw(path: &Path) -> bool {
     path.extension()
@@ -156,6 +160,15 @@ pub fn decode(path: &Path) -> Result<Decoded> {
             }
         }
         bail!("x3f decode failed for {}", path.display());
+    }
+    // GoPro GPR (VC-5-compressed DNG, HERO5-12): libraw needs the
+    // proprietary GoPro SDK for these — convert to an uncompressed DNG
+    // via the vendored gpr SDK and decode that instead.
+    if is_gpr(path) {
+        if let Ok(dng) = gpr_to_dng(path) {
+            return decode(&dng);
+        }
+        // fall through: let libraw report whatever it can.
     }
     let (h, mut info) = open_raw(path)?;
     if info.cfa_kind == 0 {
@@ -317,6 +330,41 @@ fn empty_camera_info() -> CameraInfo {
         timestamp: 0,
         flip: 0,
     }
+}
+
+fn is_gpr(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gpr"))
+        .unwrap_or(false)
+}
+
+/// GPR → uncompressed DNG via the vendored gpr SDK. Converted files are
+/// cached under the temp dir keyed by source path+size+mtime so repeated
+/// renders don't re-decode the VC-5 payload.
+fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    meta.modified()
+        .map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    let dir = std::env::temp_dir().join("araware-gpr");
+    std::fs::create_dir_all(&dir)?;
+    let out = dir.join(format!("g{:016x}.dng", hasher.finish()));
+    if out.is_file() {
+        return Ok(out);
+    }
+    let cin = CString::new(path.to_string_lossy().as_ref())?;
+    let cout = CString::new(out.to_string_lossy().as_ref())?;
+    let rc = unsafe { ffi::ara_gpr_to_dng(cin.as_ptr(), cout.as_ptr()) };
+    if rc != 0 || !out.is_file() {
+        bail!("gpr→dng conversion failed ({rc})");
+    }
+    Ok(out)
 }
 
 /// Full-res decode via macOS ImageIO system RAW codecs (real debayer for

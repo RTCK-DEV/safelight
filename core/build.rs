@@ -41,6 +41,89 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreServices");
     }
 
+    // GoPro GPR SDK (vendored under third_party/gpr, MIT/Apache-2.0):
+    // decodes VC-5-compressed GPR (HERO5-12) into uncompressed DNG.
+    let gpr_root = std::path::PathBuf::from("../third_party/gpr");
+    if gpr_root.is_dir() {
+        fn walk(dir: &Path, c: &mut Vec<String>, cpp: &mut Vec<String>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, c, cpp);
+                } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    let f = p.to_string_lossy().to_string();
+                    match ext {
+                        "c" => c.push(f),
+                        "cpp" | "cc" | "cxx" => cpp.push(f),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let (mut cs, mut cpps) = (Vec::new(), Vec::new());
+        walk(&gpr_root, &mut cs, &mut cpps);
+
+        let includes = [
+            "../third_party/gpr/gpr_sdk/public",
+            "../third_party/gpr/common/public",
+            "../third_party/gpr/common/private",
+            "../third_party/gpr/vc5_common",
+            "../third_party/gpr/vc5_decoder",
+            "../third_party/gpr/dng_sdk",
+            "../third_party/gpr/md5_lib",
+            "../third_party/gpr/expat_lib",
+            "../third_party/gpr/xmp_core/public/include",
+            "native",
+        ];
+        let defs: &[(&str, Option<&str>)] = &[
+            ("GPR_READING", Some("1")),
+            ("GPR_WRITING", Some("0")),
+            ("GPR_JPEG_AVAILABLE", Some("0")),
+            ("GPR_TIMING", Some("0")),
+            ("XML_STATIC", Some("1")),
+            ("GIT_BRANCH", Some("\"\"")),
+            ("GIT_COMMIT_HASH", Some("\"vendored\"")),
+            (
+                if cfg!(target_os = "macos") {
+                    "qMacOS"
+                } else if cfg!(target_os = "windows") {
+                    "qWinOS"
+                } else {
+                    "qLinux"
+                },
+                Some("1"),
+            ),
+        ];
+        let mut mk = || {
+            let mut b = cc::Build::new();
+            for inc in includes {
+                b.include(inc);
+            }
+            for (k, v) in defs {
+                match v {
+                    Some(v) => b.define(k, *v),
+                    None => b.define(k, None),
+                };
+            }
+            b
+        };
+        if !cs.is_empty() {
+            let mut b = mk();
+            b.files(&cs)
+                .flag_if_supported("-std=c99")
+                .warnings(false)
+                .compile("ara_gpr_c");
+        }
+        let mut b = mk();
+        b.files(&cpps)
+            .file("native/ara_gpr.cpp")
+            .cpp(true)
+            .flag_if_supported("-std=c++17")
+            .warnings(false)
+            .compile("ara_gpr_cpp");
+    }
+
     println!("cargo:rustc-link-search=native={prefix}/lib");
     println!("cargo:rustc-link-lib=dylib=raw");
     if cfg!(target_os = "macos") {

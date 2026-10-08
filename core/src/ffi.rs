@@ -70,6 +70,7 @@ extern "C" {
         w: *mut c_int,
         h: *mut c_int,
     ) -> c_int;
+    pub fn ara_gpr_to_dng(in_path: *const c_char, out_path: *const c_char) -> c_int;
     pub fn ara_raw_close(r: *mut AraRaw);
     pub fn ara_free(p: *mut c_void);
 }
