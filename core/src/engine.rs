@@ -217,6 +217,21 @@ impl Engine {
         Ok(img)
     }
 
+    /// merge several sources at full res: "hdr" (Mertens exposure fusion)
+    /// or "focus" (focus stack). Each source renders with its own sidecar
+    /// recipe; sources are translation-aligned onto the first before merge.
+    pub fn merge(&self, paths: &[std::path::PathBuf], mode: &str) -> Result<RgbaImage> {
+        let mut imgs = Vec::with_capacity(paths.len());
+        for p in paths {
+            let r = self
+                .read_sidecar(p)
+                .map(|sc| sc.recipe)
+                .unwrap_or_default();
+            imgs.push(self.export(p, &r)?);
+        }
+        crate::merge::merge(&imgs, mode)
+    }
+
     /// auto-correction analysis: neutral 512px render -> suggested recipe
     /// values (see auto.rs). CPU stats on an sRGB preview.
     pub fn auto_analyze(&self, path: &Path) -> Result<auto::AutoResult> {

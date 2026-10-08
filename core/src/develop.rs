@@ -92,10 +92,14 @@ pub struct Params {
     /// [xmin, ymin, xmax, ymax] aspect-space bbox (padded by radius).
     /// Layer params (ev,sat,temp,strength) in brush_layers;
     /// brush_misc = [n_strokes, dst_aspect, link_q_bits, 0].
+    /// brush_seeds = per-stroke edge-aware seed colour [r,g,b,tol],
+    /// parallel to strokes (tol>0 = enabled; rgb filled at render time
+    /// from the linear image at the stroke's first dab).
     pub brush_segs: Vec<[f32; 4]>,
     pub brush_strokes: Vec<[f32; 4]>,
     pub brush_layers: [[f32; 4]; 4],
     pub brush_misc: [f32; 4],
+    pub brush_seeds: Vec<[f32; 4]>,
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
     pub zones: [[f32; 4]; 4],
     pub mixer: [f32; 9],
@@ -129,6 +133,17 @@ pub struct Params {
     /// curve with an extended-Reinhard shoulder and soft-knee toe.
     pub tone_lut: [f32; 512],
     pub has_tone: bool,
+    /// serial correction stages (DaVinci serial nodes): (params, opacity,
+    /// invert_key) per enabled stage, max 4. Each stage re-runs adjust() +
+    /// local ops on the sampled colour, then blends by its own key
+    /// (qualifier × window union) × opacity.
+    pub stages: Vec<(Params, f32, bool)>,
+    /// ColorSlice: 7 fixed hue wedges (R/Skin/Y/G/C/B/M), each
+    /// [hue_shift, sat_delta, lum_delta, enabled]
+    pub cs: [[f32; 4]; 7],
+    pub has_cs: bool,
+    /// ColorWarper control points [h, s, dh, ds, radius], max 8 honoured
+    pub warper: Vec<[f32; 5]>,
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -720,6 +735,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     //   [xmin, ymin, xmax, ymax] normalized-space bbox (unpadded)
     let mut brush_segs: Vec<[f32; 4]> = Vec::new();
     let mut brush_strokes: Vec<[f32; 4]> = Vec::new();
+    let mut brush_seeds: Vec<[f32; 4]> = Vec::new();
     let mut brush_layers = [[0.0f32; 4]; 4];
     let mut link_bits = 0.0f32;
     for (li, b) in r.brushes.iter().take(4).enumerate() {
@@ -771,8 +787,26 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 },
                 li as f32,
             ]);
-            brush_strokes.push([seg_start, nseg, 0.0, 0.0]);
+            // e1.z/w: edge-aware flag + tolerance (GPU seed kernel reads
+            // these straight from the Uni block)
+            brush_strokes.push([
+                seg_start,
+                nseg,
+                if b.edge_aware { 1.0 } else { 0.0 },
+                if b.edge_aware {
+                    b.edge_tol.clamp(0.05, 1.0)
+                } else {
+                    0.0
+                },
+            ]);
             brush_strokes.push([x0, y0, x1, y1]);
+            // edge-aware: seed slot carries the tolerance as its enable
+            // flag; the rgb is sampled from the image at render time.
+            brush_seeds.push(if b.edge_aware {
+                [0.0, 0.0, 0.0, b.edge_tol.clamp(0.05, 1.0)]
+            } else {
+                [0.0; 4]
+            });
         }
     }
     let brush_misc = [(brush_strokes.len() / 3) as f32, link_bits, 0.0, 0.0];
@@ -887,6 +921,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         brush_strokes,
         brush_layers,
         brush_misc,
+        brush_seeds,
         // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
@@ -940,8 +975,31 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             || r.blacks != 0.0
             || r.highlight_rolloff != 1.0
             || r.shadow_rolloff != 1.0,
+        stages: Vec::new(),
+        cs: r.color_slice,
+        has_cs: r.color_slice.iter().any(|s| s[3] > 0.5),
+        warper: r.warper.iter().take(8).cloned().collect(),
     };
     apply_look(&mut p, &r.look);
+    // serial stages: each stage is a full Recipe evaluated with the same
+    // mosaic+stats context. Nested stages are stripped to bound the work.
+    p.stages = r
+        .stages
+        .iter()
+        .filter(|s| s.enabled)
+        .take(4)
+        .map(|s| {
+            let mut sr = (*s.params).clone();
+            sr.stages = Vec::new();
+            // stage masks/brush coords live in the base stage's dst space
+            sr.crop = r.crop;
+            (
+                build_params(m, &sr, stats),
+                s.opacity.clamp(0.0, 1.0),
+                s.invert,
+            )
+        })
+        .collect();
     p
 }
 
@@ -1008,6 +1066,9 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
 }
 
 /// smoothstep(edge0, edge1, x) helper
+/// ColorSlice wedge centers (DaVinci Red/Skin/Yellow/Green/Cyan/Blue/Magenta).
+const SLICE_CENTER: [f32; 7] = [0.0, 0.0833, 0.1667, 0.3333, 0.5, 0.6667, 0.8333];
+
 fn sstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -1194,6 +1255,46 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             }
         }
         x = x2;
+    }
+    // ColorSlice (7 hue wedges) + ColorWarper (local hue/sat displacements).
+    // Same math lives in gpu.rs.
+    if p.has_cs || !p.warper.is_empty() {
+        let (h, s, v) = rgb_to_hsv(x);
+        let mut dh = 0.0f32;
+        let mut ds = 0.0f32;
+        let mut dl = 0.0f32;
+        if p.has_cs {
+            // hue wedges fade out at low chroma (grey has no hue)
+            let cw = sstep(0.04, 0.15, s);
+            for (i, sl) in p.cs.iter().enumerate() {
+                if sl[3] <= 0.5 {
+                    continue;
+                }
+                let d = hue_dist(h, SLICE_CENTER[i]);
+                let w = (1.0 - d * 7.0).max(0.0) * cw;
+                dh += sl[0] * w;
+                ds += sl[1] * w;
+                dl += sl[2] * w;
+            }
+        }
+        for w in p.warper.iter() {
+            let hd = hue_dist(h, w[0]);
+            let sd = (s - w[1]).abs();
+            let e = ((hd / 0.12).powi(2) + (sd / w[4].max(0.03)).powi(2)).sqrt();
+            if e < 1.0 {
+                let t = 1.0 - e;
+                let wgt = t * t * (3.0 - 2.0 * t);
+                dh += w[2] * wgt;
+                ds += w[3] * wgt;
+            }
+        }
+        if dh != 0.0 || ds != 0.0 || dl != 0.0 {
+            x = hsv_to_rgb(
+                (h + dh).rem_euclid(1.0),
+                (s * (1.0 + ds)).clamp(0.0, 1.5),
+                (v * (1.0 + dl)).clamp(0.0, 8.0),
+            );
+        }
     }
     // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask.
     // Also runs when only q_show is set so the matte can be previewed.
@@ -2415,52 +2516,44 @@ fn finish_linear(
     if pc.dehaze > 0.0 {
         pc.dehaze_a = atmosphere(&lin, w, h);
     }
-    let p = &pc;
-    heal_lin(&mut lin, w, h, &p.spots, p.n_spots, flip);
-    clone_lin(&mut lin, w, h, &p.clones, p.n_clones, flip);
-    if p.noise_luma > 0.0 {
-        lin = guided_nr_lum(&lin, w, h, p.noise_luma);
+    heal_lin(&mut lin, w, h, &pc.spots, pc.n_spots, flip);
+    clone_lin(&mut lin, w, h, &pc.clones, pc.n_clones, flip);
+    if pc.noise_luma > 0.0 {
+        lin = guided_nr_lum(&lin, w, h, pc.noise_luma);
     }
-    if p.noise_chroma > 0.0 {
-        lin = chroma_smooth(&lin, w, h, p.noise_chroma);
+    if pc.noise_chroma > 0.0 {
+        lin = chroma_smooth(&lin, w, h, pc.noise_chroma);
     }
-    if p.beauty > 0.0 || p.deband > 0.0 {
-        lin = beauty_deband(&lin, w, h, p.beauty, p.deband);
+    if pc.beauty > 0.0 || pc.deband > 0.0 {
+        lin = beauty_deband(&lin, w, h, pc.beauty, pc.deband);
     }
-    if p.glow > 0.0 {
-        lin = glow_lin(&lin, w, h, p.glow);
+    if pc.glow > 0.0 {
+        lin = glow_lin(&lin, w, h, pc.glow);
     }
-    if p.sharpen > 0.0 || p.clarity != 0.0 {
-        lin = sharpen_clarity(&lin, w, h, p.sharpen, p.clarity);
+    if pc.sharpen > 0.0 || pc.clarity != 0.0 {
+        lin = sharpen_clarity(&lin, w, h, pc.sharpen, pc.clarity);
     }
-    let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, p.crop, max_px);
+    let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, pc.crop, max_px);
     let cx = cl + ew * 0.5 - 0.5;
     let cy = ct + eh * 0.5 - 0.5;
-    let sin = p.rotation_deg.to_radians().sin();
-    let cos = p.rotation_deg.to_radians().cos();
+    let sin = pc.rotation_deg.to_radians().sin();
+    let cos = pc.rotation_deg.to_radians().cos();
+    // edge-aware brush seeds: sample the linear image at each flagged
+    // stroke's first dab (dst-normalized → src-px via the same map the
+    // pixel loop uses). Stages share the base mapping (crop unified).
+    fill_brush_seeds(
+        &mut pc, &lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos,
+    );
+    let p = &pc;
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
             // dst -> crop rect in post-flip frame, undo straighten, undo flip -> src
             let nx = (dx as f32 + 0.5) / dw as f32;
             let ny = (dy as f32 + 0.5) / dh as f32;
-            let mut fx = cl + nx * ew - 0.5;
-            let mut fy = ct + ny * eh - 0.5;
-            // keystone: trapezoid warp about the crop centre
-            if p.key_v != 0.0 || p.key_h != 0.0 {
-                fx = cx + (fx - cx) * (1.0 + p.key_v * (ny * 2.0 - 1.0));
-                fy = cy + (fy - cy) * (1.0 + p.key_h * (nx * 2.0 - 1.0));
-            }
-            let px = fx - cx;
-            let py = fy - cy;
-            fx = cx + px * cos + py * sin;
-            fy = cy - px * sin + py * cos;
-            let (sx, sy) = match flip {
-                3 => (w as f32 - 1.0 - fx, h as f32 - 1.0 - fy),
-                6 => (fy, h as f32 - 1.0 - fx),
-                5 => (w as f32 - 1.0 - fy, fx),
-                _ => (fx, fy),
-            };
+            let (sx, sy) = dst_to_src(
+                nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+            );
             // chromatic-aberration fix: radial per-channel sample offsets
             let col = if p.ca_fix != 0.0 {
                 let wcx = w as f32 * 0.5;
@@ -2477,93 +2570,37 @@ fn finish_linear(
                 bilinear(&lin, w, h, sx, sy)
             };
             let mut adj = adjust(col, p);
-            // dodge/burn radial lights (dst-normalized coords)
-            for l in p.lights.iter().take(p.n_lights as usize) {
-                let d = ((nx - l[0]).hypot(ny - l[1])) / l[2].max(1e-3);
-                let f = (-d * d * 2.77).exp(); // gaussian falloff
-                adj[0] *= 1.0 + l[3] * f * 0.5;
-                adj[1] *= 1.0 + l[3] * f * 0.5;
-                adj[2] *= 1.0 + l[3] * f * 0.5;
-            }
-            // power windows: local ev/sat/temp inside the mask
-            for win in p.wins.iter().take(p.n_wins as usize) {
-                let mut mask = window_mask(win, nx, ny, col, subj) * win[10];
-                // link_q: gate the window by the HSL qualifier matte
-                if (win[0] as i32) & 8 != 0 {
-                    mask *= qual_mask(col, p);
+            let aspect = dw as f32 / dh as f32;
+            local_ops(&mut adj, col, p, nx, ny, aspect, subj);
+            // serial correction stages (DaVinci serial nodes): full adjust +
+            // local ops on the sampled colour, blended by the stage key.
+            for (sp, sop, sinv) in p.stages.iter() {
+                let mut key = 1.0f32;
+                if sp.has_qual {
+                    key *= qual_mask(col, sp);
                 }
-                if mask <= 0.001 {
+                if sp.n_wins > 0 {
+                    let mut wu = 0.0f32;
+                    for win in sp.wins.iter().take(sp.n_wins as usize) {
+                        let mut m2 = window_mask(win, nx, ny, col, subj) * win[10];
+                        if (win[0] as i32) & 8 != 0 {
+                            m2 *= qual_mask(col, sp);
+                        }
+                        wu = wu.max(m2);
+                    }
+                    key *= wu;
+                }
+                if *sinv {
+                    key = 1.0 - key;
+                }
+                key *= *sop;
+                if key <= 0.001 {
                     continue;
                 }
-                let evg = (2.0f32).powf(win[7] * mask);
-                let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
+                let mut a2 = adjust(col, sp);
+                local_ops(&mut a2, col, sp, nx, ny, aspect, subj);
                 for c in 0..3 {
-                    adj[c] = adj[c] * evg;
-                    adj[c] = l + (adj[c] - l) * (1.0 + win[8] * mask);
-                }
-                adj[0] += win[9] * mask * 0.08;
-                adj[2] -= win[9] * mask * 0.08;
-            }
-            // adjustment brushes: same local ev/sat/temp inside stroke masks
-            let n_str = p.brush_misc[0] as usize;
-            if n_str > 0 {
-                let aspect = dw as f32 / dh as f32;
-                let link_bits = p.brush_misc[1] as u32;
-                let (pax, pay) = (nx * aspect, ny);
-                let mut pm = [0.0f32; 4];
-                let mut em = [0.0f32; 4];
-                for s in 0..n_str {
-                    let e0 = p.brush_strokes[s * 3];
-                    let e1 = p.brush_strokes[s * 3 + 1];
-                    let bb = p.brush_strokes[s * 3 + 2];
-                    let rad = e0[0];
-                    if pax < bb[0] * aspect - rad || pax > bb[2] * aspect + rad {
-                        continue;
-                    }
-                    if pay < bb[1] - rad || pay > bb[3] + rad {
-                        continue;
-                    }
-                    let inner = rad * (1.0 - e0[1]);
-                    let mut w = 0.0f32;
-                    let (s0, s1) = (e1[0] as usize, (e1[0] + e1[1]) as usize);
-                    for g in s0..s1.min(p.brush_segs.len()) {
-                        let seg = p.brush_segs[g];
-                        let ax = seg[0] * aspect;
-                        let bx = seg[2] * aspect;
-                        let (vx, vy) = (bx - ax, seg[3] - seg[1]);
-                        let len2 = (vx * vx + vy * vy).max(1e-9);
-                        let t = (((pax - ax) * vx + (pay - seg[1]) * vy) / len2).clamp(0.0, 1.0);
-                        let dx = pax - ax - t * vx;
-                        let dy = pay - seg[1] - t * vy;
-                        let d = (dx * dx + dy * dy).sqrt();
-                        w = w.max(1.0 - sstep(inner, rad, d));
-                    }
-                    let li = (e0[3] as usize).min(3);
-                    if e0[2] >= 0.0 {
-                        pm[li] = pm[li].max(w * e0[2]);
-                    } else {
-                        em[li] = em[li].max(w * -e0[2]);
-                    }
-                }
-                for (li, lp) in p.brush_layers.iter().enumerate() {
-                    let mut mask = (pm[li] - em[li]).clamp(0.0, 1.0) * lp[3];
-                    if mask <= 0.001 {
-                        continue;
-                    }
-                    if link_bits & (1u32 << li) != 0 {
-                        mask *= qual_mask(col, p);
-                    }
-                    if mask <= 0.001 {
-                        continue;
-                    }
-                    let evg = (2.0f32).powf(lp[0] * mask);
-                    let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
-                    for c in 0..3 {
-                        adj[c] = adj[c] * evg;
-                        adj[c] = l + (adj[c] - l) * (1.0 + lp[1] * mask);
-                    }
-                    adj[0] += lp[2] * mask * 0.08;
-                    adj[2] -= lp[2] * mask * 0.08;
+                    adj[c] += (a2[c] - adj[c]) * key;
                 }
             }
             // lens flare: core glow + horizontal streak + mirrored ghost ring
@@ -2609,6 +2646,205 @@ fn finish_linear(
         width: dw as u32,
         height: dh as u32,
         data: out,
+    }
+}
+
+/// dst-normalized (nx,ny) → src-px (sx,sy): crop → keystone → unrotate →
+/// unflip. Shared by the finish_linear pixel loop and brush-seed sampling.
+#[allow(clippy::too_many_arguments)]
+fn dst_to_src(
+    nx: f32, ny: f32,
+    cl: f32, ct: f32, ew: f32, eh: f32,
+    cx: f32, cy: f32, sin: f32, cos: f32,
+    key_v: f32, key_h: f32, flip: i32, w: usize, h: usize,
+) -> (f32, f32) {
+    let mut fx = cl + nx * ew - 0.5;
+    let mut fy = ct + ny * eh - 0.5;
+    if key_v != 0.0 || key_h != 0.0 {
+        fx = cx + (fx - cx) * (1.0 + key_v * (ny * 2.0 - 1.0));
+        fy = cy + (fy - cy) * (1.0 + key_h * (nx * 2.0 - 1.0));
+    }
+    let px = fx - cx;
+    let py = fy - cy;
+    fx = cx + px * cos + py * sin;
+    fy = cy - px * sin + py * cos;
+    match flip {
+        3 => (w as f32 - 1.0 - fx, h as f32 - 1.0 - fy),
+        6 => (fy, h as f32 - 1.0 - fx),
+        5 => (w as f32 - 1.0 - fy, fx),
+        _ => (fx, fy),
+    }
+}
+
+/// Edge-aware brush seeds: for every stroke whose slot carries a tolerance,
+/// sample the linear image under the stroke's first dab into its [r,g,b].
+/// Runs over base + every stage (they share the base dst→src mapping).
+#[allow(clippy::too_many_arguments)]
+fn fill_brush_seeds(
+    pc: &mut Params,
+    lin: &[[f32; 3]],
+    w: usize, h: usize, flip: i32,
+    cl: f32, ct: f32, ew: f32, eh: f32,
+    cx: f32, cy: f32, sin: f32, cos: f32,
+) {
+    fn fill_one(
+        sp: &mut Params,
+        lin: &[[f32; 3]],
+        w: usize, h: usize, flip: i32,
+        cl: f32, ct: f32, ew: f32, eh: f32,
+        cx: f32, cy: f32, sin: f32, cos: f32,
+        key_v: f32, key_h: f32,
+    ) {
+        let n = sp.brush_misc[0] as usize;
+        for s in 0..n {
+            if sp.brush_seeds.get(s).map_or(0.0, |sd| sd[3]) <= 0.0 {
+                continue;
+            }
+            let s0 = sp.brush_strokes.get(s * 3 + 1).map_or(0.0, |e| e[0]) as usize;
+            let Some(seg) = sp.brush_segs.get(s0) else { continue };
+            let (sx, sy) = dst_to_src(
+                seg[0], seg[1], cl, ct, ew, eh, cx, cy, sin, cos,
+                key_v, key_h, flip, w, h,
+            );
+            let c = bilinear(lin, w, h, sx, sy);
+            if let Some(sd) = sp.brush_seeds.get_mut(s) {
+                sd[0] = c[0];
+                sd[1] = c[1];
+                sd[2] = c[2];
+            }
+        }
+    }
+    let (kv, kh) = (pc.key_v, pc.key_h);
+    fill_one(pc, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh);
+    for (sp, _, _) in pc.stages.iter_mut() {
+        fill_one(sp, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh);
+    }
+}
+
+/// Affinity/LightCraft auto-mask similarity: how close `col` is to the
+/// stroke's seed colour. Luma distance in EV + max-channel chroma distance,
+/// each smoothstepped by `tol`.
+fn edge_sim(col: [f32; 3], seed: [f32; 3], tol: f32) -> f32 {
+    let lc = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+    let ls = 0.2126 * seed[0] + 0.7152 * seed[1] + 0.0722 * seed[2];
+    if lc < 1e-4 || ls < 1e-4 {
+        return 1.0; // too dark to judge — keep the paint
+    }
+    let dl = (lc / ls).abs().log2().abs();
+    let dc = (col[0] - seed[0])
+        .abs()
+        .max((col[1] - seed[1]).abs())
+        .max((col[2] - seed[2]).abs());
+    (1.0 - sstep(0.5 * tol, tol, dl)) * (1.0 - sstep(0.25 * tol, 0.5 * tol, dc))
+}
+
+/// local spatial ops shared by the base grade and every serial stage:
+/// dodge/burn lights, power windows and adjustment brushes.
+/// `col` = pre-adjust sampled colour (masks that read source pixels).
+fn local_ops(
+    adj: &mut [f32; 3],
+    col: [f32; 3],
+    p: &Params,
+    nx: f32,
+    ny: f32,
+    aspect: f32,
+    subj: Option<&Matte>,
+) {
+    // dodge/burn radial lights (dst-normalized coords)
+    for l in p.lights.iter().take(p.n_lights as usize) {
+        let d = ((nx - l[0]).hypot(ny - l[1])) / l[2].max(1e-3);
+        let f = (-d * d * 2.77).exp(); // gaussian falloff
+        adj[0] *= 1.0 + l[3] * f * 0.5;
+        adj[1] *= 1.0 + l[3] * f * 0.5;
+        adj[2] *= 1.0 + l[3] * f * 0.5;
+    }
+    // power windows: local ev/sat/temp inside the mask
+    for win in p.wins.iter().take(p.n_wins as usize) {
+        let mut mask = window_mask(win, nx, ny, col, subj) * win[10];
+        // link_q: gate the window by the HSL qualifier matte
+        if (win[0] as i32) & 8 != 0 {
+            mask *= qual_mask(col, p);
+        }
+        if mask <= 0.001 {
+            continue;
+        }
+        let evg = (2.0f32).powf(win[7] * mask);
+        let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
+        for c in 0..3 {
+            adj[c] = adj[c] * evg;
+            adj[c] = l + (adj[c] - l) * (1.0 + win[8] * mask);
+        }
+        adj[0] += win[9] * mask * 0.08;
+        adj[2] -= win[9] * mask * 0.08;
+    }
+    // adjustment brushes: same local ev/sat/temp inside stroke masks
+    let n_str = p.brush_misc[0] as usize;
+    if n_str == 0 {
+        return;
+    }
+    let link_bits = p.brush_misc[1] as u32;
+    let (pax, pay) = (nx * aspect, ny);
+    let mut pm = [0.0f32; 4];
+    let mut em = [0.0f32; 4];
+    for s in 0..n_str {
+        let e0 = p.brush_strokes[s * 3];
+        let e1 = p.brush_strokes[s * 3 + 1];
+        let bb = p.brush_strokes[s * 3 + 2];
+        let rad = e0[0];
+        if pax < bb[0] * aspect - rad || pax > bb[2] * aspect + rad {
+            continue;
+        }
+        if pay < bb[1] - rad || pay > bb[3] + rad {
+            continue;
+        }
+        let inner = rad * (1.0 - e0[1]);
+        let mut w = 0.0f32;
+        let (s0, s1) = (e1[0] as usize, (e1[0] + e1[1]) as usize);
+        for g in s0..s1.min(p.brush_segs.len()) {
+            let seg = p.brush_segs[g];
+            let ax = seg[0] * aspect;
+            let bx = seg[2] * aspect;
+            let (vx, vy) = (bx - ax, seg[3] - seg[1]);
+            let len2 = (vx * vx + vy * vy).max(1e-9);
+            let t = (((pax - ax) * vx + (pay - seg[1]) * vy) / len2).clamp(0.0, 1.0);
+            let dx = pax - ax - t * vx;
+            let dy = pay - seg[1] - t * vy;
+            let d = (dx * dx + dy * dy).sqrt();
+            w = w.max(1.0 - sstep(inner, rad, d));
+        }
+        // edge-aware stroke: gate the painted weight by colour similarity
+        // to the seed sampled under the stroke's first dab
+        if let Some(sd) = p.brush_seeds.get(s) {
+            if sd[3] > 0.0 {
+                w *= edge_sim(col, [sd[0], sd[1], sd[2]], sd[3]);
+            }
+        }
+        let li = (e0[3] as usize).min(3);
+        if e0[2] >= 0.0 {
+            pm[li] = pm[li].max(w * e0[2]);
+        } else {
+            em[li] = em[li].max(w * -e0[2]);
+        }
+    }
+    for (li, lp) in p.brush_layers.iter().enumerate() {
+        let mut mask = (pm[li] - em[li]).clamp(0.0, 1.0) * lp[3];
+        if mask <= 0.001 {
+            continue;
+        }
+        if link_bits & (1u32 << li) != 0 {
+            mask *= qual_mask(col, p);
+        }
+        if mask <= 0.001 {
+            continue;
+        }
+        let evg = (2.0f32).powf(lp[0] * mask);
+        let l = 0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2];
+        for c in 0..3 {
+            adj[c] = adj[c] * evg;
+            adj[c] = l + (adj[c] - l) * (1.0 + lp[1] * mask);
+        }
+        adj[0] += lp[2] * mask * 0.08;
+        adj[2] -= lp[2] * mask * 0.08;
     }
 }
 

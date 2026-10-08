@@ -180,6 +180,51 @@ pub struct Recipe {
     /// `<photo>.araware.aidn.png`; this field just blends it in.
     #[serde(default)]
     pub ai_denoise: f32,
+    /// serial correction stages (DaVinci serial nodes): each stage runs the
+    /// full adjust chain again on top of the previous result, gated by its
+    /// own qualifier/window key and opacity. Max 4 honoured.
+    #[serde(default)]
+    pub stages: Vec<Stage>,
+    /// ColorSlice (DaVinci): 7 fixed hue wedges Red/Skin/Yellow/Green/Cyan/
+    /// Blue/Magenta, each [hue_shift, sat_delta, lum_delta, enabled].
+    #[serde(default)]
+    pub color_slice: [[f32; 4]; 7],
+    /// ColorWarper (DaVinci Hue-Sat): control points [h, s, dh, ds, radius],
+    /// max 8 honoured.
+    #[serde(default)]
+    pub warper: Vec<[f32; 5]>,
+}
+
+/// one serial correction stage. `params` reuses the Recipe struct — only the
+/// adjust-domain fields are honoured (tone/colour/curves/qualifier/windows/
+/// brushes/lights); geometry, retouch, grain/vignette/flare and nested
+/// `stages` are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stage {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// stage strength 0..1 (DaVinci node key output gain)
+    #[serde(default = "default_one")]
+    pub opacity: f32,
+    /// invert the stage key (apply the grade outside the mask)
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub params: Box<Recipe>,
+}
+
+impl Default for Stage {
+    fn default() -> Self {
+        Stage {
+            name: String::new(),
+            enabled: true,
+            opacity: 1.0,
+            invert: false,
+            params: Box::new(Recipe::default()),
+        }
+    }
 }
 
 /// one painted stroke inside a brush layer.
@@ -225,6 +270,12 @@ pub struct BrushLayer {
     pub temp: f32,
     /// gate this layer's mask by the HSL qualifier matte
     pub link_q: bool,
+    /// edge-aware masking (Affinity auto-mask): each stroke records the
+    /// colour under its first dab and the mask only covers pixels inside
+    /// `edge_tol` of it in luma/chroma distance
+    pub edge_aware: bool,
+    /// similarity tolerance 0.05..1.0 — larger admits more pixels
+    pub edge_tol: f32,
     pub strokes: Vec<BrushStroke>,
 }
 
@@ -237,6 +288,8 @@ impl Default for BrushLayer {
             sat: 0.0,
             temp: 0.0,
             link_q: false,
+            edge_aware: false,
+            edge_tol: 0.5,
             strokes: Vec::new(),
         }
     }
@@ -369,6 +422,9 @@ impl Default for Recipe {
             lens_corr: 1.0,
             brushes: Vec::new(),
             ai_denoise: 0.0,
+            stages: Vec::new(),
+            color_slice: [[0.0; 4]; 7],
+            warper: Vec::new(),
         }
     }
 }

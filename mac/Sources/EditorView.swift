@@ -25,7 +25,7 @@ enum CompareMode: String, CaseIterable, Identifiable {
 
 /// Inspector palettes, DaVinci color-page style: one at a time via the icon strip.
 enum Palette: String, CaseIterable, Identifiable {
-    case quick, meters, light, wheels, curves, zones, qualifier, windows, mixer,
+    case quick, meters, light, wheels, curves, zones, slice, warp, qualifier, windows, mixer,
          retouch, detail, fx, xform, versions
     var id: String { rawValue }
     var icon: String {
@@ -36,6 +36,8 @@ enum Palette: String, CaseIterable, Identifiable {
         case .wheels: return "circle.circle"
         case .curves: return "chart.line.uptrend.xyaxis"
         case .zones: return "square.split.bottomhalf.filled"
+        case .slice: return "circle.hexagongrid"
+        case .warp: return "point.3.connected.trianglepath.dotted"
         case .qualifier: return "eyedropper.halffull"
         case .windows: return "circle.dashed"
         case .mixer: return "slider.horizontal.below.square.filled.and.square"
@@ -54,6 +56,8 @@ enum Palette: String, CaseIterable, Identifiable {
         case .wheels: return "Wheels"
         case .curves: return "Curves"
         case .zones: return "HDR Zones"
+        case .slice: return "ColorSlice"
+        case .warp: return "Warper"
         case .qualifier: return "Qualifier"
         case .windows: return "Windows"
         case .mixer: return "Mixer"
@@ -73,6 +77,8 @@ enum Palette: String, CaseIterable, Identifiable {
         case .wheels: return "Drag inside a wheel to tint — the slider sets the mean"
         case .curves: return "Click to add a point, drag to move, double-click deletes"
         case .zones: return "Enable Image mode, then scroll on the photo to move the band under the cursor"
+        case .slice: return "Density, saturation and hue per colour wedge"
+        case .warp: return "Click the graph to pin a colour, drag to displace it — double-click deletes"
         case .qualifier: return "Key a colour range with the droppers, adjust inside it"
         case .windows: return "Tap or drag on the photo to place local masks"
         case .mixer: return "Channel mixing and monochrome conversion"
@@ -142,6 +148,23 @@ struct EditorView: View {
     // palettes
     @State private var palette: Palette = .quick
     @State private var selWindow: UUID?
+    // grade library (DaVinci Gallery stills) + wipe reference recipe
+    @State private var stills: [GradeStill] = []
+    @State private var stillThumbs: [UUID: NSImage] = [:]
+    @State private var refRecipe: Recipe?
+    @State private var refName = ""
+    // serial correction stages (DaVinci serial nodes): 0 = base recipe,
+    // 1..4 = recipe.stages[selStage-1].params — every colour-domain palette
+    // binds through `edit` so it edits the selected node.
+    @State private var selStage = 0
+    @State private var showStageRename = false
+    @State private var stageRenameText = ""
+    private var edit: Binding<Recipe> {
+        if selStage > 0, selStage <= recipe.stages.count {
+            return $recipe.stages[selStage - 1].params
+        }
+        return $recipe
+    }
     // grade versions
     @State private var versions: [GradeVersion] = []
     @State private var baselineVersions: [GradeVersion] = []
@@ -186,6 +209,9 @@ struct EditorView: View {
     @State private var expResize = false
     @State private var expLongEdge: Double = 2048
     @State private var expSharpen: Double = 0.25
+    // output colour space for export — engine emits sRGB; convert+tag via
+    // ColorSync into the chosen ICC profile
+    @State private var expSpace = "sRGB"
 
     /// letterboxed image rect inside the preview area (zoom/pan applied)
     private func imageRect(in size: CGSize) -> CGRect {
@@ -219,7 +245,7 @@ struct EditorView: View {
         case "heal":
             recipe.spots.append([fx, fy, spotSize, 0])
         case "dodge", "burn":
-            recipe.lights.append([nx, ny, lightRadius, retouchMode == "dodge" ? lightEV : -lightEV])
+            edit.wrappedValue.lights.append([nx, ny, lightRadius, retouchMode == "dodge" ? lightEV : -lightEV])
         case "wbpick":
             recipe.wb_pick = [fx, fy]
             recipe.wb_mode = .pick
@@ -236,25 +262,25 @@ struct EditorView: View {
             var w = PowerWindow()
             w.kind = "circle"
             w.p = [fx, fy, 0.15, 0.15, 0, 0.4]
-            recipe.windows.append(w)
+            edit.wrappedValue.windows.append(w)
             selWindow = w.id
         case "grad":
             var w = PowerWindow()
             w.kind = "gradient"
             w.p = [0.0, fy, 1.0, fy, 0, 0.5]
-            recipe.windows.append(w)
+            edit.wrappedValue.windows.append(w)
             selWindow = w.id
         case "brush":
             // tap = single dab (zero-length segment resolves to a disc)
-            if recipe.brushes.isEmpty { recipe.brushes.append(BrushLayer()) }
-            if selBrush >= recipe.brushes.count { selBrush = recipe.brushes.count - 1 }
+            if edit.wrappedValue.brushes.isEmpty { edit.wrappedValue.brushes.append(BrushLayer()) }
+            if selBrush >= edit.wrappedValue.brushes.count { selBrush = edit.wrappedValue.brushes.count - 1 }
             var st = BrushStroke()
             st.pts = [[fx, fy], [fx, fy]]
             st.radius = brushRadius
             st.soft = brushSoft
             st.opacity = brushFlow
             st.erase = brushErase
-            recipe.brushes[selBrush].strokes.append(st)
+            edit.wrappedValue.brushes[selBrush].strokes.append(st)
         case "flare":
             recipe.flare[0] = nx
             recipe.flare[1] = ny
@@ -323,6 +349,10 @@ struct EditorView: View {
             Button("") { save() }.keyboardShortcut("s", modifiers: .command)
             Button("") { export() }.keyboardShortcut("e", modifiers: .command)
             Button("") { applyPrevRecipe() }.keyboardShortcut("=", modifiers: .command)
+            Button("") { runAuto(.all) }.keyboardShortcut("c", modifiers: [.command, .option])
+            Button("") { addStage() }.keyboardShortcut("s", modifiers: .option)
+            Button("") { selStage = max(0, selStage - 1) }.keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+            Button("") { selStage = min(recipe.stages.count, selStage + 1) }.keyboardShortcut(.rightArrow, modifiers: [.command, .option])
         }
         .opacity(0)
         .frame(width: 0, height: 0)
@@ -333,6 +363,7 @@ struct EditorView: View {
 
     private var stageColumn: some View {
         VStack(spacing: 0) {
+            stageStrip
             GeometryReader { geo in
                 ZStack {
                     Ara.bg0
@@ -371,7 +402,8 @@ struct EditorView: View {
                         // compare modes: baseline underneath (or alone)
                         if cmp != .off && cmp != .before {
                             if let baselineImg {
-                                Image(baselineImg, scale: 1, label: Text("before"))
+                                Image(baselineImg, scale: 1,
+                                      label: Text(refRecipe != nil ? refName : "before"))
                                     .resizable()
                                     .frame(width: rect.width, height: rect.height)
                                     .position(x: rect.midX, y: rect.midY)
@@ -379,7 +411,8 @@ struct EditorView: View {
                         }
                         if cmp == .before {
                             if let baselineImg {
-                                Image(baselineImg, scale: 1, label: Text(photo.name))
+                                Image(baselineImg, scale: 1,
+                                      label: Text(refRecipe != nil ? refName : photo.name))
                                     .resizable()
                                     .frame(width: rect.width, height: rect.height)
                                     .position(x: rect.midX, y: rect.midY)
@@ -420,7 +453,7 @@ struct EditorView: View {
                         }
                         // darktable tone-equalizer badge: hovering band + EV
                         if zoneImgMode, let zi = zoneHover {
-                            Text(String(format: "%+d EV band   %+.2f", zi - 4, recipe.zones_ev[zi]))
+                            Text(String(format: "%+d EV band   %+.2f", zi - 4, edit.wrappedValue.zones_ev[zi]))
                                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
                                 .foregroundStyle(Ara.text1)
                                 .padding(.horizontal, 9).padding(.vertical, 4)
@@ -517,9 +550,9 @@ struct EditorView: View {
                 if zoneImgMode, let zi = zoneIndex(at: lastHover) {
                     let d = Double(ev.scrollingDeltaY + ev.scrollingDeltaX)
                     if d != 0 {
-                        var z = recipe.zones_ev
+                        var z = edit.wrappedValue.zones_ev
                         z[zi] = (z[zi] + d * 0.03).clamped(to: -4...4)
-                        recipe.zones_ev = z
+                        edit.wrappedValue.zones_ev = z
                         zoneHover = zi
                     }
                     return false
@@ -625,29 +658,29 @@ struct EditorView: View {
                   let (_, _, fx, fy) = frameCoord(g.location, in: size) else { return }
             if retouchMode == "grad" {
                 // drag defines the gradient line start→current
-                if let i = recipe.windows.lastIndex(where: { $0.id == selWindow })
-                    ?? recipe.windows.indices.last {
-                    recipe.windows[i].kind = "gradient"
-                    recipe.windows[i].p = [sfx, sfy, fx, fy, 0, 0.35]
-                    selWindow = recipe.windows[i].id
+                if let i = edit.wrappedValue.windows.lastIndex(where: { $0.id == selWindow })
+                    ?? edit.wrappedValue.windows.indices.last {
+                    edit.wrappedValue.windows[i].kind = "gradient"
+                    edit.wrappedValue.windows[i].p = [sfx, sfy, fx, fy, 0, 0.35]
+                    selWindow = edit.wrappedValue.windows[i].id
                 }
                 return
             }
             // move the selected (or newest) window
-            guard let i = recipe.windows.lastIndex(where: { $0.id == selWindow })
-                ?? recipe.windows.indices.last else { return }
-            if dragBase == nil { dragBase = recipe.windows[i].p }
+            guard let i = edit.wrappedValue.windows.lastIndex(where: { $0.id == selWindow })
+                ?? edit.wrappedValue.windows.indices.last else { return }
+            if dragBase == nil { dragBase = edit.wrappedValue.windows[i].p }
             guard let base = dragBase else { return }
             var p = base
             let dfx = fx - sfx, dfy = fy - sfy
-            if recipe.windows[i].kind == "gradient" {
+            if edit.wrappedValue.windows[i].kind == "gradient" {
                 p[0] = base[0] + dfx; p[1] = base[1] + dfy
                 p[2] = base[2] + dfx; p[3] = base[3] + dfy
             } else {
                 p[0] = (base[0] + dfx).clamped(to: 0...1)
                 p[1] = (base[1] + dfy).clamped(to: 0...1)
             }
-            recipe.windows[i].p = p
+            edit.wrappedValue.windows[i].p = p
         } else if retouchMode == "off" && zoom > 1.001 {
             if dragBase == nil { dragBase = [Double(pan.width), Double(pan.height)] }
             guard let base = dragBase, base.count == 2 else { return }
@@ -660,15 +693,15 @@ struct EditorView: View {
     /// active layer (LR-style: strokes in one layer share its adjustment).
     private func commitBrushStroke() {
         guard liveFrame.count >= 2 else { liveFrame = []; return }
-        if recipe.brushes.isEmpty { recipe.brushes.append(BrushLayer()) }
-        if selBrush >= recipe.brushes.count { selBrush = recipe.brushes.count - 1 }
+        if edit.wrappedValue.brushes.isEmpty { edit.wrappedValue.brushes.append(BrushLayer()) }
+        if selBrush >= edit.wrappedValue.brushes.count { selBrush = edit.wrappedValue.brushes.count - 1 }
         var st = BrushStroke()
         st.pts = liveFrame
         st.radius = brushRadius
         st.soft = brushSoft
         st.opacity = brushFlow
         st.erase = brushErase
-        recipe.brushes[selBrush].strokes.append(st)
+        edit.wrappedValue.brushes[selBrush].strokes.append(st)
         liveFrame = []
     }
 
@@ -676,6 +709,33 @@ struct EditorView: View {
     private func handleKey(_ ev: NSEvent) -> Bool {
         // let text fields own the keyboard
         if let fr = ev.window?.firstResponder, fr is NSTextView || fr is NSTextField {
+            return false
+        }
+        // DaVinci Printer Lights: Option+nudge offsets the whole grade toward a
+        // printer-light colour. ⌥←/→ red−/+ (cyan↔red), ⌥↑/↓ yellow↔blue,
+        // ⌥,/⌥. magenta↔green. Step 0.01 per press.
+        if ev.modifierFlags.contains(.option),
+           ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
+               .isDisjoint(with: [.command, .control]) {
+            let step = 0.01
+            let k = ev.keyCode
+            var ch = -1, dir = 0.0
+            switch k {
+            case 123: ch = 0; dir = -step          // ⌥←
+            case 124: ch = 0; dir = step           // ⌥→
+            case 126: ch = 2; dir = step           // ⌥↑
+            case 125: ch = 2; dir = -step          // ⌥↓
+            default:
+                if let c = ev.charactersIgnoringModifiers?.lowercased().first {
+                    if c == "," { ch = 1; dir = -step }
+                    else if c == "." { ch = 1; dir = step }
+                }
+            }
+            if ch >= 0 {
+                edit.wrappedValue.offset[ch] = min(0.25, max(-0.25, edit.wrappedValue.offset[ch] + dir))
+                status = String(format: "Printer %@ %+.2f", ["R", "G", "B"][ch], edit.wrappedValue.offset[ch])
+                return true
+            }
             return false
         }
         guard ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -849,6 +909,159 @@ struct EditorView: View {
         }
     }
 
+    // MARK: stage strip (DaVinci serial nodes)
+
+    /// Append a serial correction stage and select it (⌥S).
+    private func addStage() {
+        guard recipe.stages.count < 4 else { return }
+        var st = Stage()
+        st.name = "S\(recipe.stages.count + 1)"
+        recipe.stages.append(st)
+        selStage = recipe.stages.count
+    }
+
+    private func stageChip(_ idx: Int) -> some View {
+        let isBase = idx == 0
+        let st = isBase ? nil : recipe.stages[idx - 1]
+        let sel = selStage == idx
+        return HStack(spacing: 6) {
+            Text("\(idx + 1)")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(sel ? Color.black : Ara.text2)
+                .frame(width: 15, height: 15)
+                .background(Circle().fill(sel ? Ara.accent : Ara.bg3))
+            Text(isBase ? "Base" : (st!.name.isEmpty ? "Stage \(idx)" : st!.name))
+                .font(.system(size: 10.5, weight: sel ? .semibold : .regular))
+                .foregroundStyle(st?.enabled == false ? Ara.text2.opacity(0.5) : Ara.text1)
+                .lineLimit(1)
+            if let s = st {
+                if s.invert {
+                    Image(systemName: "arrow.triangle.swap")
+                        .font(.system(size: 7)).foregroundStyle(Color.orange)
+                }
+                Button {
+                    recipe.stages[idx - 1].enabled.toggle()
+                } label: {
+                    Image(systemName: s.enabled ? "eye" : "eye.slash")
+                        .font(.system(size: 8))
+                        .foregroundStyle(s.enabled ? Ara.text2 : Color.orange)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .fill(sel ? Ara.bg3 : Ara.bg2))
+        .overlay(RoundedRectangle(cornerRadius: 5)
+            .stroke(sel ? Ara.accent : Ara.border, lineWidth: sel ? 1.2 : 0.6))
+        .contentShape(Rectangle())
+        .onTapGesture { selStage = idx }
+        .contextMenu {
+            if !isBase {
+                Button("Rename…") {
+                    stageRenameText = st!.name
+                    showStageRename = true
+                }
+                Button(st!.invert ? "Uninvert key" : "Invert key") {
+                    recipe.stages[idx - 1].invert.toggle()
+                }
+                Button("Duplicate stage") {
+                    if recipe.stages.count < 4 {
+                        var c = st!
+                        c.id = UUID(); c.name += " copy"
+                        recipe.stages.insert(c, at: idx)
+                    }
+                }
+                Divider()
+                Button("Delete stage", role: .destructive) {
+                    recipe.stages.remove(at: idx - 1)
+                    if selStage > recipe.stages.count { selStage = recipe.stages.count }
+                }
+            }
+        }
+    }
+
+    private var stageStrip: some View {
+        HStack(spacing: 4) {
+            stageChip(0)
+            ForEach(Array(recipe.stages.indices), id: \.self) { i in
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(Ara.text2.opacity(0.6))
+                stageChip(i + 1)
+            }
+            if recipe.stages.count < 4 {
+                Button(action: addStage) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Ara.text2)
+                        .frame(width: 20, height: 20)
+                        .background(Circle().stroke(Ara.border, lineWidth: 0.8))
+                }
+                .buttonStyle(.plain)
+                .help("Add serial stage (⌥S)")
+            }
+            Spacer()
+            if selStage > 0, selStage <= recipe.stages.count {
+                let i = selStage - 1
+                Text("Opacity")
+                    .font(.system(size: 9)).foregroundStyle(Ara.text2)
+                Slider(value: $recipe.stages[i].opacity, in: 0...1)
+                    .frame(width: 90)
+                Text(String(format: "%.2f", recipe.stages[i].opacity))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Ara.text2)
+                    .frame(width: 32)
+                Toggle("Invert", isOn: $recipe.stages[i].invert)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 9))
+                    .foregroundStyle(Ara.text2)
+                // reliable path to stage ops — the chip's .contextMenu
+                // doesn't fire on some macOS/SwiftUI combos
+                Menu {
+                    Button("Rename…") {
+                        stageRenameText = recipe.stages[i].name
+                        showStageRename = true
+                    }
+                    Button("Duplicate stage") {
+                        if recipe.stages.count < 4 {
+                            var c = recipe.stages[i]
+                            c.id = UUID(); c.name += " copy"
+                            recipe.stages.insert(c, at: selStage)
+                        }
+                    }
+                    Divider()
+                    Button("Delete stage", role: .destructive) {
+                        recipe.stages.remove(at: i)
+                        if selStage > recipe.stages.count { selStage = recipe.stages.count }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Ara.text2)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 18)
+                .help("Stage options")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(Ara.bg1)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Ara.border).frame(height: 0.5)
+        }
+        .alert("Stage name", isPresented: $showStageRename) {
+            TextField("Name", text: $stageRenameText)
+            Button("OK") {
+                if selStage > 0, selStage <= recipe.stages.count {
+                    recipe.stages[selStage - 1].name = stageRenameText
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+
     // MARK: inspector
 
     private var inspector: some View {
@@ -1009,6 +1222,8 @@ struct EditorView: View {
         case .wheels: wheelsPalette
         case .curves: curvesPalette
         case .zones: zonesPalette
+        case .slice: slicePalette
+        case .warp: warpPalette
         case .qualifier: qualifierPalette
         case .windows: windowsPalette
         case .mixer: mixerPalette
@@ -1048,20 +1263,20 @@ struct EditorView: View {
                     .help("Analyze the photo and apply every suggestion")
                     .opacity(autoBusy ? 0.5 : 1)
             }) {
-                SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
-                SliderRow("Contrast", $recipe.contrast, -1...1)
-                SliderRow("Highlights", $recipe.highlights, -1...1)
-                SliderRow("Shadows", $recipe.shadows, -1...1)
-                SliderRow("Whites", $recipe.whites, -1...1)
-                SliderRow("Blacks", $recipe.blacks, -1...1)
+                SliderRow("Exposure", edit.exposure, -4...4, step: 0.05)
+                SliderRow("Contrast", edit.contrast, -1...1)
+                SliderRow("Highlights", edit.highlights, -1...1)
+                SliderRow("Shadows", edit.shadows, -1...1)
+                SliderRow("Whites", edit.whites, -1...1)
+                SliderRow("Blacks", edit.blacks, -1...1)
             }
             Panel("Colour", trailing: {
                 ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.colour) }
                     .help("Estimate vibrance from the chroma distribution")
                     .opacity(autoBusy ? 0.5 : 1)
             }) {
-                SliderRow("Saturation", $recipe.saturation, -1...1)
-                SliderRow("Vibrance", $recipe.vibrance, -1...1)
+                SliderRow("Saturation", edit.saturation, -1...1)
+                SliderRow("Vibrance", edit.vibrance, -1...1)
                 SliderRow("Clarity", $recipe.clarity, -1...1)
             }
             Panel("Geometry", trailing: {
@@ -1099,16 +1314,16 @@ struct EditorView: View {
                             .gesture(DragGesture(minimumDistance: 0)
                                 .onChanged { g in
                                     if scopeDragBase == nil {
-                                        scopeDragBase = recipe.exposure
+                                        scopeDragBase = edit.wrappedValue.exposure
                                         if g.time.timeIntervalSince(scopeTapTime) < 0.3 {
-                                            recipe.exposure = 0
+                                            edit.wrappedValue.exposure = 0
                                             scopeDragBase = 0
                                             scopeTapTime = .distantPast
                                             return
                                         }
                                         scopeTapTime = g.time
                                     }
-                                    recipe.exposure = ((scopeDragBase ?? 0)
+                                    edit.wrappedValue.exposure = ((scopeDragBase ?? 0)
                                         - Double(g.translation.height) * 0.015)
                                         .clamped(to: -4...4)
                                 }
@@ -1144,72 +1359,72 @@ struct EditorView: View {
             Panel("Tone", trailing: {
                 ToolChip(label: "Auto", icon: "wand.and.stars") {
                     recipe.wb_mode = .auto
-                    recipe.auto_exposure = true
-                    recipe.auto_contrast = true
+                    edit.wrappedValue.auto_exposure = true
+                    edit.wrappedValue.auto_contrast = true
                     status = "Auto: WB + exposure + contrast"
                 }
             }) {
                 HStack(spacing: 6) {
-                    Toggle("Auto Exp", isOn: $recipe.auto_exposure)
+                    Toggle("Auto Exp", isOn: edit.auto_exposure)
                         .font(.system(size: 10)).foregroundStyle(Ara.text2)
                         .controlSize(.mini)
-                    Toggle("Auto Contrast", isOn: $recipe.auto_contrast)
+                    Toggle("Auto Contrast", isOn: edit.auto_contrast)
                         .font(.system(size: 10)).foregroundStyle(Ara.text2)
                         .controlSize(.mini)
                 }
-                SliderRow("Exposure", $recipe.exposure, -4...4, step: 0.05)
-                SliderRow("Contrast", $recipe.contrast, -1...1)
-                SliderRow("Pivot", $recipe.pivot, 0.05...0.5, reset: 0.18)
-                SliderRow("Highlights", $recipe.highlights, -1...1)
-                SliderRow("Shadows", $recipe.shadows, -1...1)
-                SliderRow("Whites", $recipe.whites, -1...1)
-                SliderRow("Blacks", $recipe.blacks, -1...1)
-                SliderRow("HL Roll", $recipe.highlight_rolloff, 0.5...2, reset: 1.0)
-                SliderRow("SH Roll", $recipe.shadow_rolloff, 0.5...2, reset: 1.0)
+                SliderRow("Exposure", edit.exposure, -4...4, step: 0.05)
+                SliderRow("Contrast", edit.contrast, -1...1)
+                SliderRow("Pivot", edit.pivot, 0.05...0.5, reset: 0.18)
+                SliderRow("Highlights", edit.highlights, -1...1)
+                SliderRow("Shadows", edit.shadows, -1...1)
+                SliderRow("Whites", edit.whites, -1...1)
+                SliderRow("Blacks", edit.blacks, -1...1)
+                SliderRow("HL Roll", edit.highlight_rolloff, 0.5...2, reset: 1.0)
+                SliderRow("SH Roll", edit.shadow_rolloff, 0.5...2, reset: 1.0)
             }
             Panel("Color") {
-                SliderRow("Saturation", $recipe.saturation, -1...1)
-                SliderRow("Vibrance", $recipe.vibrance, -1...1)
+                SliderRow("Saturation", edit.saturation, -1...1)
+                SliderRow("Vibrance", edit.vibrance, -1...1)
             }
         }
     }
 
     private var wheelsPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Panel("Primaries", trailing: { LookPicker(look: $recipe.look, photo: photo, recipe: recipe) }) {
+            Panel("Primaries", trailing: { LookPicker(look: edit.look, lutFile: edit.lut_file, photo: photo, recipe: edit.wrappedValue) }) {
                 HStack(spacing: 6) {
-                    ColorWheel(title: "Lift", v: $recipe.lift, center: 0)
-                    ColorWheel(title: "Gamma", v: $recipe.gamma, center: 1)
-                    ColorWheel(title: "Gain", v: $recipe.gain, center: 1)
-                    ColorWheel(title: "Offset", v: $recipe.offset, center: 0)
+                    ColorWheel(title: "Lift", v: edit.lift, center: 0)
+                    ColorWheel(title: "Gamma", v: edit.gamma, center: 1)
+                    ColorWheel(title: "Gain", v: edit.gain, center: 1)
+                    ColorWheel(title: "Offset", v: edit.offset, center: 0)
                 }
                 HStack(spacing: 6) {
                     Text("LUT")
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(Ara.text2)
                         .frame(width: 60, alignment: .leading)
-                    ToolChip(label: recipe.lut_file.isEmpty
+                    ToolChip(label: edit.wrappedValue.lut_file.isEmpty
                              ? "Choose .cube…"
-                             : URL(fileURLWithPath: recipe.lut_file)
+                             : URL(fileURLWithPath: edit.wrappedValue.lut_file)
                                 .deletingPathExtension().lastPathComponent,
                              icon: "doc.badge.plus") { pickLut() }
-                    if !recipe.lut_file.isEmpty {
-                        ToolChip(label: "", icon: "xmark") { recipe.lut_file = "" }
+                    if !edit.wrappedValue.lut_file.isEmpty {
+                        ToolChip(label: "", icon: "xmark") { edit.wrappedValue.lut_file = "" }
                             .help("Clear LUT")
                     }
                     Spacer()
                 }
-                if !recipe.lut_file.isEmpty {
-                    SliderRow("Amount", $recipe.lut_amount, 0...1, reset: 1)
+                if !edit.wrappedValue.lut_file.isEmpty {
+                    SliderRow("Amount", edit.lut_amount, 0...1, reset: 1)
                 }
             }
             Panel("Split Tone") {
-                SliderRow("Shd Hue", $recipe.shadow_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
-                SliderRow("Shd Sat", $recipe.shadow_sat, 0...1)
-                SliderRow("Mid Hue", $recipe.midtone_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
-                SliderRow("Mid Sat", $recipe.midtone_sat, 0...1)
-                SliderRow("Hi Hue", $recipe.highlight_hue, 0...1, reset: 0.08, track: Ara.hueTrack)
-                SliderRow("Hi Sat", $recipe.highlight_sat, 0...1)
+                SliderRow("Shd Hue", edit.shadow_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
+                SliderRow("Shd Sat", edit.shadow_sat, 0...1)
+                SliderRow("Mid Hue", edit.midtone_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
+                SliderRow("Mid Sat", edit.midtone_sat, 0...1)
+                SliderRow("Hi Hue", edit.highlight_hue, 0...1, reset: 0.08, track: Ara.hueTrack)
+                SliderRow("Hi Sat", edit.highlight_sat, 0...1)
             }
         }
     }
@@ -1248,21 +1463,210 @@ struct EditorView: View {
                     }
                     .help("Scroll on the photo to adjust the band under the cursor")
                     ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
-                        recipe.zones_ev = [Double](repeating: 0, count: 9)
+                        edit.wrappedValue.zones_ev = [Double](repeating: 0, count: 9)
                     }
                 }
             }) {
-                ZoneEQ(zones: $recipe.zones_ev)
+                ZoneEQ(zones: edit.zones_ev)
                 Text(zoneImgMode
                      ? "Hover the photo and scroll — the EV badge marks the band under the cursor"
                      : "EV gain per luminance band (−4…+4 EV around mid grey)")
                     .font(.system(size: 8.5)).foregroundStyle(zoneImgMode ? Ara.accent : Ara.text3)
             }
             Panel("HDR Zones") {
-                ZoneRow("Dark", $recipe.z_dark)
-                ZoneRow("Shadow", $recipe.z_shadow)
-                ZoneRow("Light", $recipe.z_light)
-                ZoneRow("Global", $recipe.z_global)
+                ZoneRow("Dark", edit.z_dark)
+                ZoneRow("Shadow", edit.z_shadow)
+                ZoneRow("Light", edit.z_light)
+                ZoneRow("Global", edit.z_global)
+            }
+        }
+    }
+
+    // MARK: ColorSlice (DaVinci)
+
+    static let sliceNames = ["Red", "Skin", "Yellow", "Green", "Cyan", "Blue", "Magenta"]
+    static let sliceHues: [Double] = [0.0, 0.0833, 0.1667, 0.3333, 0.5, 0.6667, 0.8333]
+    @State private var selSlice = 0
+
+    private var slicePalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("ColorSlice", trailing: {
+                ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
+                    edit.wrappedValue.color_slice = Recipe().color_slice
+                }
+            }) {
+                // wedge chips: pick the vector to edit
+                HStack(spacing: 4) {
+                    ForEach(0..<7, id: \.self) { i in
+                        let on = edit.wrappedValue.color_slice[i][3] > 0.5
+                        VStack(spacing: 2) {
+                            Circle()
+                                .fill(Color(hue: Self.sliceHues[i], saturation: 0.85, brightness: on ? 1.0 : 0.55))
+                                .frame(width: 16, height: 16)
+                                .overlay(Circle().stroke(selSlice == i ? Ara.accent : Ara.border,
+                                                         lineWidth: selSlice == i ? 1.6 : 0.5))
+                            Text(Self.sliceNames[i].prefix(1))
+                                .font(.system(size: 7.5))
+                                .foregroundStyle(selSlice == i ? Ara.accent : Ara.text2)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                        .onTapGesture { selSlice = i }
+                    }
+                }
+                .padding(.vertical, 2)
+                // per-slice controls: [hue_shift, sat_delta, lum_delta, enabled]
+                HStack {
+                    Text(Self.sliceNames[selSlice])
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(Ara.text1)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { edit.wrappedValue.color_slice[selSlice][3] > 0.5 },
+                        set: { edit.wrappedValue.color_slice[selSlice][3] = $0 ? 1 : 0 }))
+                        .toggleStyle(.checkbox)
+                        .labelsHidden()
+                }
+                SliderRow("Hue", Binding(
+                    get: { edit.wrappedValue.color_slice[selSlice][0] * 360 },
+                    set: { edit.wrappedValue.color_slice[selSlice][0] = $0 / 360; edit.wrappedValue.color_slice[selSlice][3] = 1 }),
+                    -30...30, step: 0.5, reset: 0)
+                SliderRow("Saturation", Binding(
+                    get: { edit.wrappedValue.color_slice[selSlice][1] },
+                    set: { edit.wrappedValue.color_slice[selSlice][1] = $0; edit.wrappedValue.color_slice[selSlice][3] = 1 }),
+                    -0.8...0.8, reset: 0)
+                SliderRow("Density", Binding(
+                    get: { -edit.wrappedValue.color_slice[selSlice][2] },
+                    set: { edit.wrappedValue.color_slice[selSlice][2] = -$0; edit.wrappedValue.color_slice[selSlice][3] = 1 }),
+                    -0.6...0.6, reset: 0)
+                Text("Density adds depth — positive darkens the wedge, negative lifts it")
+                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+            }
+        }
+    }
+
+    // MARK: ColorWarper (DaVinci Hue-Sat spider graph)
+
+    @State private var warpDrag = -1
+    @State private var warpDragNew = false
+    @State private var warpTapIdx = -1
+    @State private var warpTapTime = Date.distantPast
+
+    /// graph coords → (h, s); radius = saturation 0..1
+    private func warpHS(_ loc: CGPoint, in size: CGSize) -> (h: Double, s: Double) {
+        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+        let r = min(size.width, size.height) / 2 - 8
+        let dx = Double(loc.x - c.x) / r, dy = Double(loc.y - c.y) / r
+        let s = min(1.0, (dx * dx + dy * dy).squareRoot())
+        var h = atan2(dy, dx) / (2 * .pi)
+        if h < 0 { h += 1 }
+        return (h, s)
+    }
+    private func warpPt(_ h: Double, _ s: Double, in size: CGSize) -> CGPoint {
+        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+        let r = min(size.width, size.height) / 2 - 8
+        return CGPoint(x: c.x + CGFloat(s * cos(h * 2 * .pi)) * r,
+                       y: c.y + CGFloat(s * sin(h * 2 * .pi)) * r)
+    }
+
+    private var warpPalette: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Color Warper — Hue vs Saturation", trailing: {
+                ToolChip(label: "Reset", icon: "arrow.counterclockwise") {
+                    edit.wrappedValue.warper = []
+                }
+            }) {
+                GeometryReader { geo in
+                    let sz = geo.size
+                    Canvas { ctx, size in
+                        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+                        let r = min(size.width, size.height) / 2 - 8
+                        // concentric sat rings at .25/.5/.75/1
+                        for k in 1...4 {
+                            let rr = r * CGFloat(k) / 4
+                            ctx.stroke(Circle().path(in: CGRect(x: c.x - rr, y: c.y - rr, width: rr * 2, height: rr * 2)),
+                                       with: .color(Ara.text2.opacity(k == 4 ? 0.5 : 0.22)), lineWidth: k == 4 ? 1 : 0.5)
+                        }
+                        // spokes every 30° + wedge tint ticks on the rim
+                        for k in 0..<12 {
+                            let a = CGFloat(k) * .pi / 6
+                            var p = Path()
+                            p.move(to: c)
+                            p.addLine(to: CGPoint(x: c.x + cos(a) * r, y: c.y + sin(a) * r))
+                            ctx.stroke(p, with: .color(Ara.text2.opacity(0.15)), lineWidth: 0.5)
+                            ctx.fill(Circle().path(in: CGRect(
+                                x: c.x + cos(a) * r - 2.5, y: c.y + sin(a) * r - 2.5,
+                                width: 5, height: 5)),
+                                with: .color(Color(hue: Double(k) / 12, saturation: 0.9, brightness: 0.95)))
+                        }
+                        // control points: anchor ring + line to displaced dot
+                        for w in edit.wrappedValue.warper {
+                            guard w.count >= 5 else { continue }
+                            let ah = w[0], as_ = w[1]
+                            let dh = w[2], ds = w[3]
+                            let a = warpPt(ah, as_, in: size)
+                            let d = warpPt((ah + dh).truncatingRemainder(dividingBy: 1), (as_ + ds).clamped(to: 0...1), in: size)
+                            var ln = Path(); ln.move(to: a); ln.addLine(to: d)
+                            ctx.stroke(ln, with: .color(.white.opacity(0.6)), lineWidth: 1)
+                            ctx.stroke(Circle().path(in: CGRect(x: a.x - 3.5, y: a.y - 3.5, width: 7, height: 7)),
+                                       with: .color(.white.opacity(0.5)), lineWidth: 1)
+                            ctx.fill(Circle().path(in: CGRect(x: d.x - 5, y: d.y - 5, width: 10, height: 10)),
+                                     with: .color(Color(hue: ah, saturation: 0.85, brightness: 1.0)))
+                            ctx.stroke(Circle().path(in: CGRect(x: d.x - 5, y: d.y - 5, width: 10, height: 10)),
+                                       with: .color(.white), lineWidth: 1)
+                        }
+                    }
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { g in
+                            if warpDrag < 0 {
+                                // hit-test displaced dots first (12px), else create a point
+                                let hit = edit.wrappedValue.warper.indices.first { i in
+                                    let w = edit.wrappedValue.warper[i]
+                                    guard w.count >= 5 else { return false }
+                                    let d = warpPt((w[0] + w[2]).truncatingRemainder(dividingBy: 1),
+                                                   (w[1] + w[3]).clamped(to: 0...1), in: sz)
+                                    return abs(d.x - g.startLocation.x) < 12 && abs(d.y - g.startLocation.y) < 12
+                                }
+                                if let i = hit { warpDrag = i }
+                                else if edit.wrappedValue.warper.count < 8 {
+                                    let (h, s) = warpHS(g.startLocation, in: sz)
+                                    edit.wrappedValue.warper.append([h, s, 0, 0, 0.15])
+                                    warpDrag = edit.wrappedValue.warper.count - 1
+                                    warpDragNew = true
+                                } else { return }
+                            }
+                            guard warpDrag >= 0, warpDrag < edit.wrappedValue.warper.count else { return }
+                            let (h2, s2) = warpHS(g.location, in: sz)
+                            var dh = h2 - edit.wrappedValue.warper[warpDrag][0]
+                            if dh > 0.5 { dh -= 1 } else if dh < -0.5 { dh += 1 }
+                            edit.wrappedValue.warper[warpDrag][2] = dh
+                            edit.wrappedValue.warper[warpDrag][3] = (s2 - edit.wrappedValue.warper[warpDrag][1]).clamped(to: -1...1)
+                        }
+                        .onEnded { g in
+                            // a near-zero drag on an existing point counts as a
+                            // tap — a second one within 0.4s deletes the point
+                            let moved = abs(g.location.x - g.startLocation.x) > 3
+                                || abs(g.location.y - g.startLocation.y) > 3
+                            if warpDrag >= 0, !moved, !warpDragNew {
+                                let now = Date()
+                                if warpDrag == warpTapIdx,
+                                   now.timeIntervalSince(warpTapTime) < 0.4 {
+                                    edit.wrappedValue.warper.remove(at: warpDrag)
+                                    warpTapIdx = -1
+                                } else {
+                                    warpTapIdx = warpDrag
+                                    warpTapTime = now
+                                }
+                            }
+                            warpDrag = -1
+                            warpDragNew = false
+                        })
+                }
+                .aspectRatio(1, contentMode: .fit)
+                .background(Ara.bg0)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                Text("\(edit.wrappedValue.warper.count) point\(edit.wrappedValue.warper.count == 1 ? "" : "s") — ring = pinned colour, dot = where it moves")
+                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
             }
         }
     }
@@ -1271,11 +1675,11 @@ struct EditorView: View {
     private var qualifierPalette: some View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Qualifier", trailing: {
-                Toggle("", isOn: $recipe.q_enabled)
+                Toggle("", isOn: edit.q_enabled)
                     .labelsHidden().controlSize(.mini).tint(Ara.accent)
-                    .onChange(of: recipe.q_enabled) { _, on in
-                        if !on { recipe.qh[1] = 0; recipe.q_show = false }
-                        else if recipe.qh[1] == 0 { recipe.qh[1] = 0.1 }
+                    .onChange(of: edit.wrappedValue.q_enabled) { _, on in
+                        if !on { edit.wrappedValue.qh[1] = 0; edit.wrappedValue.q_show = false }
+                        else if edit.wrappedValue.qh[1] == 0 { edit.wrappedValue.qh[1] = 0.1 }
                     }
             }) {
                 // eyedropper row: pick / add / subtract
@@ -1294,61 +1698,61 @@ struct EditorView: View {
                         retouchMode = retouchMode == "qsub" ? "off" : "qsub"
                     }
                     Spacer()
-                    ToolChip(label: "View", icon: "eye", active: recipe.q_show) {
-                        recipe.q_show.toggle()
+                    ToolChip(label: "View", icon: "eye", active: edit.wrappedValue.q_show) {
+                        edit.wrappedValue.q_show.toggle()
                     }
                     .help("Highlight: show the matte — keyed area in colour, rest grey")
                 }
-                if recipe.q_enabled {
+                if edit.wrappedValue.q_enabled {
                     // HSL gradient bars
                     RangeBar(title: "Hue",
                              lo: Binding(
-                                 get: { (recipe.qh[0] - recipe.qh[1]).clamped(to: 0...1) },
+                                 get: { (edit.wrappedValue.qh[0] - edit.wrappedValue.qh[1]).clamped(to: 0...1) },
                                  set: { v in
-                                     let hi = (recipe.qh[0] + recipe.qh[1]).clamped(to: 0...1)
-                                     recipe.qh[0] = (v + hi) / 2
-                                     recipe.qh[1] = max(0.002, (hi - v) / 2)
+                                     let hi = (edit.wrappedValue.qh[0] + edit.wrappedValue.qh[1]).clamped(to: 0...1)
+                                     edit.wrappedValue.qh[0] = (v + hi) / 2
+                                     edit.wrappedValue.qh[1] = max(0.002, (hi - v) / 2)
                                  }),
                              hi: Binding(
-                                 get: { (recipe.qh[0] + recipe.qh[1]).clamped(to: 0...1) },
+                                 get: { (edit.wrappedValue.qh[0] + edit.wrappedValue.qh[1]).clamped(to: 0...1) },
                                  set: { v in
-                                     let lo = (recipe.qh[0] - recipe.qh[1]).clamped(to: 0...1)
-                                     recipe.qh[0] = (lo + v) / 2
-                                     recipe.qh[1] = max(0.002, (v - lo) / 2)
+                                     let lo = (edit.wrappedValue.qh[0] - edit.wrappedValue.qh[1]).clamped(to: 0...1)
+                                     edit.wrappedValue.qh[0] = (lo + v) / 2
+                                     edit.wrappedValue.qh[1] = max(0.002, (v - lo) / 2)
                                  }),
                              gradient: LinearGradient(
                                  colors: (0...12).map { Color(hue: Double($0) / 12, saturation: 0.8, brightness: 0.9) },
                                  startPoint: .leading, endPoint: .trailing))
                     RangeBar(title: "Sat",
-                             lo: $recipe.qs[0], hi: $recipe.qs[1],
+                             lo: edit.qs[0], hi: edit.qs[1],
                              gradient: LinearGradient(colors: [.gray.opacity(0.4), .orange],
                                                       startPoint: .leading, endPoint: .trailing))
                     RangeBar(title: "Lum",
-                             lo: $recipe.ql[0], hi: $recipe.ql[1],
+                             lo: edit.ql[0], hi: edit.ql[1],
                              gradient: LinearGradient(colors: [.black, .white],
                                                       startPoint: .leading, endPoint: .trailing))
-                    SliderRow("Hue Soft", $recipe.qh[2], 0.01...0.4, reset: 0.1)
-                    SliderRow("Sat Soft", $recipe.qs[2], 0.01...0.4, reset: 0.1)
-                    SliderRow("Lum Soft", $recipe.ql[2], 0.01...0.4, reset: 0.1)
+                    SliderRow("Hue Soft", edit.qh[2], 0.01...0.4, reset: 0.1)
+                    SliderRow("Sat Soft", edit.qs[2], 0.01...0.4, reset: 0.1)
+                    SliderRow("Lum Soft", edit.ql[2], 0.01...0.4, reset: 0.1)
                     Text("MATTE FINESSE")
                         .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
                         .foregroundStyle(Ara.text3)
-                    SliderRow("Clean Blk", $recipe.q_clean[0], 0...1)
-                    SliderRow("Clean Wht", $recipe.q_clean[1], 0...1, reset: 1)
-                    SliderRow("Blur", $recipe.q_blur, 0...1)
+                    SliderRow("Clean Blk", edit.q_clean[0], 0...1)
+                    SliderRow("Clean Wht", edit.q_clean[1], 0...1, reset: 1)
+                    SliderRow("Blur", edit.q_blur, 0...1)
                     HStack {
                         Text("Invert mask").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
                         Spacer()
-                        Toggle("", isOn: $recipe.q_invert)
+                        Toggle("", isOn: edit.q_invert)
                             .labelsHidden().controlSize(.mini).tint(Ara.accent)
                     }
                     Text("ADJUST INSIDE KEY")
                         .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
                         .foregroundStyle(Ara.text3)
-                    SliderRow("Hue Δ", $recipe.qadj[0], -0.5...0.5, track: Ara.hueTrack)
-                    SliderRow("Sat Δ", $recipe.qadj[1], -1...1)
-                    SliderRow("Lum Δ", $recipe.qadj[2], -1...1)
-                    SliderRow("Temp Δ", $recipe.qadj[3], -1...1)
+                    SliderRow("Hue Δ", edit.qadj[0], -0.5...0.5, track: Ara.hueTrack)
+                    SliderRow("Sat Δ", edit.qadj[1], -1...1)
+                    SliderRow("Lum Δ", edit.qadj[2], -1...1)
+                    SliderRow("Temp Δ", edit.qadj[3], -1...1)
                 }
             }
         }
@@ -1369,7 +1773,7 @@ struct EditorView: View {
                         var w = PowerWindow()
                         w.kind = "lum"
                         w.p = [0.0, 0.6, 0.1, 0.1, 0, 0]
-                        recipe.windows.append(w)
+                        edit.wrappedValue.windows.append(w)
                         selWindow = w.id
                     }
                     .help("Luminance-range mask: selects a band of the image by brightness")
@@ -1382,19 +1786,19 @@ struct EditorView: View {
                     .opacity(subjBusy ? 0.5 : 1)
                 }
             }) {
-                if recipe.windows.isEmpty {
+                if edit.wrappedValue.windows.isEmpty {
                     Text("Add a circle, gradient, or luminance window, then tap or drag on the image. " +
                          "Select a window row, then drag on the image to move it.")
                         .font(.system(size: 10)).foregroundStyle(Ara.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                ForEach(recipe.windows) { w in
-                    if let i = recipe.windows.firstIndex(where: { $0.id == w.id }) {
-                        WindowRow(w: $recipe.windows[i],
+                ForEach(edit.wrappedValue.windows) { w in
+                    if let i = edit.wrappedValue.windows.firstIndex(where: { $0.id == w.id }) {
+                        WindowRow(w: edit.windows[i],
                                   selected: selWindow == w.id,
                                   onSelect: { selWindow = w.id }) {
                             if selWindow == w.id { selWindow = nil }
-                            recipe.windows.remove(at: i)
+                            edit.wrappedValue.windows.remove(at: i)
                         }
                     }
                 }
@@ -1412,7 +1816,7 @@ struct EditorView: View {
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle([Color.red.opacity(0.9), .green.opacity(0.9), .blue.opacity(0.9)][row])
                                 .frame(width: 14, alignment: .leading)
-                            MixRow($recipe.mixer, row: row)
+                            MixRow(edit.mixer, row: row)
                         }
                     }
                 }
@@ -1420,13 +1824,13 @@ struct EditorView: View {
                     Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
                     Spacer()
                     Toggle("", isOn: Binding(
-                        get: { recipe.mono != [0, 0, 0] },
-                        set: { recipe.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0] }
+                        get: { edit.wrappedValue.mono != [0, 0, 0] },
+                        set: { edit.wrappedValue.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0] }
                     ))
                     .labelsHidden().controlSize(.mini).tint(Ara.accent)
                 }
-                if recipe.mono != [0, 0, 0] {
-                    TriRow("Mono", $recipe.mono, 0...1)
+                if edit.wrappedValue.mono != [0, 0, 0] {
+                    TriRow("Mono", edit.mono, 0...1)
                 }
             }
         }
@@ -1452,7 +1856,7 @@ struct EditorView: View {
                     SliderRow("EV", $lightEV, 0...2, reset: 0.5)
                 }
                 // adjustment brush: paint strokes, layer holds the adjustment
-                if retouchMode == "brush" || !recipe.brushes.isEmpty {
+                if retouchMode == "brush" || !edit.wrappedValue.brushes.isEmpty {
                     Divider().overlay(Ara.hairline)
                     HStack(spacing: 6) {
                         Text("Brush").font(.system(size: 10.5, weight: .semibold))
@@ -1463,9 +1867,9 @@ struct EditorView: View {
                         }
                         .help("Erase strokes from the active layer")
                         ToolChip(label: "+Layer", icon: "plus", active: false) {
-                            if recipe.brushes.count < 4 {
-                                recipe.brushes.append(BrushLayer())
-                                selBrush = recipe.brushes.count - 1
+                            if edit.wrappedValue.brushes.count < 4 {
+                                edit.wrappedValue.brushes.append(BrushLayer())
+                                selBrush = edit.wrappedValue.brushes.count - 1
                             }
                         }
                         .help("New brush layer with its own adjustment (max 4)")
@@ -1473,19 +1877,19 @@ struct EditorView: View {
                     SliderRow("Size", $brushRadius, 0.005...0.25, reset: 0.04)
                     SliderRow("Feather", $brushSoft, 0...1, reset: 0.5)
                     SliderRow("Flow", $brushFlow, 0.05...1, reset: 1)
-                    ForEach(Array(recipe.brushes.enumerated()), id: \.element.id) { li, layer in
+                    ForEach(Array(edit.wrappedValue.brushes.enumerated()), id: \.element.id) { li, layer in
                         BrushLayerRow(layer: layer, index: li, selected: li == selBrush,
                                       onSelect: { selBrush = li },
-                                      onToggle: { recipe.brushes[li].enabled.toggle() },
+                                      onToggle: { edit.wrappedValue.brushes[li].enabled.toggle() },
                                       onDelete: {
-                            recipe.brushes.remove(at: li)
-                            selBrush = max(0, min(selBrush, recipe.brushes.count - 1))
+                            edit.wrappedValue.brushes.remove(at: li)
+                            selBrush = max(0, min(selBrush, edit.wrappedValue.brushes.count - 1))
                         })
                     }
-                    if recipe.brushes.indices.contains(selBrush) {
+                    if edit.wrappedValue.brushes.indices.contains(selBrush) {
                         let bl = Binding<BrushLayer>(
-                            get: { recipe.brushes[selBrush] },
-                            set: { recipe.brushes[selBrush] = $0 })
+                            get: { edit.wrappedValue.brushes[selBrush] },
+                            set: { edit.wrappedValue.brushes[selBrush] = $0 })
                         SliderRow("Exposure", bl.ev, -4...4)
                         SliderRow("Saturation", bl.sat, -1...1)
                         SliderRow("Temp", bl.temp, -1...1)
@@ -1497,9 +1901,19 @@ struct EditorView: View {
                                 .labelsHidden().controlSize(.mini).tint(Ara.accent)
                         }
                         .help("Gate this brush layer by the HSL qualifier matte")
+                        HStack(spacing: 6) {
+                            Text("Edge Aware").font(.system(size: 10)).foregroundStyle(Ara.text2)
+                            Spacer()
+                            Toggle("", isOn: bl.edgeAware)
+                                .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                        }
+                        .help("Strokes stick to the colour under their first dab — paint a sky without bleeding into buildings")
+                        if bl.edgeAware.wrappedValue {
+                            SliderRow("Tolerance", bl.edgeTol, 0.05...1.0, reset: 0.5)
+                        }
                     }
                 }
-                if !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty {
+                if !recipe.spots.isEmpty || !edit.wrappedValue.lights.isEmpty || !recipe.clones.isEmpty {
                     ForEach(recipe.spots.indices, id: \.self) { i in
                         MarkRow("Spot \(i + 1)", icon: "bandage") { recipe.spots.remove(at: i) }
                     }
@@ -1508,10 +1922,10 @@ struct EditorView: View {
                             recipe.clones.remove(at: i)
                         }
                     }
-                    ForEach(recipe.lights.indices, id: \.self) { i in
-                        MarkRow("Light \(i + 1)  \(recipe.lights[i][3] >= 0 ? "+" : "")\(String(format: "%.1f", recipe.lights[i][3]))EV",
+                    ForEach(edit.wrappedValue.lights.indices, id: \.self) { i in
+                        MarkRow("Light \(i + 1)  \(edit.wrappedValue.lights[i][3] >= 0 ? "+" : "")\(String(format: "%.1f", edit.wrappedValue.lights[i][3]))EV",
                                 icon: "sun.max") {
-                            recipe.lights.remove(at: i)
+                            edit.wrappedValue.lights.remove(at: i)
                         }
                     }
                 }
@@ -1651,6 +2065,69 @@ struct EditorView: View {
                                onDelete: { versions.removeAll { $0.id == v.id } })
                 }
             }
+            // DaVinci Gallery stills: app-wide grade library. Click applies
+            // the still's recipe; a still can also act as the wipe reference.
+            Panel("Grade Library", trailing: {
+                ToolChip(label: "Save", icon: "plus") { saveStill() }
+            }) {
+                if refRecipe != nil {
+                    HStack(spacing: 6) {
+                        Image(systemName: "rectangle.split.2x1")
+                            .font(.system(size: 10)).foregroundStyle(Ara.accent)
+                        Text("Wipe ref: \(refName)")
+                            .font(.system(size: 10)).foregroundStyle(Ara.text1)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Clear") { clearReference() }
+                            .font(.system(size: 10)).foregroundStyle(Ara.accent)
+                            .buttonStyle(.plain)
+                    }
+                }
+                if stills.isEmpty {
+                    Text("Save the current grade as a reusable still — click one to apply it " +
+                         "to this photo, or use it as the wipe reference.")
+                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(stills) { st in
+                                VStack(spacing: 3) {
+                                    if let t = stillThumbs[st.id] {
+                                        Image(nsImage: t)
+                                            .resizable().aspectRatio(contentMode: .fill)
+                                            .frame(width: 84, height: 56)
+                                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                                            .overlay(RoundedRectangle(cornerRadius: 4)
+                                                .stroke(Ara.border, lineWidth: 0.5))
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(Ara.bg3)
+                                            .frame(width: 84, height: 56)
+                                            .overlay(ProgressView().controlSize(.mini))
+                                    }
+                                    Text(st.name)
+                                        .font(.system(size: 8.5)).foregroundStyle(Ara.text2)
+                                        .lineLimit(1)
+                                        .frame(width: 84)
+                                }
+                                .contentShape(Rectangle())
+                                .onTapGesture { applyStill(st) }
+                                .contextMenu {
+                                    Button("Apply") { applyStill(st) }
+                                    Button("Use as wipe reference") { useAsReference(st) }
+                                    Divider()
+                                    Button("Rename…") { renameStill(st) }
+                                    Button("Delete") { deleteStill(st) }
+                                }
+                                .help("Apply \"\(st.name)\" — right-click for more")
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(height: 72)
+                }
+            }
             // darktable history stack: every undo step as a clickable row.
             Panel("Edit History") {
                 if undoStack.isEmpty {
@@ -1730,8 +2207,8 @@ struct EditorView: View {
             p.allowedContentTypes = [cube]
         }
         if p.runModal() == .OK, let u = p.url {
-            recipe.lut_file = u.path
-            if recipe.lut_amount == 0 { recipe.lut_amount = 1 }
+            edit.wrappedValue.lut_file = u.path
+            if edit.wrappedValue.lut_amount == 0 { edit.wrappedValue.lut_amount = 1 }
         }
     }
 
@@ -1756,19 +2233,19 @@ struct EditorView: View {
                 switch scope {
                 case .all:
                     recipe.wb_mode = .auto
-                    recipe.auto_exposure = true
-                    recipe.auto_contrast = true
+                    edit.wrappedValue.auto_exposure = true
+                    edit.wrappedValue.auto_contrast = true
                     recipe.rotation_deg = s.rotation_deg
                     recipe.key_v = s.key_v; recipe.key_h = s.key_h
                     recipe.noise_luma = s.noise_luma; recipe.noise_chroma = s.noise_chroma
                     recipe.ca_fix = s.ca_fix
                     recipe.dehaze = s.dehaze
-                    recipe.vibrance = s.vibrance
-                    recipe.zones_ev = s.zones_ev
+                    edit.wrappedValue.vibrance = s.vibrance
+                    edit.wrappedValue.zones_ev = s.zones_ev
                 case .tone:
                     recipe.wb_mode = .auto
-                    recipe.auto_exposure = true
-                    recipe.auto_contrast = true
+                    edit.wrappedValue.auto_exposure = true
+                    edit.wrappedValue.auto_contrast = true
                 case .geometry:
                     recipe.rotation_deg = s.rotation_deg
                     recipe.key_v = s.key_v; recipe.key_h = s.key_h
@@ -1777,9 +2254,9 @@ struct EditorView: View {
                     recipe.ca_fix = s.ca_fix
                     recipe.dehaze = s.dehaze
                 case .zones:
-                    recipe.zones_ev = s.zones_ev
+                    edit.wrappedValue.zones_ev = s.zones_ev
                 case .colour:
-                    recipe.vibrance = s.vibrance
+                    edit.wrappedValue.vibrance = s.vibrance
                 }
                 status = autoSummary(s, scope)
             }
@@ -1833,15 +2310,15 @@ struct EditorView: View {
 
     private func curveBinding(_ ch: Int) -> Binding<[[Double]]> {
         switch ch {
-        case 0: return $recipe.curve
-        case 1: return $recipe.curve_r
-        case 2: return $recipe.curve_g
-        case 3: return $recipe.curve_b
-        case 4: return $recipe.hue_hue
-        case 5: return $recipe.hue_sat
-        case 6: return $recipe.hue_lum
-        case 7: return $recipe.lum_sat
-        default: return $recipe.sat_sat
+        case 0: return edit.curve
+        case 1: return edit.curve_r
+        case 2: return edit.curve_g
+        case 3: return edit.curve_b
+        case 4: return edit.hue_hue
+        case 5: return edit.hue_sat
+        case 6: return edit.hue_lum
+        case 7: return edit.lum_sat
+        default: return edit.sat_sat
         }
     }
 
@@ -1861,6 +2338,8 @@ struct EditorView: View {
         baselineVersions = sc.versions
         versions = store.unsavedVersions[photo.id] ?? sc.versions
         recipe = store.unsavedEdits[photo.id] ?? sc.recipe
+        selStage = 0
+        selWindow = nil
         rating = sc.rating
         label = sc.label
         flag = sc.flag
@@ -1868,6 +2347,7 @@ struct EditorView: View {
         loadedLabel = sc.label
         image = nil
         baselineImg = nil
+        clearReference()
         undoStack.removeAll()
         redoStack.removeAll()
         cmp = .off
@@ -1883,6 +2363,7 @@ struct EditorView: View {
         subjReady = false
         // .insp stills are always equirect — open straight into 360 mode
         panoMode = photo.name.lowercased().hasSuffix(".insp")
+        if stills.isEmpty { loadGallery() }
         Task {
             let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
             if let d = meta.data(using: .utf8),
@@ -1924,7 +2405,7 @@ struct EditorView: View {
         w.kind = "subject"
         w.p = [0, 0, 0, 0, 0, 0]
         w.ev = 0.6   // sensible starting lift so the mask is visible
-        recipe.windows.append(w)
+        edit.wrappedValue.windows.append(w)
         selWindow = w.id
         status = "Subject window added — tweak EV/Sat/Temp"
     }
@@ -1967,6 +2448,7 @@ struct EditorView: View {
             baseline = recipe
             baselineVersions = versions
             baselineImg = nil   // re-render compare base with the saved recipe
+            clearReference()
             store.unsavedEdits.removeValue(forKey: photo.id)
             store.unsavedVersions.removeValue(forKey: photo.id)
             dirty = false
@@ -2007,13 +2489,108 @@ struct EditorView: View {
     // MARK: compare baseline render
 
     /// Render the saved-state image once for wipe/before/diff modes.
+    /// When a library still is chosen as wipe reference, render that instead.
     private func ensureBaseline() {
         if baselineImg != nil { return }
-        let r = baseline
+        let r = refRecipe ?? baseline
         Task.detached { [path = photo.path] in
             let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1400).0 }
             await MainActor.run { baselineImg = img }
         }
+    }
+
+    // MARK: grade library (~/.araware/gallery)
+
+    private var galleryDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".araware/gallery", isDirectory: true)
+    }
+    private var galleryFile: URL { galleryDir.appendingPathComponent("stills.json") }
+
+    private func loadGallery() {
+        try? FileManager.default.createDirectory(at: galleryDir, withIntermediateDirectories: true)
+        if let d = try? Data(contentsOf: galleryFile),
+           let s = try? JSONDecoder().decode([GradeStill].self, from: d) {
+            stills = s
+        }
+        // lazy thumb load — read <id>.jpg files that exist
+        for st in stills where stillThumbs[st.id] == nil {
+            if let img = NSImage(contentsOf: galleryDir.appendingPathComponent("\(st.id.uuidString).jpg")) {
+                stillThumbs[st.id] = img
+            }
+        }
+    }
+
+    private func saveGallery() {
+        if let d = try? JSONEncoder().encode(stills) {
+            try? d.write(to: galleryFile, options: .atomic)
+        }
+    }
+
+    private func saveStill() {
+        var st = GradeStill(name: "", recipe: recipe, saved: Date().timeIntervalSince1970)
+        st.name = "Still \(stills.count + 1)"
+        stills.append(st)
+        saveGallery()
+        // render the thumbnail in the background
+        let path = photo.path, r = recipe, id = st.id, dir = galleryDir
+        Task.detached {
+            let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 280).0 }
+            var thumb: NSImage?
+            if let img {
+                let rep = NSBitmapImageRep(cgImage: img)
+                if let d = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                    try? d.write(to: dir.appendingPathComponent("\(id.uuidString).jpg"))
+                    thumb = NSImage(data: d)
+                }
+            }
+            await MainActor.run { if let thumb { stillThumbs[id] = thumb } }
+        }
+        status = "Saved \"\(st.name)\" to grade library"
+    }
+
+    private func applyStill(_ st: GradeStill) {
+        recipe = st.recipe
+        status = "Applied \"\(st.name)\""
+    }
+
+    private func useAsReference(_ st: GradeStill) {
+        refRecipe = st.recipe
+        refName = st.name
+        baselineImg = nil
+        if cmp == .off { cmp = .wipeV }
+        ensureBaseline()
+        status = "Wipe reference: \(st.name)"
+    }
+
+    private func clearReference() {
+        refRecipe = nil; refName = ""; baselineImg = nil
+    }
+
+    private func renameStill(_ st: GradeStill) {
+        let a = NSAlert()
+        a.messageText = "Rename still"
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        tf.stringValue = st.name
+        a.accessoryView = tf
+        a.addButton(withTitle: "Rename")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn {
+            let n = tf.stringValue.trimmingCharacters(in: .whitespaces)
+            if !n.isEmpty, let i = stills.firstIndex(where: { $0.id == st.id }) {
+                stills[i].name = n
+                saveGallery()
+            }
+        }
+    }
+
+    private func deleteStill(_ st: GradeStill) {
+        stills.removeAll { $0.id == st.id }
+        stillThumbs.removeValue(forKey: st.id)
+        try? FileManager.default.removeItem(
+            at: galleryDir.appendingPathComponent("\(st.id.uuidString).jpg"))
+        saveGallery()
+        if refName == st.name { clearReference() }
     }
 
     // MARK: qualifier picking
@@ -2066,38 +2643,38 @@ struct EditorView: View {
         let l = 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
         switch mode {
         case "qpick":
-            recipe.qh = [hh, 0.08, 0.08]
-            recipe.qs = [max(0, ss - 0.18), min(1, ss + 0.18), 0.12]
-            recipe.ql = [max(0, l - 0.28), min(1, l + 0.28), 0.18]
-            recipe.q_enabled = true
+            edit.wrappedValue.qh = [hh, 0.08, 0.08]
+            edit.wrappedValue.qs = [max(0, ss - 0.18), min(1, ss + 0.18), 0.12]
+            edit.wrappedValue.ql = [max(0, l - 0.28), min(1, l + 0.28), 0.18]
+            edit.wrappedValue.q_enabled = true
             status = String(format: "Keyed h=%.2f s=%.2f l=%.2f", hh, ss, l)
         case "qadd":
-            recipe.qh[1] = max(recipe.qh[1], hueDist(hh, recipe.qh[0]) + 0.03)
-            recipe.qs[0] = min(recipe.qs[0], ss)
-            recipe.qs[1] = max(recipe.qs[1], ss)
-            recipe.ql[0] = min(recipe.ql[0], l)
-            recipe.ql[1] = max(recipe.ql[1], l)
+            edit.wrappedValue.qh[1] = max(edit.wrappedValue.qh[1], hueDist(hh, edit.wrappedValue.qh[0]) + 0.03)
+            edit.wrappedValue.qs[0] = min(edit.wrappedValue.qs[0], ss)
+            edit.wrappedValue.qs[1] = max(edit.wrappedValue.qs[1], ss)
+            edit.wrappedValue.ql[0] = min(edit.wrappedValue.ql[0], l)
+            edit.wrappedValue.ql[1] = max(edit.wrappedValue.ql[1], l)
         case "qsub":
-            if hueDist(hh, recipe.qh[0]) < recipe.qh[1] {
-                recipe.qh[1] = max(0.004, hueDist(hh, recipe.qh[0]) - 0.02)
+            if hueDist(hh, edit.wrappedValue.qh[0]) < edit.wrappedValue.qh[1] {
+                edit.wrappedValue.qh[1] = max(0.004, hueDist(hh, edit.wrappedValue.qh[0]) - 0.02)
             }
-            if ss > recipe.qs[0] && ss < recipe.qs[1] {
-                if ss - recipe.qs[0] < recipe.qs[1] - ss {
-                    recipe.qs[0] = min(1, ss + 0.02)
+            if ss > edit.wrappedValue.qs[0] && ss < edit.wrappedValue.qs[1] {
+                if ss - edit.wrappedValue.qs[0] < edit.wrappedValue.qs[1] - ss {
+                    edit.wrappedValue.qs[0] = min(1, ss + 0.02)
                 } else {
-                    recipe.qs[1] = max(0, ss - 0.02)
+                    edit.wrappedValue.qs[1] = max(0, ss - 0.02)
                 }
             }
-            if l > recipe.ql[0] && l < recipe.ql[1] {
-                if l - recipe.ql[0] < recipe.ql[1] - l {
-                    recipe.ql[0] = min(1, l + 0.02)
+            if l > edit.wrappedValue.ql[0] && l < edit.wrappedValue.ql[1] {
+                if l - edit.wrappedValue.ql[0] < edit.wrappedValue.ql[1] - l {
+                    edit.wrappedValue.ql[0] = min(1, l + 0.02)
                 } else {
-                    recipe.ql[1] = max(0, l - 0.02)
+                    edit.wrappedValue.ql[1] = max(0, l - 0.02)
                 }
             }
         default: break
         }
-        recipe.q_enabled = true
+        edit.wrappedValue.q_enabled = true
     }
 
     // MARK: palette bookkeeping
@@ -2107,51 +2684,55 @@ struct EditorView: View {
         let d = Recipe()
         switch p {
         case .quick:
-            return recipe.exposure != d.exposure || recipe.contrast != d.contrast
-                || recipe.highlights != d.highlights || recipe.shadows != d.shadows
-                || recipe.whites != d.whites || recipe.blacks != d.blacks
+            return edit.wrappedValue.exposure != d.exposure || edit.wrappedValue.contrast != d.contrast
+                || edit.wrappedValue.highlights != d.highlights || edit.wrappedValue.shadows != d.shadows
+                || edit.wrappedValue.whites != d.whites || edit.wrappedValue.blacks != d.blacks
                 || recipe.temperature != d.temperature || recipe.tint != d.tint
                 || recipe.wb_mode != d.wb_mode || recipe.wb_pick != d.wb_pick
-                || recipe.saturation != d.saturation || recipe.vibrance != d.vibrance
+                || edit.wrappedValue.saturation != d.saturation || edit.wrappedValue.vibrance != d.vibrance
                 || recipe.clarity != d.clarity || recipe.rotation_deg != d.rotation_deg
-                || recipe.auto_exposure || recipe.auto_contrast
+                || edit.wrappedValue.auto_exposure || edit.wrappedValue.auto_contrast
         case .light:
-            return recipe.exposure != d.exposure || recipe.contrast != d.contrast
-                || recipe.highlights != d.highlights || recipe.shadows != d.shadows
-                || recipe.whites != d.whites || recipe.blacks != d.blacks
+            return edit.wrappedValue.exposure != d.exposure || edit.wrappedValue.contrast != d.contrast
+                || edit.wrappedValue.highlights != d.highlights || edit.wrappedValue.shadows != d.shadows
+                || edit.wrappedValue.whites != d.whites || edit.wrappedValue.blacks != d.blacks
                 || recipe.temperature != d.temperature || recipe.tint != d.tint
                 || recipe.wb_mode != d.wb_mode || recipe.wb_pick != d.wb_pick
-                || recipe.saturation != d.saturation || recipe.vibrance != d.vibrance
-                || recipe.auto_exposure || recipe.auto_contrast
-                || recipe.pivot != d.pivot
-                || recipe.highlight_rolloff != d.highlight_rolloff
-                || recipe.shadow_rolloff != d.shadow_rolloff
+                || edit.wrappedValue.saturation != d.saturation || edit.wrappedValue.vibrance != d.vibrance
+                || edit.wrappedValue.auto_exposure || edit.wrappedValue.auto_contrast
+                || edit.wrappedValue.pivot != d.pivot
+                || edit.wrappedValue.highlight_rolloff != d.highlight_rolloff
+                || edit.wrappedValue.shadow_rolloff != d.shadow_rolloff
         case .wheels:
-            return recipe.lift != d.lift || recipe.gamma != d.gamma
-                || recipe.gain != d.gain || recipe.offset != d.offset
-                || recipe.shadow_sat != d.shadow_sat || recipe.midtone_sat != d.midtone_sat
-                || recipe.highlight_sat != d.highlight_sat
-                || recipe.shadow_hue != d.shadow_hue || recipe.midtone_hue != d.midtone_hue
-                || recipe.highlight_hue != d.highlight_hue || !recipe.look.isEmpty
+            return edit.wrappedValue.lift != d.lift || edit.wrappedValue.gamma != d.gamma
+                || edit.wrappedValue.gain != d.gain || edit.wrappedValue.offset != d.offset
+                || edit.wrappedValue.shadow_sat != d.shadow_sat || edit.wrappedValue.midtone_sat != d.midtone_sat
+                || edit.wrappedValue.highlight_sat != d.highlight_sat
+                || edit.wrappedValue.shadow_hue != d.shadow_hue || edit.wrappedValue.midtone_hue != d.midtone_hue
+                || edit.wrappedValue.highlight_hue != d.highlight_hue || !edit.wrappedValue.look.isEmpty
         case .curves:
-            return !recipe.curve.isEmpty || !recipe.curve_r.isEmpty
-                || !recipe.curve_g.isEmpty || !recipe.curve_b.isEmpty
-                || !recipe.hue_hue.isEmpty || !recipe.hue_sat.isEmpty
-                || !recipe.hue_lum.isEmpty || !recipe.lum_sat.isEmpty
-                || !recipe.sat_sat.isEmpty
+            return !edit.wrappedValue.curve.isEmpty || !edit.wrappedValue.curve_r.isEmpty
+                || !edit.wrappedValue.curve_g.isEmpty || !edit.wrappedValue.curve_b.isEmpty
+                || !edit.wrappedValue.hue_hue.isEmpty || !edit.wrappedValue.hue_sat.isEmpty
+                || !edit.wrappedValue.hue_lum.isEmpty || !edit.wrappedValue.lum_sat.isEmpty
+                || !edit.wrappedValue.sat_sat.isEmpty
         case .zones:
-            return recipe.z_dark != d.z_dark || recipe.z_shadow != d.z_shadow
-                || recipe.z_light != d.z_light || recipe.z_global != d.z_global
-                || recipe.zones_ev != d.zones_ev
+            return edit.wrappedValue.z_dark != d.z_dark || edit.wrappedValue.z_shadow != d.z_shadow
+                || edit.wrappedValue.z_light != d.z_light || edit.wrappedValue.z_global != d.z_global
+                || edit.wrappedValue.zones_ev != d.zones_ev
+        case .slice:
+            return edit.wrappedValue.color_slice != d.color_slice
+        case .warp:
+            return !edit.wrappedValue.warper.isEmpty
         case .qualifier:
-            return recipe.q_enabled || recipe.q_show
+            return edit.wrappedValue.q_enabled || edit.wrappedValue.q_show
         case .windows:
-            return !recipe.windows.isEmpty
+            return !edit.wrappedValue.windows.isEmpty
         case .mixer:
-            return recipe.mixer != d.mixer || recipe.mono != d.mono
+            return edit.wrappedValue.mixer != d.mixer || edit.wrappedValue.mono != d.mono
         case .retouch:
-            return !recipe.spots.isEmpty || !recipe.lights.isEmpty || !recipe.clones.isEmpty
-                || !recipe.brushes.isEmpty
+            return !recipe.spots.isEmpty || !edit.wrappedValue.lights.isEmpty || !recipe.clones.isEmpty
+                || !edit.wrappedValue.brushes.isEmpty
         case .detail:
             return recipe.sharpen != 0 || recipe.noise_luma != 0 || recipe.noise_chroma != d.noise_chroma
                 || recipe.dehaze != 0 || recipe.deband != 0 || recipe.ca_fix != 0 || recipe.beauty != 0
@@ -2172,53 +2753,53 @@ struct EditorView: View {
         let d = Recipe()
         switch p {
         case .quick:
-            recipe.exposure = d.exposure; recipe.contrast = d.contrast
-            recipe.highlights = d.highlights; recipe.shadows = d.shadows
-            recipe.whites = d.whites; recipe.blacks = d.blacks
+            edit.wrappedValue.exposure = d.exposure; edit.wrappedValue.contrast = d.contrast
+            edit.wrappedValue.highlights = d.highlights; edit.wrappedValue.shadows = d.shadows
+            edit.wrappedValue.whites = d.whites; edit.wrappedValue.blacks = d.blacks
             recipe.temperature = d.temperature; recipe.tint = d.tint
             recipe.wb_mode = d.wb_mode; recipe.wb_pick = d.wb_pick
-            recipe.saturation = d.saturation; recipe.vibrance = d.vibrance
+            edit.wrappedValue.saturation = d.saturation; edit.wrappedValue.vibrance = d.vibrance
             recipe.clarity = d.clarity; recipe.rotation_deg = d.rotation_deg
-            recipe.auto_exposure = false; recipe.auto_contrast = false
+            edit.wrappedValue.auto_exposure = false; edit.wrappedValue.auto_contrast = false
         case .light:
-            recipe.exposure = d.exposure; recipe.contrast = d.contrast
-            recipe.highlights = d.highlights; recipe.shadows = d.shadows
-            recipe.whites = d.whites; recipe.blacks = d.blacks
+            edit.wrappedValue.exposure = d.exposure; edit.wrappedValue.contrast = d.contrast
+            edit.wrappedValue.highlights = d.highlights; edit.wrappedValue.shadows = d.shadows
+            edit.wrappedValue.whites = d.whites; edit.wrappedValue.blacks = d.blacks
             recipe.temperature = d.temperature; recipe.tint = d.tint
             recipe.wb_mode = d.wb_mode; recipe.wb_pick = d.wb_pick
-            recipe.saturation = d.saturation; recipe.vibrance = d.vibrance
-            recipe.auto_exposure = false; recipe.auto_contrast = false
-            recipe.pivot = d.pivot
-            recipe.highlight_rolloff = d.highlight_rolloff
-            recipe.shadow_rolloff = d.shadow_rolloff
+            edit.wrappedValue.saturation = d.saturation; edit.wrappedValue.vibrance = d.vibrance
+            edit.wrappedValue.auto_exposure = false; edit.wrappedValue.auto_contrast = false
+            edit.wrappedValue.pivot = d.pivot
+            edit.wrappedValue.highlight_rolloff = d.highlight_rolloff
+            edit.wrappedValue.shadow_rolloff = d.shadow_rolloff
         case .wheels:
-            recipe.lift = d.lift; recipe.gamma = d.gamma; recipe.gain = d.gain
-            recipe.offset = d.offset
-            recipe.shadow_hue = d.shadow_hue; recipe.shadow_sat = d.shadow_sat
-            recipe.midtone_hue = d.midtone_hue; recipe.midtone_sat = d.midtone_sat
-            recipe.highlight_hue = d.highlight_hue; recipe.highlight_sat = d.highlight_sat
-            recipe.look = ""
+            edit.wrappedValue.lift = d.lift; edit.wrappedValue.gamma = d.gamma; edit.wrappedValue.gain = d.gain
+            edit.wrappedValue.offset = d.offset
+            edit.wrappedValue.shadow_hue = d.shadow_hue; edit.wrappedValue.shadow_sat = d.shadow_sat
+            edit.wrappedValue.midtone_hue = d.midtone_hue; edit.wrappedValue.midtone_sat = d.midtone_sat
+            edit.wrappedValue.highlight_hue = d.highlight_hue; edit.wrappedValue.highlight_sat = d.highlight_sat
+            edit.wrappedValue.look = ""
         case .curves:
-            recipe.curve = []; recipe.curve_r = []; recipe.curve_g = []; recipe.curve_b = []
-            recipe.hue_hue = []; recipe.hue_sat = []; recipe.hue_lum = []
-            recipe.lum_sat = []; recipe.sat_sat = []
+            edit.wrappedValue.curve = []; edit.wrappedValue.curve_r = []; edit.wrappedValue.curve_g = []; edit.wrappedValue.curve_b = []
+            edit.wrappedValue.hue_hue = []; edit.wrappedValue.hue_sat = []; edit.wrappedValue.hue_lum = []
+            edit.wrappedValue.lum_sat = []; edit.wrappedValue.sat_sat = []
         case .zones:
-            recipe.z_dark = d.z_dark; recipe.z_shadow = d.z_shadow
-            recipe.z_light = d.z_light; recipe.z_global = d.z_global
-            recipe.zones_ev = d.zones_ev
+            edit.wrappedValue.z_dark = d.z_dark; edit.wrappedValue.z_shadow = d.z_shadow
+            edit.wrappedValue.z_light = d.z_light; edit.wrappedValue.z_global = d.z_global
+            edit.wrappedValue.zones_ev = d.zones_ev
             zoneImgMode = false
         case .qualifier:
-            recipe.qh = d.qh; recipe.qs = d.qs; recipe.ql = d.ql; recipe.qadj = d.qadj
-            recipe.q_invert = false; recipe.q_clean = d.q_clean; recipe.q_blur = 0
-            recipe.q_show = false; recipe.q_enabled = false
+            edit.wrappedValue.qh = d.qh; edit.wrappedValue.qs = d.qs; edit.wrappedValue.ql = d.ql; edit.wrappedValue.qadj = d.qadj
+            edit.wrappedValue.q_invert = false; edit.wrappedValue.q_clean = d.q_clean; edit.wrappedValue.q_blur = 0
+            edit.wrappedValue.q_show = false; edit.wrappedValue.q_enabled = false
         case .windows:
-            recipe.windows = []
+            edit.wrappedValue.windows = []
             selWindow = nil
         case .mixer:
-            recipe.mixer = d.mixer; recipe.mono = d.mono
+            edit.wrappedValue.mixer = d.mixer; edit.wrappedValue.mono = d.mono
         case .retouch:
-            recipe.spots = []; recipe.lights = []; recipe.clones = []
-            recipe.brushes = []
+            recipe.spots = []; edit.wrappedValue.lights = []; recipe.clones = []
+            edit.wrappedValue.brushes = []
             selBrush = 0
             pendingClone = nil
         case .detail:
@@ -2231,6 +2812,10 @@ struct EditorView: View {
             recipe.rotation_deg = 0; recipe.crop = d.crop
             recipe.key_v = 0; recipe.key_h = 0
             recipe.lens_corr = d.lens_corr
+        case .slice:
+            edit.wrappedValue.color_slice = d.color_slice
+        case .warp:
+            edit.wrappedValue.warper = []
         case .meters, .versions:
             break
         }
@@ -2388,22 +2973,65 @@ struct EditorView: View {
             "sharpen": expSharpen,
         ]
         let qual = expQuality
+        let space = expSpace
         Task.detached { [path = photo.path] in
             let img = await AraEngine.shared.work { $0.exportOpts(path: path, recipe: r, opts: opts) }
             await MainActor.run {
                 rendering = false
-                guard let img,
-                      let dest = CGImageDestinationCreateWithURL(url as CFURL, uti.identifier as CFString, 1, nil)
-                else {
+                guard let img else {
                     status = "Export failed: \(AraEngine.shared.lastError)"
+                    return
+                }
+                let tagged = convertColorSpace(img, space)
+                // encode to memory first: ImageIO never embeds the ICC
+                // profile itself, so JPEG APP2 / PNG iCCP get injected below
+                let mdata = NSMutableData()
+                guard let dest2 = CGImageDestinationCreateWithData(
+                    mdata, uti.identifier as CFString, 1, nil) else {
+                    status = "Export failed"
                     return
                 }
                 var props: [CFString: Any] = [:]
                 if uti == .jpeg { props[kCGImageDestinationLossyCompressionQuality] = qual }
-                CGImageDestinationAddImage(dest, img, props as CFDictionary)
-                status = CGImageDestinationFinalize(dest) ? "Exported \(url.lastPathComponent)" : "Export failed"
+                CGImageDestinationAddImage(dest2, tagged, props as CFDictionary)
+                guard CGImageDestinationFinalize(dest2) else {
+                    status = "Export failed"
+                    return
+                }
+                var out = mdata as Data
+                if let icc = ExportICC.icc(of: tagged) {
+                    if uti == .jpeg { out = ExportICC.jpeg(out, icc: icc) }
+                    if uti == .png { out = ExportICC.png(out, icc: icc) }
+                }
+                let ok = (try? out.write(to: url)) != nil
+                status = ok ? "Exported \(url.lastPathComponent) (\(space))" : "Export failed"
             }
         }
+    }
+
+    /// sRGB engine output → tagged target profile (ColorSync conversion).
+    private func convertColorSpace(_ img: CGImage, _ space: String) -> CGImage {
+        guard let src = CGColorSpace(name: CGColorSpace.sRGB) else { return img }
+        // engine emits sRGB-encoded pixels; tag first so the conversion
+        // below sees the right source space
+        let base = (img.colorSpace == src) ? img : (img.copy(colorSpace: src) ?? img)
+        let named: CGColorSpace? = switch space {
+        case "Display P3": CGColorSpace(name: CGColorSpace.displayP3)
+        case "Adobe RGB": CGColorSpace(name: CGColorSpace.adobeRGB1998)
+        case "ProPhoto": CGColorSpace(name: CGColorSpace.rommrgb)
+        default: src
+        }
+        guard let named, named != src else { return base }
+        // draw into a context tagged with the destination profile so
+        // ColorSync converts the pixel values and the image is tagged
+        guard let ctx = CGContext(
+            data: nil, width: base.width, height: base.height,
+            bitsPerComponent: 8, bytesPerRow: 0, space: named,
+            bitmapInfo: (CGImageAlphaInfo.noneSkipLast.rawValue
+                | CGImageByteOrderInfo.orderDefault.rawValue))
+        else { return base }
+        ctx.draw(base, in: CGRect(x: 0, y: 0, width: base.width, height: base.height))
+        return ctx.makeImage() ?? base
     }
 
     /// LR-style export settings: format, resize, output sharpening.
@@ -2428,6 +3056,12 @@ struct EditorView: View {
                 Text("px").font(.system(size: 10)).foregroundStyle(Ara.text3)
             }
             SliderRow("Sharpen", $expSharpen, 0...1)
+            HStack(spacing: 8) {
+                Text("Color Space").font(.system(size: 10.5)).foregroundStyle(Ara.text2).frame(width: 78, alignment: .leading)
+                SegPicker([("sRGB", "sRGB"), ("Display P3", "P3"), ("Adobe RGB", "Adobe"), ("ProPhoto", "ProPhoto")],
+                          selection: $expSpace)
+            }
+            Text("ICC profile is embedded in the file.").font(.system(size: 9)).foregroundStyle(Ara.text3)
             Text("Output sharpening is applied after resize.").font(.system(size: 9)).foregroundStyle(Ara.text3)
             HStack {
                 Spacer()
@@ -2492,13 +3126,24 @@ struct FilmCell: View {
 /// gallery / darktable preset style).
 struct LookPicker: View {
     @Binding var look: String
+    @Binding var lutFile: String
     let photo: Photo
     let recipe: Recipe
 
     @State private var open = false
     @State private var thumbs: [String: CGImage] = [:]
+    @State private var lutThumbs: [String: CGImage] = [:]
+    @State private var lutFiles: [String] = []
     @State private var thumbPath = ""
     @State private var loading = false
+
+    /// DaVinci LUTs folder: ~/.araware/luts scanned for .cube files
+    private static func lutDir() -> URL {
+        let d = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".araware/luts", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
 
     private let creative: [(String, String)] = [
         ("teal_orange", "Teal & Orange"), ("film_fade", "Film Fade"),
@@ -2600,6 +3245,45 @@ struct LookPicker: View {
                         .onTapGesture { look = v; open = false }
                     }
                 }
+                // .cube LUTs (DaVinci LUTs panel): files in ~/.araware/luts
+                Text("LUTS")
+                    .font(.system(size: 7.5, weight: .semibold)).tracking(1)
+                    .foregroundStyle(Ara.text3.opacity(0.7))
+                if lutFiles.isEmpty {
+                    Text("drop .cube files into ~/.araware/luts")
+                        .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                }
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
+                          spacing: 8) {
+                    ForEach(lutFiles, id: \.self) { f in
+                        let name = URL(fileURLWithPath: f).deletingPathExtension().lastPathComponent
+                        VStack(spacing: 3) {
+                            ZStack {
+                                Ara.bg3
+                                if let img = lutThumbs[f] {
+                                    Image(img, scale: 1, label: Text(name))
+                                        .resizable().scaledToFill()
+                                } else {
+                                    ProgressView().controlSize(.mini).tint(Ara.text3)
+                                }
+                            }
+                            .aspectRatio(1.5, contentMode: .fit)
+                            .clipped()
+                            Text(name)
+                                .font(.system(size: 8, weight: f == lutFile ? .semibold : .regular))
+                                .foregroundStyle(f == lutFile ? Ara.accent : Ara.text3)
+                                .lineLimit(1)
+                        }
+                        .padding(4)
+                        .background(Ara.bg2)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(f == lutFile ? Ara.accent : Ara.hairline,
+                                    lineWidth: f == lutFile ? 1.5 : 0.5))
+                        .contentShape(Rectangle())
+                        .onTapGesture { lutFile = (lutFile == f) ? "" : f; open = false }
+                    }
+                }
             }
             .padding(10)
             .frame(width: 300)
@@ -2608,11 +3292,16 @@ struct LookPicker: View {
     }
 
     /// One render per look at 220px; engine cache makes this fast enough.
+    /// Same for every .cube in ~/.araware/luts (applied over the base look).
     private func loadThumbs() {
         if loading { return }
         loading = true
         let path = photo.path
         let base = recipe
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: Self.lutDir().path)) ?? [])
+            .filter { $0.lowercased().hasSuffix(".cube") }
+            .map { Self.lutDir().appendingPathComponent($0).path }
+            .sorted()
         Task.detached {
             var out: [String: CGImage] = [:]
             for (v, _) in options {
@@ -2623,8 +3312,20 @@ struct LookPicker: View {
                 }
                 if let img { out[v] = img }
             }
+            var lout: [String: CGImage] = [:]
+            for f in files {
+                var r = base
+                r.lut_file = f
+                r.lut_amount = 1
+                let (img, _) = await AraEngine.shared.work {
+                    $0.render(path: path, recipe: r, maxPx: 220)
+                }
+                if let img { lout[f] = img }
+            }
             await MainActor.run {
                 thumbs.merge(out) { _, n in n }
+                lutThumbs.merge(lout) { _, n in n }
+                lutFiles = files
                 loading = false
             }
         }
@@ -3158,7 +3859,7 @@ extension EditorView {
             ln.addLine(to: .init(x: dx, y: dy))
             ctx.stroke(ln, with: .color(.white.opacity(0.5)), lineWidth: 0.8)
         }
-        for l in recipe.lights {
+        for l in edit.wrappedValue.lights {
             let cx = rect.minX + l[0] * rect.width
             let cy = rect.minY + l[1] * rect.height
             let r = l[2] * rect.width
@@ -3166,7 +3867,7 @@ extension EditorView {
             let col: Color = l[3] >= 0 ? .yellow : .purple
             ctx.stroke(path, with: .color(col.opacity(0.9)), lineWidth: 1.5)
         }
-        for w in recipe.windows {
+        for w in edit.wrappedValue.windows {
             // DaVinci overlay: white-ish outline; the selected window is amber
             // and thicker; a disabled window is dimmed to a hairline.
             let sel = w.id == selWindow
@@ -3223,7 +3924,7 @@ extension EditorView {
             ctx.stroke(cross, with: .color(.yellow), lineWidth: 1.5)
         }
         // adjustment-brush strokes: centreline + feather circles at the ends
-        for (li, layer) in recipe.brushes.enumerated() {
+        for (li, layer) in edit.wrappedValue.brushes.enumerated() {
             let sel = li == selBrush
             for st in layer.strokes where st.pts.count >= 2 {
                 let col: Color = st.erase ? .red : (sel ? Ara.accent : .white)

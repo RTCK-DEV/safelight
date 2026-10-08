@@ -149,11 +149,17 @@ struct BrushLayer: Codable, Equatable, Identifiable {
     var sat: Double = 0
     var temp: Double = 0
     var linkQ: Bool = false
+    // edge-aware masking: mask only covers pixels similar to the colour
+    // under each stroke's first dab (engine edge_sim, ±edge_tol)
+    var edgeAware: Bool = false
+    var edgeTol: Double = 0.5
     var strokes: [BrushStroke] = []
 
     enum CodingKeys: String, CodingKey {
         case enabled, opacity, ev, sat, temp
         case linkQ = "link_q"
+        case edgeAware = "edge_aware"
+        case edgeTol = "edge_tol"
         case strokes
     }
 
@@ -167,6 +173,8 @@ struct BrushLayer: Codable, Equatable, Identifiable {
         sat = (try? c.decode(Double.self, forKey: .sat)) ?? 0
         temp = (try? c.decode(Double.self, forKey: .temp)) ?? 0
         linkQ = (try? c.decode(Bool.self, forKey: .linkQ)) ?? false
+        edgeAware = (try? c.decode(Bool.self, forKey: .edgeAware)) ?? false
+        edgeTol = (try? c.decode(Double.self, forKey: .edgeTol)) ?? 0.5
         strokes = (try? c.decode([BrushStroke].self, forKey: .strokes)) ?? []
     }
 }
@@ -221,8 +229,10 @@ struct Recipe: Codable, Equatable {
     var hue_lum: [[Double]] = []
     var lum_sat: [[Double]] = []
     var sat_sat: [[Double]] = []
-    // HSL qualifier: [center/lo, width/hi, softness]
-    var qh: [Double] = [0.5, 0.1, 0.1]
+    // HSL qualifier: [center/lo, width/hi, softness] — width 0 = disabled
+    // (matches Rust Recipe::default; a nonzero width silently enables the
+    // qualifier and gates serial-stage keys to a hue band)
+    var qh: [Double] = [0.0, 0.0, 0.05]
     var qs: [Double] = [0.0, 1.0, 0.1]
     var ql: [Double] = [0.0, 1.0, 0.1]
     var qadj: [Double] = [0, 0, 0, 0]  // hue shift, sat, lum, temp
@@ -269,7 +279,48 @@ struct Recipe: Codable, Equatable {
     var brushes: [BrushLayer] = []
     // AI denoise amount 0..1 — blends against the prepared denoise cache
     var ai_denoise: Double = 0
+    // serial correction stages (DaVinci serial nodes, up to 4 honoured)
+    var stages: [Stage] = []
+    // ColorSlice: 7 hue wedges (R/Skin/Y/G/C/B/M) [hue_shift, sat_delta, lum_delta, enabled]
+    var color_slice: [[Double]] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    // ColorWarper control points [h, s, dh, ds, radius], max 8 honoured
+    var warper: [[Double]] = []
 
+}
+
+/// Grade library still (DaVinci Gallery): a saved recipe + thumbnail.
+/// Persisted app-wide at ~/.araware/gallery/stills.json with JPEG thumbs
+/// beside it (<id>.jpg).
+struct GradeStill: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var name: String = ""
+    var recipe: Recipe = Recipe()
+    var saved: TimeInterval = 0
+}
+/// the full adjust-domain recipe applied on top of the previous result,
+/// gated by its own qualifier/window key and opacity.
+struct Stage: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var name: String = ""
+    var enabled: Bool = true
+    var opacity: Double = 1     // node key output gain 0..1
+    var invert: Bool = false    // apply the grade outside the key
+    var params: Recipe = Recipe()
+
+    enum CodingKeys: String, CodingKey {
+        case name, enabled, opacity, invert, params
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
+        opacity = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        invert = (try? c.decode(Bool.self, forKey: .invert)) ?? false
+        params = (try? c.decode(Recipe.self, forKey: .params)) ?? Recipe()
+    }
 }
 
 extension Recipe {
@@ -295,6 +346,7 @@ extension Recipe {
         case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
         case lens_corr, brushes
         case ai_denoise
+        case stages, color_slice, warper
     }
 
     init(from decoder: Decoder) throws {
@@ -344,7 +396,7 @@ extension Recipe {
         hue_lum = opt(.hue_lum, [[Double]].self) ?? []
         lum_sat = opt(.lum_sat, [[Double]].self) ?? []
         sat_sat = opt(.sat_sat, [[Double]].self) ?? []
-        qh = opt(.qh, [Double].self) ?? [0.5, 0.1, 0.1]
+        qh = opt(.qh, [Double].self) ?? [0.0, 0.0, 0.05]
         qs = opt(.qs, [Double].self) ?? [0.0, 1.0, 0.1]
         ql = opt(.ql, [Double].self) ?? [0.0, 1.0, 0.1]
         qadj = opt(.qadj, [Double].self) ?? [0, 0, 0, 0]
@@ -379,6 +431,11 @@ extension Recipe {
         brushes = opt(.brushes, [BrushLayer].self) ?? []
         key_v = opt(.key_v, Double.self) ?? 0
         key_h = opt(.key_h, Double.self) ?? 0
+        stages = opt(.stages, [Stage].self) ?? []
+        var cs = opt(.color_slice, [[Double]].self) ?? []
+        if cs.count != 7 { cs = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]] }
+        color_slice = cs
+        warper = opt(.warper, [[Double]].self) ?? []
         lens_corr = opt(.lens_corr, Double.self) ?? 1
         ai_denoise = opt(.ai_denoise, Double.self) ?? 0
         q_enabled = qh[1] > 0

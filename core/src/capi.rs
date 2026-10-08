@@ -23,14 +23,14 @@ pub struct AraHistogram {
     pub bins: [u32; 1024],
 }
 
-thread_local! {
-    static LAST_ERROR: Mutex<CString> = Mutex::new(CString::new("").unwrap());
-}
+// process-global so errors raised on the engine worker thread are
+// readable by whichever thread calls `araware_last_error` (thread_local
+// made every UI error path read an empty string).
+static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
 fn set_err(e: &anyhow::Error) {
-    LAST_ERROR.with(|s| {
-        *s.lock().unwrap() = CString::new(e.to_string()).unwrap_or_default();
-    });
+    *LAST_ERROR.lock().unwrap() =
+        Some(CString::new(e.to_string()).unwrap_or_default());
 }
 
 fn cstr(p: *const c_char) -> String {
@@ -95,12 +95,11 @@ pub unsafe extern "C" fn araware_free_engine(e: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn araware_last_error() -> *mut c_char {
-    LAST_ERROR.with(|s| {
-        let guard = s.lock().unwrap();
-        CString::new(guard.as_bytes())
-            .map(CString::into_raw)
-            .unwrap_or(std::ptr::null_mut())
-    })
+    let guard = LAST_ERROR.lock().unwrap();
+    let bytes = guard.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+    CString::new(bytes)
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -269,6 +268,40 @@ pub unsafe extern "C" fn araware_export_opts(
     let opts: serde_json::Value =
         serde_json::from_str(&cstr(opts_json)).unwrap_or(serde_json::json!({}));
     match eng.export_opts(std::path::Path::new(&cstr(path)), &recipe, &opts) {
+        Ok(img) => into_raw_image(img),
+        Err(err) => {
+            set_err(&err);
+            AraImage {
+                data: std::ptr::null_mut(),
+                len: 0,
+                width: 0,
+                height: 0,
+            }
+        }
+    }
+}
+
+/// merge N source photos: `paths_json` = JSON array of paths,
+/// `mode` = "hdr" | "focus". Renders each at full res with its own
+/// sidecar recipe, aligns, merges → RGBA8.
+#[no_mangle]
+pub unsafe extern "C" fn araware_merge(
+    e: *mut c_void,
+    paths_json: *const c_char,
+    mode: *const c_char,
+) -> AraImage {
+    let Some(eng) = engine(e) else {
+        return AraImage {
+            data: std::ptr::null_mut(),
+            len: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+    let paths: Vec<String> =
+        serde_json::from_str(&cstr(paths_json)).unwrap_or_default();
+    let pvec: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    match eng.merge(&pvec, &cstr(mode)) {
         Ok(img) => into_raw_image(img),
         Err(err) => {
             set_err(&err);

@@ -44,6 +44,9 @@ final class LibraryStore: ObservableObject {
     @Published var expandedStacks: Set<Int64> = []
     /// compare/survey mode shows the selected photos side by side
     @Published var surveying = false
+    /// merge-in-flight flag + failure surfaced from the library merge menu
+    @Published var merging = false
+    @Published var mergeError = ""
     /// darktable lighttable sort key: name | date | capture | rating | size
     @Published var sortKey = "name"
 

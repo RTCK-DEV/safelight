@@ -76,6 +76,20 @@ fn main() -> Result<()> {
             let list = eng.scan(Path::new(&args[2]))?;
             println!("{}", serde_json::to_string_pretty(&list)?);
         }
+        // merge <out.png> <hdr|focus> <src1> <src2> [src3...]
+        "merge" => {
+            if args.len() < 5 {
+                anyhow::bail!("merge <out.png> <hdr|focus> <src1> <src2> [src3...]");
+            }
+            let out = &args[2];
+            let mode = &args[3];
+            let paths: Vec<std::path::PathBuf> =
+                args[4..].iter().map(std::path::PathBuf::from).collect();
+            let t = std::time::Instant::now();
+            let img = eng.merge(&paths, mode)?;
+            eprintln!("merge {mode} {}x{} in {:?}", img.width, img.height, t.elapsed());
+            image::save_buffer(out, &img.data, img.width, img.height, image::ColorType::Rgba8)?;
+        }
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;
             println!("{}", serde_json::to_string_pretty(&v)?);

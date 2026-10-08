@@ -95,7 +95,7 @@ fn main() {
                 Some("1"),
             ),
         ];
-        let mut mk = || {
+        let mk = || {
             let mut b = cc::Build::new();
             for inc in includes {
                 b.include(inc);

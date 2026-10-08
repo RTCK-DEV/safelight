@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @EnvironmentObject var store: LibraryStore
@@ -14,8 +16,8 @@ struct LibraryView: View {
             VStack(spacing: 0) {
                 filterStrip
                 Group {
-                    if store.scanning {
-                        ProgressView("Scanning…")
+                    if store.scanning || store.merging {
+                        ProgressView(store.merging ? "Merging…" : "Scanning…")
                             .tint(Ara.accent)
                             .foregroundStyle(Ara.text2)
                     } else if store.filtered.isEmpty {
@@ -77,6 +79,13 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $showSmartSheet) {
             SmartCollectionSheet()
+        }
+        .alert("Merge failed", isPresented: Binding(
+            get: { !store.mergeError.isEmpty },
+            set: { if !$0 { store.mergeError = "" } })) {
+            Button("OK") { store.mergeError = "" }
+        } message: {
+            Text(store.mergeError).font(.system(size: 11))
         }
     }
 
@@ -389,7 +398,54 @@ struct LibraryView: View {
         Button("Show in Finder") {
             NSWorkspace.shared.selectFile(p.path, inFileViewerRootedAtPath: "")
         }
+        if store.selection.count > 1 {
+            Menu("Merge Selected") {
+                Button("HDR (Exposure Fusion)") { mergeSelected("hdr") }
+                Button("Focus Stack") { mergeSelected("focus") }
+            }
+        }
         Button("Export Selected…") { exportSelected() }
+    }
+
+    /// merge the selected photos at full res (each with its own sidecar),
+    /// write a JPEG next to the first source, rescan to show it
+    private func mergeSelected(_ mode: String) {
+        let targets = store.selectedPhotos
+        guard targets.count > 1 else { return }
+        let first = targets[0]
+        let paths = targets.map(\.path)
+        Task.detached {
+            await MainActor.run { store.merging = true }
+            let img = await AraEngine.shared.work { $0.merge(paths: paths, mode: mode) }
+            await MainActor.run {
+                store.merging = false
+                guard let img else {
+                    store.mergeError = AraEngine.shared.lastError
+                    return
+                }
+                let dir = URL(fileURLWithPath: first.path).deletingLastPathComponent()
+                let stem = URL(fileURLWithPath: first.path).deletingPathExtension().lastPathComponent
+                let url = dir.appendingPathComponent("\(stem)_\(mode).jpg")
+                if let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+                   let tagged = img.copy(colorSpace: srgb) {
+                    let mdata = NSMutableData()
+                    if let dest = CGImageDestinationCreateWithData(
+                        mdata, UTType.jpeg.identifier as CFString, 1, nil) {
+                        CGImageDestinationAddImage(dest, tagged, [
+                            kCGImageDestinationLossyCompressionQuality: 0.95,
+                        ] as CFDictionary)
+                        if CGImageDestinationFinalize(dest) {
+                            var out = mdata as Data
+                            if let icc = ExportICC.icc(of: tagged) {
+                                out = ExportICC.jpeg(out, icc: icc)
+                            }
+                            try? out.write(to: url)
+                        }
+                    }
+                }
+                store.refresh()
+            }
+        }
     }
 
     private func exportSelected() {
@@ -408,9 +464,29 @@ struct LibraryView: View {
                     let name = p.vslot > 0 ? "\(stem)_v\(p.vslot).jpg" : "\(stem).jpg"
                     let url = dir.appendingPathComponent(name)
                     await MainActor.run {
-                        let rep = NSBitmapImageRep(cgImage: img)
-                        let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9])
-                        try? data?.write(to: url)
+                        // encode via ImageIO then inject the sRGB ICC APP2 —
+                        // macOS never writes the profile itself
+                        if let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+                           let srgbImg = img.copy(colorSpace: srgb) {
+                            let mdata = NSMutableData()
+                            if let dest = CGImageDestinationCreateWithData(
+                                mdata, UTType.jpeg.identifier as CFString, 1, nil) {
+                                CGImageDestinationAddImage(dest, srgbImg, [
+                                    kCGImageDestinationLossyCompressionQuality: 0.9,
+                                ] as CFDictionary)
+                                if CGImageDestinationFinalize(dest) {
+                                    var out = mdata as Data
+                                    if let icc = ExportICC.icc(of: srgbImg) {
+                                        out = ExportICC.jpeg(out, icc: icc)
+                                    }
+                                    try? out.write(to: url)
+                                }
+                            }
+                        } else {
+                            let rep = NSBitmapImageRep(cgImage: img)
+                            let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9])
+                            try? data?.write(to: url)
+                        }
                     }
                 }
             }

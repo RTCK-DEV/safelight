@@ -113,6 +113,20 @@ struct Uni {
     blayers: [[f32; 4]; 4],
     bmisc: [f32; 4],
     bstr: [[f32; 4]; 192],
+    /// serial stages: [n_stages, 0, 0, 0]
+    stg0: [f32; 4],
+    /// per-stage opacity (node key output gain)
+    sop0: [f32; 4],
+    /// per-stage key invert flags
+    sinv0: [f32; 4],
+    /// [lut region base, is_stage flag, brush segment base, stage 3D LUT offset]
+    misc3: [f32; 4],
+    /// ColorSlice: 7 wedges [hue_shift, sat_delta, lum_delta, enabled]
+    cs: [[f32; 4]; 7],
+    /// ColorWarper: 8 points × 2 vec4 ([h,s,dh,ds] then [radius,0,0,0])
+    warp: [[f32; 4]; 10],
+    /// [n_warp, has_cs, 0, 0]
+    csn: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -176,6 +190,16 @@ struct Uni {
     blayers: array<vec4<f32>, 4>,
     bmisc: vec4<f32>,
     bstr: array<vec4<f32>, 192>,
+    // stg0 = [n_stages,0,0,0]; sop0 = per-stage opacity; sinv0 = key invert
+    // flags; misc3 = [lut region base, is_stage flag, brush seg base, stg l3]
+    stg0: vec4<f32>,
+    sop0: vec4<f32>,
+    sinv0: vec4<f32>,
+    misc3: vec4<f32>,
+    // ColorSlice wedges + ColorWarper points; csn = [n_warp, has_cs, 0, 0]
+    cs: array<vec4<f32>, 7>,
+    warp: array<vec4<f32>, 10>,
+    csn: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -191,33 +215,42 @@ struct Uni {
 // AI-denoised base cache: [0]=w, [1]=h, then 2 u32 per px (r|g<<16, b), sRGB16
 @group(0) @binding(11) var<storage, read> denbuf: array<u32>;
 @group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
+@group(0) @binding(13) var<storage, read> suni: array<Uni>;
+// edge-aware brush seeds: [r,g,b,tol] per stroke, 64 slots per param block
+// (base + one per serial stage), written by seed_main.
+@group(0) @binding(14) var<storage, read_write> seedsb: array<vec4<f32>>;
+// working copy of the uniform: every kernel seeds it with `pg = u`, and the
+// stage loop in finish_main swaps in suni[i] so all param reads below are
+// shared between the base grade and serial correction stages.
+var<private> pg: Uni;
+var<private> l3_base: u32;
 
 fn cfa_col(sx: u32, sy: u32) -> u32 {
-    return cfa[(sy % u.g3.y) * u.g3.x + (sx % u.g3.x)];
+    return cfa[(sy % pg.g3.y) * pg.g3.x + (sx % pg.g3.x)];
 }
 
-// ---- color-difference demosaic (stride == 1, u.g4.w == 1) --------------
+// ---- color-difference demosaic (stride == 1, pg.g4.w == 1) --------------
 // mirrors demosaic_plane() in develop.rs: pass 1 writes the interpolated
 // green plane into io_b.x (green_main), pass 2 reconstructs R/B from the
 // smooth C-G difference channels inside demosaic_cd() below.
 
 fn raw_v(sx_i: i32, sy_i: i32) -> f32 {
-    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
-    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let sx = u32(clamp(sx_i, 0, i32(pg.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(pg.g0.y) - 1));
     let ci = min(cfa_col(sx, sy), 3u);
-    return (f32(rawbuf[sy * u.g0.x + sx]) - u.black[ci]) * u.norm[ci];
+    return (f32(rawbuf[sy * pg.g0.x + sx]) - pg.black[ci]) * pg.norm[ci];
 }
 
 fn is_green(sx_i: i32, sy_i: i32) -> bool {
-    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
-    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let sx = u32(clamp(sx_i, 0, i32(pg.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(pg.g0.y) - 1));
     let col = cfa_col(sx, sy);
     return col == 1u || col == 3u;
 }
 
 fn is_color(sx_i: i32, sy_i: i32, ch: u32) -> bool {
-    let sx = u32(clamp(sx_i, 0, i32(u.g0.x) - 1));
-    let sy = u32(clamp(sy_i, 0, i32(u.g0.y) - 1));
+    let sx = u32(clamp(sx_i, 0, i32(pg.g0.x) - 1));
+    let sy = u32(clamp(sy_i, 0, i32(pg.g0.y) - 1));
     let col = cfa_col(sx, sy);
     let cc = select(col, 1u, col == 3u);
     return cc == ch;
@@ -225,17 +258,18 @@ fn is_color(sx_i: i32, sy_i: i32, ch: u32) -> bool {
 
 // green plane value (io_b.x) at a sensor coordinate
 fn g_at(jx: i32, jy: i32) -> f32 {
-    let jvx = u32(clamp(jx - i32(u.g0.z), 0, i32(u.g1.x) - 1));
-    let jvy = u32(clamp(jy - i32(u.g0.w), 0, i32(u.g1.y) - 1));
-    return io_b[jvy * u.g1.x + jvx].x;
+    let jvx = u32(clamp(jx - i32(pg.g0.z), 0, i32(pg.g1.x) - 1));
+    let jvy = u32(clamp(jy - i32(pg.g0.w), 0, i32(pg.g1.y) - 1));
+    return io_b[jvy * pg.g1.x + jvx].x;
 }
 
 @compute @workgroup_size(256)
 fn green_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    if (i >= u.g1.x * u.g1.y) { return; }
-    let sx0 = i32(u.g0.z + (i % u.g1.x));
-    let sy0 = i32(u.g0.w + (i / u.g1.x));
+    if (i >= pg.g1.x * pg.g1.y) { return; }
+    let sx0 = i32(pg.g0.z + (i % pg.g1.x));
+    let sy0 = i32(pg.g0.w + (i / pg.g1.x));
     var g = 0.0;
     if (is_green(sx0, sy0)) {
         g = raw_v(sx0, sy0);
@@ -243,7 +277,7 @@ fn green_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         // weighted median of neighbouring greens, weighted by how well
         // the pixel's own measured channel agrees with the same-channel
         // tap on each green tap's side — taps on our side of an edge win.
-        let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+        let ph = (u32(sy0) % pg.g3.y) * pg.g3.x + (u32(sx0) % pg.g3.x);
         let col = cfa_col(u32(sx0), u32(sy0));
         let own = raw_v(sx0, sy0);
         let idx_g = tap_idx[ph * 3u + 1u];
@@ -255,8 +289,8 @@ fn green_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         for (var k = 0u; k < idx_g.y; k = k + 1u) {
             if (nc >= 24u) { break; }
             let t = taps[idx_g.x + k];
-            let jx = clamp(sx0 + t.x, 0, i32(u.g0.x) - 1);
-            let jy = clamp(sy0 + t.y, 0, i32(u.g0.y) - 1);
+            let jx = clamp(sx0 + t.x, 0, i32(pg.g0.x) - 1);
+            let jy = clamp(sy0 + t.y, 0, i32(pg.g0.y) - 1);
             var best_dot = 0.0;
             var best_val = 0.0;
             let jlen = sqrt(f32(t.x * t.x + t.y * t.y));
@@ -308,11 +342,12 @@ fn green_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 // pass 2: difference planes into io_b.yz (dR at .y, dB at .z)
 @compute @workgroup_size(256)
 fn diff_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    if (i >= u.g1.x * u.g1.y) { return; }
-    let sx0 = i32(u.g0.z + (i % u.g1.x));
-    let sy0 = i32(u.g0.w + (i / u.g1.x));
-    let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+    if (i >= pg.g1.x * pg.g1.y) { return; }
+    let sx0 = i32(pg.g0.z + (i % pg.g1.x));
+    let sy0 = i32(pg.g0.w + (i / pg.g1.x));
+    let ph = (u32(sy0) % pg.g3.y) * pg.g3.x + (u32(sx0) % pg.g3.x);
     let col = cfa_col(u32(sx0), u32(sy0));
     let cc = select(col, 1u, col == 3u);
     let g = io_b[i].x;
@@ -334,8 +369,8 @@ fn diff_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
             for (var k = 0u; k < idx.y; k = k + 1u) {
                 if (nc >= 24u) { break; }
                 let t = taps[idx.x + k];
-                let jx = clamp(sx0 + t.x, 0, i32(u.g0.x) - 1);
-                let jy = clamp(sy0 + t.y, 0, i32(u.g0.y) - 1);
+                let jx = clamp(sx0 + t.x, 0, i32(pg.g0.x) - 1);
+                let jy = clamp(sy0 + t.y, 0, i32(pg.g0.y) - 1);
                 let dj = raw_v(jx, jy) - g_at(jx, jy);
                 let w = 1.0
                     / (abs(g_at(jx, jy) - g) + 0.04)
@@ -377,11 +412,11 @@ fn diff_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 // pass 3: reconstruct — G + 3x3 median of the difference plane
 // (zipper ticks are 1-px outliers in the smooth diff channel)
 fn demosaic_cd(i: u32) -> vec3<f32> {
-    let vx = i % u.g1.x;
-    let vy = i / u.g1.x;
-    let sx0 = i32(u.g0.z + vx);
-    let sy0 = i32(u.g0.w + vy);
-    let ph = (u32(sy0) % u.g3.y) * u.g3.x + (u32(sx0) % u.g3.x);
+    let vx = i % pg.g1.x;
+    let vy = i / pg.g1.x;
+    let sx0 = i32(pg.g0.z + vx);
+    let sy0 = i32(pg.g0.w + vy);
+    let ph = (u32(sy0) % pg.g3.y) * pg.g3.x + (u32(sx0) % pg.g3.x);
     let col = cfa_col(u32(sx0), u32(sy0));
     let cc = select(col, 1u, col == 3u);
     let g = io_b[i].x;
@@ -396,9 +431,9 @@ fn demosaic_cd(i: u32) -> vec3<f32> {
             var n = 0u;
             for (var oy = -2; oy <= 2; oy = oy + 1) {
                 for (var ox = -2; ox <= 2; ox = ox + 1) {
-                    let jx = u32(clamp(i32(vx) + ox, 0, i32(u.g1.x) - 1));
-                    let jy = u32(clamp(i32(vy) + oy, 0, i32(u.g1.y) - 1));
-                    nb[n] = io_b[jy * u.g1.x + jx][c + 1u];
+                    let jx = u32(clamp(i32(vx) + ox, 0, i32(pg.g1.x) - 1));
+                    let jy = u32(clamp(i32(vy) + oy, 0, i32(pg.g1.y) - 1));
+                    nb[n] = io_b[jy * pg.g1.x + jx][c + 1u];
                     n = n + 1u;
                 }
             }
@@ -419,10 +454,10 @@ fn demosaic_cd(i: u32) -> vec3<f32> {
 }
 
 fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
-    let x0 = u.g0.z + vx * u.g1.z;
-    let y0 = u.g0.w + vy * u.g1.z;
-    let x_end = u.g0.z + u.g4.y;
-    let y_end = u.g0.w + u.g4.z;
+    let x0 = pg.g0.z + vx * pg.g1.z;
+    let y0 = pg.g0.w + vy * pg.g1.z;
+    let x_end = pg.g0.z + pg.g4.y;
+    let y_end = pg.g0.w + pg.g4.z;
     var sums = vec3<f32>(0.0);
     var cnts = vec3<u32>(0u);
     var pad = 0u;
@@ -431,19 +466,19 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
         cnts = vec3<u32>(0u);
         var ys = y0;
         if (ys >= pad) { ys = ys - pad; } else { ys = 0u; }
-        ys = max(ys, u.g0.w);
+        ys = max(ys, pg.g0.w);
         var xs = x0;
         if (xs >= pad) { xs = xs - pad; } else { xs = 0u; }
-        xs = max(xs, u.g0.z);
-        let ye = min(y0 + u.g1.z + pad, y_end);
-        let xe = min(x0 + u.g1.z + pad, x_end);
+        xs = max(xs, pg.g0.z);
+        let ye = min(y0 + pg.g1.z + pad, y_end);
+        let xe = min(x0 + pg.g1.z + pad, x_end);
         for (var sy = ys; sy < ye; sy = sy + 1u) {
-            let row = sy * u.g0.x;
+            let row = sy * pg.g0.x;
             for (var sx = xs; sx < xe; sx = sx + 1u) {
                 let col = cfa_col(sx, sy);
                 let ci = min(col, 3u);
                 let cc = select(ci, 1u, col == 3u);
-                let v = (f32(rawbuf[row + sx]) - u.black[ci]) * u.norm[ci];
+                let v = (f32(rawbuf[row + sx]) - pg.black[ci]) * pg.norm[ci];
                 sums[cc] = sums[cc] + v;
                 cnts[cc] = cnts[cc] + 1u;
             }
@@ -455,11 +490,11 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
 }
 
 fn wb_matrix(cam: vec3<f32>) -> vec3<f32> {
-    let cw = clamp(cam * u.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+    let cw = clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
     return vec3<f32>(
-        dot(u.m0.xyz, cw),
-        dot(u.m1.xyz, cw),
-        dot(u.m2.xyz, cw),
+        dot(pg.m0.xyz, cw),
+        dot(pg.m1.xyz, cw),
+        dot(pg.m2.xyz, cw),
     );
 }
 
@@ -471,10 +506,11 @@ fn flat_index(gid: vec3<u32>, num: vec3<u32>) -> u32 {
 // sparse gray-world statistics for auto WB (sums * 1e6 as u32 + count)
 @compute @workgroup_size(256)
 fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let step = u.g3.z;
-    let nx = (u.g1.x + step - 1u) / step;
-    let ny = (u.g1.y + step - 1u) / step;
+    let step = pg.g3.z;
+    let nx = (pg.g1.x + step - 1u) / step;
+    let ny = (pg.g1.y + step - 1u) / step;
     if (i >= nx * ny) { return; }
     let c = demosaic((i % nx) * step, (i / nx) * step);
     // u32 accumulators: scale x1000, capped at ~64K samples => sum <= ~2.6e8
@@ -492,7 +528,7 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // WB pick region accumulation (stats[261..264] = rgb sums, [264] = count)
     let px = f32((i % nx) * step);
     let py = f32((i / nx) * step);
-    if (px >= u.pick0.x && px <= u.pick0.z && py >= u.pick0.y && py <= u.pick0.w) {
+    if (px >= pg.pick0.x && px <= pg.pick0.z && py >= pg.pick0.y && py <= pg.pick0.w) {
         atomicAdd(&stats[261u], u32(clamp(c.x, 0.0, 4.0) * 1000.0));
         atomicAdd(&stats[262u], u32(clamp(c.y, 0.0, 4.0) * 1000.0));
         atomicAdd(&stats[263u], u32(clamp(c.z, 0.0, 4.0) * 1000.0));
@@ -501,28 +537,28 @@ fn stats_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 }
 
 // ---- lens profile correction (mirrors develop.rs) -------------------------
-// u.lens0 = [model, a, b, c]  model: 1=ptlens 2=poly3
-// u.lens1 = [vr, br, vb, bb]  TCA scales
-// u.lens2 = [k1, k2, k3, scale]   vignette pa coeffs + cam/lens crop ratio
-// u.lens3 = [0, 0, 0, amount]
+// pg.lens0 = [model, a, b, c]  model: 1=ptlens 2=poly3
+// pg.lens1 = [vr, br, vb, bb]  TCA scales
+// pg.lens2 = [k1, k2, k3, scale]   vignette pa coeffs + cam/lens crop ratio
+// pg.lens3 = [0, 0, 0, amount]
 
 fn lens_f(model: u32, rd: f32) -> f32 {
     if (model == 1u) {
-        let a = u.lens0.y;
-        let b = u.lens0.z;
-        let c = u.lens0.w;
+        let a = pg.lens0.y;
+        let b = pg.lens0.z;
+        let c = pg.lens0.w;
         return rd * (a * rd * rd * rd + b * rd * rd + c * rd + (1.0 - a - b - c));
     }
-    return rd * (1.0 + u.lens0.y * rd * rd);
+    return rd * (1.0 + pg.lens0.y * rd * rd);
 }
 fn lens_fp(model: u32, rd: f32) -> f32 {
     if (model == 1u) {
-        let a = u.lens0.y;
-        let b = u.lens0.z;
-        let c = u.lens0.w;
+        let a = pg.lens0.y;
+        let b = pg.lens0.z;
+        let c = pg.lens0.w;
         return 4.0 * a * rd * rd * rd + 3.0 * b * rd * rd + 2.0 * c * rd + (1.0 - a - b - c);
     }
-    return 1.0 + 3.0 * u.lens0.y * rd * rd;
+    return 1.0 + 3.0 * pg.lens0.y * rd * rd;
 }
 fn inv_dist(model: u32, ru: f32) -> f32 {
     if (model == 0u || ru <= 0.0) { return ru; }
@@ -543,16 +579,16 @@ fn inv_tca(v: f32, b: f32, ru: f32) -> f32 {
     return rd;
 }
 fn lens_bilinear(sx: f32, sy: f32, ch: u32) -> f32 {
-    let sw = i32(u.g1.x);
-    let sh = i32(u.g1.y);
+    let sw = i32(pg.g1.x);
+    let sh = i32(pg.g1.y);
     let x0 = u32(clamp(i32(floor(sx)), 0, sw - 1));
     let y0 = u32(clamp(i32(floor(sy)), 0, sh - 1));
     let x1 = min(x0 + 1u, u32(sw - 1));
     let y1 = min(y0 + 1u, u32(sh - 1));
     let tx = clamp(sx - f32(x0), 0.0, 1.0);
     let ty = clamp(sy - f32(y0), 0.0, 1.0);
-    let a = mix(io_a[y0 * u.g1.x + x0][ch], io_a[y0 * u.g1.x + x1][ch], tx);
-    let b = mix(io_a[y1 * u.g1.x + x0][ch], io_a[y1 * u.g1.x + x1][ch], tx);
+    let a = mix(io_a[y0 * pg.g1.x + x0][ch], io_a[y0 * pg.g1.x + x1][ch], tx);
+    let b = mix(io_a[y1 * pg.g1.x + x0][ch], io_a[y1 * pg.g1.x + x1][ch], tx);
     return mix(a, b, ty);
 }
 /// display px -> corrected source radius (cam-normalised) per channel + gain
@@ -565,15 +601,15 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
     let dy = y - cy;
     let rn = sqrt(dx * dx + dy * dy) / halfd;
     if (rn < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
-    let ru = rn * u.lens2.w;
-    let rd = inv_dist(u32(u.lens0.x), ru);
-    let amt = u.lens3.w;
-    let att = max(1.0 + u.lens2.x * ru * ru + u.lens2.y * ru * ru * ru * ru
-        + u.lens2.z * ru * ru * ru * ru * ru * ru, 0.05);
+    let ru = rn * pg.lens2.w;
+    let rd = inv_dist(u32(pg.lens0.x), ru);
+    let amt = pg.lens3.w;
+    let att = max(1.0 + pg.lens2.x * ru * ru + pg.lens2.y * ru * ru * ru * ru
+        + pg.lens2.z * ru * ru * ru * ru * ru * ru, 0.05);
     let gain = 1.0 + (1.0 / att - 1.0) * amt;
-    let rr = inv_tca(u.lens1.x, u.lens1.y, rd) / u.lens2.w;
-    let rg = rd / u.lens2.w;
-    let rb = inv_tca(u.lens1.z, u.lens1.w, rd) / u.lens2.w;
+    let rr = inv_tca(pg.lens1.x, pg.lens1.y, rd) / pg.lens2.w;
+    let rg = rd / pg.lens2.w;
+    let rb = inv_tca(pg.lens1.z, pg.lens1.w, rd) / pg.lens2.w;
     // blend to identity by amount
     let f = 1.0 - amt;
     return vec4<f32>(
@@ -587,20 +623,22 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
 // stride-1 + lens: reconstruct cam grid into io_a
 @compute @workgroup_size(256)
 fn recon_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    if (i >= u.g1.x * u.g1.y) { return; }
+    if (i >= pg.g1.x * pg.g1.y) { return; }
     io_a[i] = vec4<f32>(demosaic_cd(i), 0.0);
 }
 
 // resample the cam grid at corrected radii (per channel, for lateral CA)
 @compute @workgroup_size(256)
 fn geom_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    if (i >= u.g1.x * u.g1.y) { return; }
-    let w = f32(u.g1.x);
-    let h = f32(u.g1.y);
-    let x = f32(i % u.g1.x);
-    let y = f32(i / u.g1.x);
+    if (i >= pg.g1.x * pg.g1.y) { return; }
+    let w = f32(pg.g1.x);
+    let h = f32(pg.g1.y);
+    let x = f32(i % pg.g1.x);
+    let y = f32(i / pg.g1.x);
     let g = lens_geom(x, y, w, h);
     if (g.x == 0.0 && g.y == 0.0 && g.z == 0.0) {
         io_b[i] = vec4<f32>(io_a[i].xyz, 1.0);
@@ -621,11 +659,12 @@ fn geom_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
 @compute @workgroup_size(256)
 fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    if (i >= u.g1.x * u.g1.y) { return; }
+    if (i >= pg.g1.x * pg.g1.y) { return; }
     var cam: vec3<f32>;
-    let lens_on = u.g4.w >= 2u;
-    let full = (u.g4.w % 2u) == 1u;
+    let lens_on = pg.g4.w >= 2u;
+    let full = (pg.g4.w % 2u) == 1u;
     if (full && lens_on) {
         // geom pass already wrote corrected cam (gain folded in)
         cam = io_b[i].xyz;
@@ -633,10 +672,10 @@ fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
         cam = demosaic_cd(i);
     } else if (lens_on) {
         // preview: remap the sampling position, fold vignette gain
-        let w = f32(u.g1.x);
-        let h = f32(u.g1.y);
-        let x = f32(i % u.g1.x);
-        let y = f32(i / u.g1.x);
+        let w = f32(pg.g1.x);
+        let h = f32(pg.g1.y);
+        let x = f32(i % pg.g1.x);
+        let y = f32(i / pg.g1.x);
         let g = lens_geom(x, y, w, h);
         if (g.x == 0.0 && g.y == 0.0 && g.z == 0.0) {
             cam = demosaic(u32(x), u32(y));
@@ -647,18 +686,18 @@ fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
             let dx = x - cx;
             let dy = y - cy;
             let sc = g.y * halfd / sqrt(dx * dx + dy * dy);
-            let sx = min(u32(round(cx + dx * sc)), u.g1.x - 1u);
-            let sy = min(u32(round(cy + dy * sc)), u.g1.y - 1u);
+            let sx = min(u32(round(cx + dx * sc)), pg.g1.x - 1u);
+            let sy = min(u32(round(cy + dy * sc)), pg.g1.y - 1u);
             cam = demosaic(sx, sy) * g.w;
         }
     } else {
-        cam = demosaic(i % u.g1.x, i / u.g1.x);
+        cam = demosaic(i % pg.g1.x, i / pg.g1.x);
     }
     var lin = wb_matrix(cam);
-    if (u.bmisc.z > 0.001 && denbuf[0] > 0u) {
-        let nx = (f32(i % u.g1.x) + 0.5) / f32(u.g1.x);
-        let ny = (f32(i / u.g1.x) + 0.5) / f32(u.g1.y);
-        lin = mix(lin, den_bil(nx, ny), min(u.bmisc.z, 1.0));
+    if (pg.bmisc.z > 0.001 && denbuf[0] > 0u) {
+        let nx = (f32(i % pg.g1.x) + 0.5) / f32(pg.g1.x);
+        let ny = (f32(i / pg.g1.x) + 0.5) / f32(pg.g1.y);
+        lin = mix(lin, den_bil(nx, ny), min(pg.bmisc.z, 1.0));
     }
     io_a[i] = vec4<f32>(lin, 0.0);
 }
@@ -726,13 +765,14 @@ fn subj_bil(nx: f32, ny: f32) -> f32 {
 // applied as a per-channel exp2 gain — mirrors develop.rs guided_nr_lum
 @compute @workgroup_size(256)
 fn nrl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     let x = i % w;
     let y = i / w;
-    let nl = u.a3.y;
+    let nl = pg.a3.y;
     let l0 = log2(luma(io_a[i].xyz) + 0.01);
     let rad = i32(round(1.0 + nl * 4.0));
     let eps = 0.002 + nl * nl * 0.25;
@@ -760,9 +800,10 @@ fn nrl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 // chroma NR: cr/cb box smooth preserving luma
 @compute @workgroup_size(256)
 fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     let x = i % w;
     let y = i / w;
@@ -786,7 +827,7 @@ fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
             }
         }
     }
-    let amt = u.fx0.z;
+    let amt = pg.fx0.z;
     let nr = mix(cr0, sr / n, amt);
     let nb = mix(cb0, sb / n, amt);
     io_b[i] = vec4<f32>(
@@ -798,8 +839,8 @@ fn nr_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
 }
 
 fn box_at(x: u32, y: u32, rad: i32) -> vec3<f32> {
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     var s = vec3<f32>(0.0);
     var n = 0.0;
     for (var dy = -rad; dy <= rad; dy = dy + 1) {
@@ -816,23 +857,24 @@ fn box_at(x: u32, y: u32, rad: i32) -> vec3<f32> {
 }
 
 fn px_at(x: i32, y: i32) -> vec3<f32> {
-    let cx = clamp(x, 0, i32(u.g2.x) - 1);
-    let cy = clamp(y, 0, i32(u.g2.y) - 1);
-    return io_a[u32(cy) * u.g2.x + u32(cx)].xyz;
+    let cx = clamp(x, 0, i32(pg.g2.x) - 1);
+    let cy = clamp(y, 0, i32(pg.g2.y) - 1);
+    return io_a[u32(cy) * pg.g2.x + u32(cx)].xyz;
 }
 
 // spot heal: frequency separation src + blur(target-src), source auto-picked
 // by annulus match — mirrors develop.rs heal_lin/heal_find_source
 @compute @workgroup_size(256)
 fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     var c = io_a[i].xyz;
-    let n = u32(u.misc.z);
+    let n = u32(pg.misc.z);
     for (var s = 0u; s < n; s = s + 1u) {
-        let sp = u.heal[s];
+        let sp = pg.heal[s];
         let pxf = vec2<f32>(f32(i % w), f32(i / w));
         let d = distance(pxf, sp.xy) / max(sp.z, 1.0);
         if (d < 1.0) {
@@ -882,10 +924,10 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         }
     }
     // clone stamps: copy the source patch into the destination circle
-    let nc = u32(u.misc2.y);
+    let nc = u32(pg.misc2.y);
     for (var s = 0u; s < nc; s = s + 1u) {
-        let csrc = u.clones[s * 2u];
-        let cdst = u.clones[s * 2u + 1u];
+        let csrc = pg.clones[s * 2u];
+        let cdst = pg.clones[s * 2u + 1u];
         let d = distance(vec2<f32>(f32(i % w), f32(i / w)), cdst.xy) / max(csrc.z, 1.0);
         if (d < 1.0) {
             let src = px_at(
@@ -960,19 +1002,20 @@ fn skin_mask(x: vec3<f32>) -> f32 {
 // beauty (skin-masked smoothing) + deband (flat-area smoothing)
 @compute @workgroup_size(256)
 fn soft_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     let x = i % w;
     let y = i / w;
     let c = io_a[i].xyz;
     let m = box_at(x, y, 1);
     var wgt = 0.0;
-    if (u.mono0.w > 0.0) { wgt = wgt + u.mono0.w * skin_mask(c); }
-    if (u.misc2.w > 0.0) {
+    if (pg.mono0.w > 0.0) { wgt = wgt + pg.mono0.w * skin_mask(c); }
+    if (pg.misc2.w > 0.0) {
         let flat = 1.0 - sstep(0.004, 0.03, abs(luma(c) - luma(m)));
-        wgt = wgt + u.misc2.w * flat;
+        wgt = wgt + pg.misc2.w * flat;
     }
     wgt = min(wgt, 1.0);
     io_b[i] = vec4<f32>(mix(c, m, wgt), 0.0);
@@ -981,9 +1024,10 @@ fn soft_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 // lens glow: highlight-extract + 9x9 blur added back
 @compute @workgroup_size(256)
 fn glow_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     let x = i % w;
     let y = i / w;
@@ -1000,25 +1044,26 @@ fn glow_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
             }
         }
     }
-    io_b[i] = vec4<f32>(io_a[i].xyz + m * (u.fx0.y * 0.8 / n), 0.0);
+    io_b[i] = vec4<f32>(io_a[i].xyz + m * (pg.fx0.y * 0.8 / n), 0.0);
 }
 
 // unsharp (3x3) + clarity (5x5 midtone-weighted local contrast)
 @compute @workgroup_size(256)
 fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
     let i = flat_index(gid, num);
-    let w = u.g2.x;
-    let h = u.g2.y;
+    let w = pg.g2.x;
+    let h = pg.g2.y;
     if (i >= w * h) { return; }
     let src = io_a[i].xyz;
     var out = src;
-    if (u.a3.x != 0.0) {
-        out = src + u.a3.x * 0.8 * (src - box_at(i % w, i / w, 1));
+    if (pg.a3.x != 0.0) {
+        out = src + pg.a3.x * 0.8 * (src - box_at(i % w, i / w, 1));
     }
-    if (u.a3.z != 0.0) {
+    if (pg.a3.z != 0.0) {
         let lum = clamp(luma(src), 0.0, 1.0);
         let mid = 4.0 * lum * (1.0 - lum);
-        out = out + u.a3.z * 0.6 * mid * (src - box_at(i % w, i / w, 2));
+        out = out + pg.a3.z * 0.6 * mid * (src - box_at(i % w, i / w, 2));
     }
     io_b[i] = vec4<f32>(out, 0.0);
 }
@@ -1049,25 +1094,29 @@ fn srgb_decode(v: f32) -> f32 {
 fn tone_at(t: f32) -> f32 {
     let f = clamp(t, 0.0, 1.0) * 511.0;
     let i0 = min(u32(f), 510u);
-    return mix(lut[2304u + i0], lut[2304u + i0 + 1u], f - f32(i0));
+    return mix(lut[u32(pg.misc3.x) + 2304u + i0], lut[u32(pg.misc3.x) + 2304u + i0 + 1u], f - f32(i0));
 }
 // [2816]=size (0=off) [2817]=amount [2818..21]=domain_min [2821..24]=domain_scale
 // data from 2824, R fastest
 fn l3at(n: u32, x: u32, y: u32, z: u32) -> vec3<f32> {
-    let o = 2824u + ((z * n + y) * n + x) * 3u;
+    let o = l3_base + ((z * n + y) * n + x) * 3u;
     return vec3<f32>(lut[o], lut[o + 1u], lut[o + 2u]);
 }
 
+// Stage-aware: the base recipe's 3D LUT header sits at 2816; a stage's sits at
+// its own absolute offset in misc3.w (is_stage flag in misc3.y).
 fn lut3d_apply(x: vec3<f32>) -> vec3<f32> {
-    let n = u32(lut[2816u]);
+    let hb = select(2816u, u32(pg.misc3.w), pg.misc3.y > 0.5);
+    let n = u32(lut[hb]);
     if (n < 2u) { return x; }
-    let amt = lut[2817u];
+    l3_base = hb + 8u;
+    let amt = lut[hb + 1u];
     let enc = vec3<f32>(
         srgb_encode(clamp(x.x, 0.0, 1.0)),
         srgb_encode(clamp(x.y, 0.0, 1.0)),
         srgb_encode(clamp(x.z, 0.0, 1.0)));
-    let dmin = vec3<f32>(lut[2818u], lut[2819u], lut[2820u]);
-    let dscl = vec3<f32>(lut[2821u], lut[2822u], lut[2823u]);
+    let dmin = vec3<f32>(lut[hb + 2u], lut[hb + 3u], lut[hb + 4u]);
+    let dscl = vec3<f32>(lut[hb + 5u], lut[hb + 6u], lut[hb + 7u]);
     let f = clamp((enc - dmin) * dscl, vec3<f32>(0.0), vec3<f32>(1.0)) * f32(n - 1u);
     let i0 = vec3<u32>(floor(f));
     let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(n - 1u));
@@ -1091,79 +1140,79 @@ fn lut3d_apply(x: vec3<f32>) -> vec3<f32> {
 fn qual_mask(c: vec3<f32>) -> f32 {
     let hsv = rgb_to_hsv(c);
     let l = luma(c);
-    let qb = u.qf2.z * 0.25;
-    let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z + qb, 1e-4), hue_dist(hsv.x, u.qh.x));
-    let qs2 = u.qs.z + qb;
-    let ms = sstep(u.qs.x - qs2, u.qs.x + qs2, hsv.y)
-        * (1.0 - sstep(u.qs.y - qs2, u.qs.y + qs2, hsv.y));
-    let ql2 = u.ql.z + qb;
-    let ml = sstep(u.ql.x - ql2, u.ql.x + ql2, l)
-        * (1.0 - sstep(u.ql.y - ql2, u.ql.y + ql2, l));
+    let qb = pg.qf2.z * 0.25;
+    let mh = 1.0 - sstep(pg.qh.y, pg.qh.y + max(pg.qh.z + qb, 1e-4), hue_dist(hsv.x, pg.qh.x));
+    let qs2 = pg.qs.z + qb;
+    let ms = sstep(pg.qs.x - qs2, pg.qs.x + qs2, hsv.y)
+        * (1.0 - sstep(pg.qs.y - qs2, pg.qs.y + qs2, hsv.y));
+    let ql2 = pg.ql.z + qb;
+    let ml = sstep(pg.ql.x - ql2, pg.ql.x + ql2, l)
+        * (1.0 - sstep(pg.ql.y - ql2, pg.ql.y + ql2, l));
     var mask = mh * ms * ml;
-    if (u.qf2.x > 0.0 || u.qf2.y < 1.0) {
-        mask = clamp((mask - u.qf2.x) / max(u.qf2.y - u.qf2.x, 1e-4), 0.0, 1.0);
+    if (pg.qf2.x > 0.0 || pg.qf2.y < 1.0) {
+        mask = clamp((mask - pg.qf2.x) / max(pg.qf2.y - pg.qf2.x, 1e-4), 0.0, 1.0);
     }
-    if (u.qf.y > 0.5) { mask = 1.0 - mask; }
+    if (pg.qf.y > 0.5) { mask = 1.0 - mask; }
     return mask;
 }
 
 fn adjust(px: vec3<f32>) -> vec3<f32> {
-    var x = px * u.a1.x;
+    var x = px * pg.a1.x;
     // auto-contrast percentile remap
-    if (u.misc.y - u.misc.x < 0.999 || u.misc.x > 0.001) {
-        x = (x - vec3<f32>(u.misc.x)) / max(u.misc.y - u.misc.x, 0.02);
+    if (pg.misc.y - pg.misc.x < 0.999 || pg.misc.x > 0.001) {
+        x = (x - vec3<f32>(pg.misc.x)) / max(pg.misc.y - pg.misc.x, 0.02);
     }
     // dehaze (dark-channel prior): veil = w * min(r,g,b); t floored at
     // 0.35; x' = (x - veil)/t — mirrors develop.rs
-    if (u.dh0.x > 0.0) {
+    if (pg.dh0.x > 0.0) {
         let mn = min(x.x, min(x.y, x.z));
-        let t = max(1.0 - u.dh0.x * mn / u.dh0.y, 0.35);
-        x = max((x - vec3<f32>(u.dh0.x * mn)) / t, vec3<f32>(0.0));
+        let t = max(1.0 - pg.dh0.x * mn / pg.dh0.y, 0.35);
+        x = max((x - vec3<f32>(pg.dh0.x * mn)) / t, vec3<f32>(0.0));
     }
     // tone equalizer: per-zone EV (9 log2-luma zones, centers -4..+4)
-    if (u.ze2.y > 0.5) {
+    if (pg.ze2.y > 0.5) {
         let zz = array<f32, 9>(
-            u.ze0.x, u.ze0.y, u.ze0.z, u.ze0.w,
-            u.ze1.x, u.ze1.y, u.ze1.z, u.ze1.w, u.ze2.x);
+            pg.ze0.x, pg.ze0.y, pg.ze0.z, pg.ze0.w,
+            pg.ze1.x, pg.ze1.y, pg.ze1.z, pg.ze1.w, pg.ze2.x);
         let e = log2(max(luma(x), 1e-6));
         let t = clamp(e + 4.0, 0.0, 8.0);
         let zi = min(u32(t), 7u);
         x = x * pow(2.0, zz[zi] * (1.0 - fract(t)) + zz[zi + 1u] * fract(t));
     }
     // lift/gamma/gain
-    x = u.lgg2.xyz * pow(max(x + u.lgg0.xyz, vec3<f32>(0.0)), 1.0 / u.lgg1.xyz);
+    x = pg.lgg2.xyz * pow(max(x + pg.lgg0.xyz, vec3<f32>(0.0)), 1.0 / pg.lgg1.xyz);
     // offset wheel
-    x = x + u.off0.xyz;
+    x = x + pg.off0.xyz;
     // EV-domain tone map (luminance-preserving): shadows/highlights/whites/
     // blacks + rolloff folded into one curve — mirrors develop.rs build_tone_lut
-    if (u.qf.w > 0.5) {
+    if (pg.qf.w > 0.5) {
         let tl = clamp(luma(x), 0.0, 1.6);
         // clamp evaluation luma to bound the y/l gain — mirrors develop.rs
         let le = max(tl, 0.04);
         x = x * (tone_at(le / 1.6) / le);
     }
-    x = (x - vec3<f32>(u.pv.x)) * (1.0 + u.a1.y * 0.9) + vec3<f32>(u.pv.x);
-    if (u.a2.z != 0.0 || u.a2.w != 0.0) {
+    x = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
+    if (pg.a2.z != 0.0 || pg.a2.w != 0.0) {
         let luma2 = luma(x);
         let mx = max(x.x, max(x.y, x.z));
         let mn = min(x.x, min(x.y, x.z));
         var sat_now = 0.0;
         if (mx > 1e-5) { sat_now = (mx - mn) / mx; }
-        let s = max(1.0 + u.a2.z + u.a2.w * (1.0 - sat_now), 0.0);
+        let s = max(1.0 + pg.a2.z + pg.a2.w * (1.0 - sat_now), 0.0);
         x = vec3<f32>(luma2) + (x - vec3<f32>(luma2)) * s;
     }
     // split toning (shadow / midtone / highlight)
-    if (u.st0.w > 0.0 || u.st1.w > 0.0 || u.mt0.w > 0.0) {
+    if (pg.st0.w > 0.0 || pg.st1.w > 0.0 || pg.mt0.w > 0.0) {
         let lum = luma(x);
-        let ws = (1.0 - sstep(0.0, 0.55, lum)) * u.st0.w;
-        let wh = sstep(0.45, 1.0, lum) * u.st1.w;
-        let wm = max(1.0 - abs(lum - 0.5) * 2.0, 0.0) * u.mt0.w;
-        x = x + ws * (u.st0.xyz - vec3<f32>(lum)) * 0.5
-            + wh * (u.st1.xyz - vec3<f32>(lum)) * 0.5
-            + wm * (u.mt0.xyz - vec3<f32>(lum)) * 0.5;
+        let ws = (1.0 - sstep(0.0, 0.55, lum)) * pg.st0.w;
+        let wh = sstep(0.45, 1.0, lum) * pg.st1.w;
+        let wm = max(1.0 - abs(lum - 0.5) * 2.0, 0.0) * pg.mt0.w;
+        x = x + ws * (pg.st0.xyz - vec3<f32>(lum)) * 0.5
+            + wh * (pg.st1.xyz - vec3<f32>(lum)) * 0.5
+            + wm * (pg.mt0.xyz - vec3<f32>(lum)) * 0.5;
     }
     // HDR zone wheels
-    let zones = array<vec4<f32>, 4>(u.z0, u.z1, u.z2, u.z3);
+    let zones = array<vec4<f32>, 4>(pg.z0, pg.z1, pg.z2, pg.z3);
     for (var zi = 0u; zi < 4u; zi = zi + 1u) {
         let z = zones[zi];
         if (z.y == 0.0 && z.z == 0.0 && z.w == 0.0) { continue; }
@@ -1181,68 +1230,108 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         }
     }
     // RGB channel mixer
-    if (u.qf.z > 0.5) {
+    if (pg.qf.z > 0.5) {
         x = vec3<f32>(
-            dot(u.mx0.xyz, x),
-            dot(u.mx1.xyz, x),
-            dot(u.mx2.xyz, x),
+            dot(pg.mx0.xyz, x),
+            dot(pg.mx1.xyz, x),
+            dot(pg.mx2.xyz, x),
         );
     }
     // monochrome
-    if (u.mono0.x != 0.0 || u.mono0.y != 0.0 || u.mono0.z != 0.0) {
-        let g = dot(u.mono0.xyz, x);
+    if (pg.mono0.x != 0.0 || pg.mono0.y != 0.0 || pg.mono0.z != 0.0) {
+        let g = dot(pg.mono0.xyz, x);
         x = vec3<f32>(g);
     }
     x = vec3<f32>(
-        lut[u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-        lut[u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-        lut[u32(clamp(x.z, 0.0, 1.0) * 255.0)],
+        lut[u32(pg.misc3.x) + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
+        lut[u32(pg.misc3.x) + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
+        lut[u32(pg.misc3.x) + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
     );
     // per-channel custom curves (lut offsets 256/512/768)
-    if (u.fx0.w > 0.5) {
+    if (pg.fx0.w > 0.5) {
         x = vec3<f32>(
-            lut[256u + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-            lut[512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-            lut[768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
+            lut[u32(pg.misc3.x) + 256u + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
+            lut[u32(pg.misc3.x) + 512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
+            lut[u32(pg.misc3.x) + 768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
         );
     }
     // hue-domain curves (lut offsets 1024 hh | 1280 hs | 1536 hl | 1792 ls | 2048 ss)
-    if (u.misc2.z > 0.5) {
+    if (pg.misc2.z > 0.5) {
         let hsv = rgb_to_hsv(x);
         let lum = luma(x);
-        let h2 = lut[1024u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)];
-        var s2 = hsv.y * lut[1280u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)]
-            * lut[1792u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
-        s2 = lut[2048u + u32(clamp(s2, 0.0, 1.0) * 255.0)];
-        let l2 = lum * lut[1536u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        let h2 = lut[u32(pg.misc3.x) + 1024u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)];
+        var s2 = hsv.y * lut[u32(pg.misc3.x) + 1280u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)]
+            * lut[u32(pg.misc3.x) + 1792u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        s2 = lut[u32(pg.misc3.x) + 2048u + u32(clamp(s2, 0.0, 1.0) * 255.0)];
+        let l2 = lum * lut[u32(pg.misc3.x) + 1536u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
         var x2 = hsv_to_rgb(h2, clamp(s2, 0.0, 1.0), hsv.z);
         let l3 = luma(x2);
         if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
         x = x2;
     }
-    // HSL qualifier (also runs for highlight-only preview when u.qf2.w is set)
-    if (u.qf.x > 0.5 || u.qf2.w > 0.5) {
+    // ColorSlice (7 hue wedges) + ColorWarper — mirrors develop.rs
+    if (pg.csn.y > 0.5 || pg.csn.x > 0.5) {
+        let hsv = rgb_to_hsv(x);
+        var dh = 0.0;
+        var ds = 0.0;
+        var dl = 0.0;
+        if (pg.csn.y > 0.5) {
+            let cw = sstep(0.04, 0.15, hsv.y);
+            let sc = array<f32, 7>(0.0, 0.0833, 0.1667, 0.3333, 0.5, 0.6667, 0.8333);
+            for (var i = 0u; i < 7u; i = i + 1u) {
+                let sl = pg.cs[i];
+                if (sl.w > 0.5) {
+                    let w = max(0.0, 1.0 - hue_dist(hsv.x, sc[i]) * 7.0) * cw;
+                    dh = dh + sl.x * w;
+                    ds = ds + sl.y * w;
+                    dl = dl + sl.z * w;
+                }
+            }
+        }
+        let nwp = u32(pg.csn.x);
+        for (var i = 0u; i < nwp; i = i + 1u) {
+            let wp = pg.warp[i * 2u];
+            let rad = max(pg.warp[i * 2u + 1u].x, 0.03);
+            let hd = hue_dist(hsv.x, wp.x);
+            let sd = abs(hsv.y - wp.y);
+            let e = sqrt((hd / 0.12) * (hd / 0.12) + (sd / rad) * (sd / rad));
+            if (e < 1.0) {
+                let t = 1.0 - e;
+                let wgt = t * t * (3.0 - 2.0 * t);
+                dh = dh + wp.z * wgt;
+                ds = ds + wp.w * wgt;
+            }
+        }
+        if (dh != 0.0 || ds != 0.0 || dl != 0.0) {
+            x = hsv_to_rgb(
+                fract(hsv.x + dh + 1.0),
+                clamp(hsv.y * (1.0 + ds), 0.0, 1.5),
+                clamp(hsv.z * (1.0 + dl), 0.0, 8.0));
+        }
+    }
+    // HSL qualifier (also runs for highlight-only preview when pg.qf2.w is set)
+    if (pg.qf.x > 0.5 || pg.qf2.w > 0.5) {
         let hsv = rgb_to_hsv(x);
         let l = luma(x);
-        let qb = u.qf2.z * 0.25;
-        let mh = 1.0 - sstep(u.qh.y, u.qh.y + max(u.qh.z + qb, 1e-4), hue_dist(hsv.x, u.qh.x));
-        let qs2 = u.qs.z + qb;
-        let ms = sstep(u.qs.x - qs2, u.qs.x + qs2, hsv.y)
-            * (1.0 - sstep(u.qs.y - qs2, u.qs.y + qs2, hsv.y));
-        let ql2 = u.ql.z + qb;
-        let ml = sstep(u.ql.x - ql2, u.ql.x + ql2, l)
-            * (1.0 - sstep(u.ql.y - ql2, u.ql.y + ql2, l));
+        let qb = pg.qf2.z * 0.25;
+        let mh = 1.0 - sstep(pg.qh.y, pg.qh.y + max(pg.qh.z + qb, 1e-4), hue_dist(hsv.x, pg.qh.x));
+        let qs2 = pg.qs.z + qb;
+        let ms = sstep(pg.qs.x - qs2, pg.qs.x + qs2, hsv.y)
+            * (1.0 - sstep(pg.qs.y - qs2, pg.qs.y + qs2, hsv.y));
+        let ql2 = pg.ql.z + qb;
+        let ml = sstep(pg.ql.x - ql2, pg.ql.x + ql2, l)
+            * (1.0 - sstep(pg.ql.y - ql2, pg.ql.y + ql2, l));
         var mask = mh * ms * ml;
-        if (u.qf2.x > 0.0 || u.qf2.y < 1.0) {
-            mask = clamp((mask - u.qf2.x) / max(u.qf2.y - u.qf2.x, 1e-4), 0.0, 1.0);
+        if (pg.qf2.x > 0.0 || pg.qf2.y < 1.0) {
+            mask = clamp((mask - pg.qf2.x) / max(pg.qf2.y - pg.qf2.x, 1e-4), 0.0, 1.0);
         }
-        if (u.qf.y > 0.5) { mask = 1.0 - mask; }
-        if (u.qf2.w > 0.5) { x = vec3<f32>(l) + (x - vec3<f32>(l)) * mask; }
-        if (mask > 0.001 && u.qf.x > 0.5) {
-            var xq = hsv_to_rgb(hsv.x + u.qadj.x, clamp(hsv.y * (1.0 + u.qadj.y), 0.0, 1.0), hsv.z);
+        if (pg.qf.y > 0.5) { mask = 1.0 - mask; }
+        if (pg.qf2.w > 0.5) { x = vec3<f32>(l) + (x - vec3<f32>(l)) * mask; }
+        if (mask > 0.001 && pg.qf.x > 0.5) {
+            var xq = hsv_to_rgb(hsv.x + pg.qadj.x, clamp(hsv.y * (1.0 + pg.qadj.y), 0.0, 1.0), hsv.z);
             let lq = luma(xq);
-            if (lq > 1e-5) { xq = xq * ((l * (1.0 + u.qadj.z)) / lq); }
-            xq = xq + vec3<f32>(u.qadj.w * 0.06, 0.0, -u.qadj.w * 0.06);
+            if (lq > 1e-5) { xq = xq * ((l * (1.0 + pg.qadj.z)) / lq); }
+            xq = xq + vec3<f32>(pg.qadj.w * 0.06, 0.0, -pg.qadj.w * 0.06);
             x = mix(x, xq, mask);
         }
     }
@@ -1252,8 +1341,8 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
 }
 
 fn bil_ch(sx: f32, sy: f32, ch: u32) -> f32 {
-    let sw = u.g2.x;
-    let sh = u.g2.y;
+    let sw = pg.g2.x;
+    let sh = pg.g2.y;
     let x0 = i32(floor(sx));
     let y0 = i32(floor(sy));
     if (x0 < 0 || y0 < 0 || x0 + 1 >= i32(sw) || y0 + 1 >= i32(sh)) {
@@ -1278,24 +1367,33 @@ fn hash(p: vec2<f32>, seed: f32) -> f32 {
     return f32(h) * (1.0 / 4294967296.0);
 }
 
-// finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
+// edge-aware brush seeds: one thread per stroke slot (64 per param block,
+// base + stages). Samples the linear image under the stroke's first dab via
+// the same dst→src map finish_main uses, writes [r,g,b,tol] into seedsb.
 @compute @workgroup_size(256)
-fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
-    let i = flat_index(gid, num);
-    let dw = u.g2.z;
-    let dh = u.g2.w;
-    if (i >= dw * dh) { return; }
-    let dx = i % dw;
-    let dy = i / dw;
-    // dst -> crop rect in post-flip frame coords
-    let nx = (f32(dx) + 0.5) / f32(dw);
-    let ny = (f32(dy) + 0.5) / f32(dh);
+fn seed_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    let tid = flat_index(gid, num);
+    let k = tid / 64u;
+    let si = tid % 64u;
+    let nblk = 1u + u32(u.stg0.x);
+    if (k >= nblk) { return; }
+    if (k == 0u) { pg = u; } else { pg = suni[k - 1u]; }
+    let e1 = pg.bstr[si * 3u + 1u];
+    if (e1.z < 0.5) {
+        seedsb[k * 64u + si] = vec4<f32>(0.0);
+        return;
+    }
+    // dab = first point of the stroke's first segment (dst-normalized)
+    let sb = u32(pg.misc3.z);
+    let dab = brushsegs[sb + u32(e1.x)].xy;
+    // dst -> src map (mirrors finish_main) — always the BASE transform:
+    // stage params carry no geometry of their own (crop is unified)
+    let nx = dab.x;
+    let ny = dab.y;
     var fx = u.crop.x + nx * u.crop.z - 0.5;
     var fy = u.crop.y + ny * u.crop.w - 0.5;
-    // undo straighten rotation about crop centre
     let cx = u.crop.x + u.crop.z * 0.5 - 0.5;
     let cy = u.crop.y + u.crop.w * 0.5 - 0.5;
-    // keystone: trapezoid warp about the crop centre
     if (u.ze2.z != 0.0 || u.ze2.w != 0.0) {
         fx = cx + (fx - cx) * (1.0 + u.ze2.z * (ny * 2.0 - 1.0));
         fy = cy + (fy - cy) * (1.0 + u.ze2.w * (nx * 2.0 - 1.0));
@@ -1304,12 +1402,191 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let py = fy - cy;
     fx = cx + px * u.a4.z + py * u.a4.y;
     fy = cy - px * u.a4.y + py * u.a4.z;
-    // undo flip -> src coords (src_w x src_h)
     var sx = fx;
     var sy = fy;
     let sw = u.g2.x;
     let sh = u.g2.y;
     switch u.g1.w {
+        case 3u: {
+            sx = f32(sw) - 1.0 - fx;
+            sy = f32(sh) - 1.0 - fy;
+        }
+        case 6u: {
+            sx = fy;
+            sy = f32(sh) - 1.0 - fx;
+        }
+        case 5u: {
+            sx = f32(sh) - 1.0 - fy;
+            sy = fx;
+        }
+        default: {}
+    }
+    let c = vec3<f32>(bil_ch(sx, sy, 0u), bil_ch(sx, sy, 1u), bil_ch(sx, sy, 2u));
+    seedsb[k * 64u + si] = vec4<f32>(c, e1.w);
+}
+
+// finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
+// shared power-window mask eval (used by local_ops and the stage key).
+fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
+    let kb = u32(w2.y);
+    let kind = kb & 1u;
+    var mask = 0.0;
+    if ((kb & 16u) != 0u) {
+        mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 4u) != 0u) {
+        let l = luma(col);
+        let lf = max(w0.z, 0.005);
+        let hf = max(w0.w, 0.005);
+        mask = sstep(w0.x - lf, w0.x + lf, l) * (1.0 - sstep(w0.y - hf, w0.y + hf, l));
+    } else if (kind == 1u) {
+        let dvec = w0.zw - w0.xy;
+        let len2 = max(dot(dvec, dvec), 1e-6);
+        let t = dot(vec2<f32>(nx, ny) - w0.xy, dvec) / len2;
+        let soft = max(w1.y, 0.02);
+        mask = 1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t);
+    } else {
+        let rot = w1.x * 0.0174533;
+        let dd = vec2<f32>(nx, ny) - w0.xy;
+        let rr = max(w0.zw, vec2<f32>(0.005));
+        let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
+        let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
+        let d = length(vec2<f32>(ux, uy));
+        mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
+    }
+    if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
+    if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
+    return mask * w2.z;
+}
+
+// local spatial ops shared by the base grade and every serial stage:
+// Affinity/LightCraft auto-mask similarity (mirrors develop.rs edge_sim).
+fn edge_sim(col: vec3<f32>, seed: vec3<f32>, tol: f32) -> f32 {
+    let lc = luma(col);
+    let ls = luma(seed);
+    if (lc < 1e-4 || ls < 1e-4) { return 1.0; }
+    let dl = abs(log2(lc / ls));
+    let dc = max(abs(col.x - seed.x), max(abs(col.y - seed.y), abs(col.z - seed.z)));
+    return (1.0 - sstep(0.5 * tol, tol, dl)) * (1.0 - sstep(0.25 * tol, 0.5 * tol, dc));
+}
+
+// dodge/burn lights, power windows, adjustment brushes.
+// Mirrors local_ops() in develop.rs.
+fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -> vec3<f32> {
+    var adj = adj_in;
+    let nl = u32(pg.misc.w);
+    for (var li = 0u; li < nl; li = li + 1u) {
+        let lt = pg.lts[li];
+        let d = distance(vec2<f32>(nx, ny), lt.xy) / max(lt.z, 1e-3);
+        let f = exp(-d * d * 2.77);
+        adj = adj * (1.0 + lt.w * f * 0.5);
+    }
+    let nw = u32(pg.misc2.x);
+    for (var wi = 0u; wi < nw; wi = wi + 1u) {
+        let w1 = pg.wins[wi * 4u + 1u];
+        let w2 = pg.wins[wi * 4u + 2u];
+        let mask = win_mask(pg.wins[wi * 4u], w1, w2, nx, ny, col);
+        if (mask > 0.001) {
+            let evg = pow(2.0, w1.z * mask);
+            let l = luma(adj);
+            adj = adj * evg;
+            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + w1.w * mask);
+            adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
+        }
+    }
+    let n_str = u32(pg.bmisc.x);
+    if (n_str > 0u) {
+        let link_bits = u32(pg.bmisc.y);
+        let pax = nx * aspect;
+        let pay = ny;
+        var pm = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        var em = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        for (var si = 0u; si < n_str; si = si + 1u) {
+            let e0 = pg.bstr[si * 3u];
+            let e1 = pg.bstr[si * 3u + 1u];
+            let bb = pg.bstr[si * 3u + 2u];
+            let rad = e0.x;
+            if (pax < bb.x * aspect - rad || pax > bb.z * aspect + rad) { continue; }
+            if (pay < bb.y - rad || pay > bb.w + rad) { continue; }
+            let inner = rad * (1.0 - e0.y);
+            var w = 0.0;
+            let s0 = u32(e1.x);
+            let s1 = u32(e1.x + e1.y);
+            let sb = u32(pg.misc3.z);
+            for (var g = s0; g < s1; g = g + 1u) {
+                let seg = brushsegs[sb + g];
+                let ax = seg.x * aspect;
+                let vx = seg.z * aspect - ax;
+                let vy = seg.w - seg.y;
+                let len2 = max(vx * vx + vy * vy, 1e-9);
+                let t = clamp(((pax - ax) * vx + (pay - seg.y) * vy) / len2, 0.0, 1.0);
+                let dx = pax - ax - t * vx;
+                let dy = pay - seg.y - t * vy;
+                let d = sqrt(dx * dx + dy * dy);
+                w = max(w, 1.0 - sstep(inner, rad, d));
+            }
+            // edge-aware: gate the stroke weight by colour similarity to
+            // the seed sampled under its first dab (mirrors develop.rs)
+            let sd = seedsb[u32(pg.bmisc.w) + si];
+            if (sd.w > 0.0) {
+                w = w * edge_sim(col, sd.xyz, sd.w);
+            }
+            let li = min(u32(e0.w), 3u);
+            if (e0.z >= 0.0) {
+                pm[li] = max(pm[li], w * e0.z);
+            } else {
+                em[li] = max(em[li], w * -e0.z);
+            }
+        }
+        for (var li = 0u; li < 4u; li = li + 1u) {
+            let lp = pg.blayers[li];
+            var bmask = clamp(pm[li] - em[li], 0.0, 1.0) * lp.w;
+            if (bmask <= 0.001) { continue; }
+            if ((link_bits & (1u << li)) != 0u) {
+                bmask = bmask * qual_mask(col);
+            }
+            if (bmask <= 0.001) { continue; }
+            let evg = pow(2.0, lp.x * bmask);
+            let l = luma(adj);
+            adj = adj * evg;
+            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + lp.y * bmask);
+            adj = adj + vec3<f32>(lp.z * bmask * 0.08, 0.0, -lp.z * bmask * 0.08);
+        }
+    }
+    return adj;
+}
+
+@compute @workgroup_size(256)
+fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
+    let i = flat_index(gid, num);
+    let dw = pg.g2.z;
+    let dh = pg.g2.w;
+    if (i >= dw * dh) { return; }
+    let dx = i % dw;
+    let dy = i / dw;
+    // dst -> crop rect in post-flip frame coords
+    let nx = (f32(dx) + 0.5) / f32(dw);
+    let ny = (f32(dy) + 0.5) / f32(dh);
+    var fx = pg.crop.x + nx * pg.crop.z - 0.5;
+    var fy = pg.crop.y + ny * pg.crop.w - 0.5;
+    // undo straighten rotation about crop centre
+    let cx = pg.crop.x + pg.crop.z * 0.5 - 0.5;
+    let cy = pg.crop.y + pg.crop.w * 0.5 - 0.5;
+    // keystone: trapezoid warp about the crop centre
+    if (pg.ze2.z != 0.0 || pg.ze2.w != 0.0) {
+        fx = cx + (fx - cx) * (1.0 + pg.ze2.z * (ny * 2.0 - 1.0));
+        fy = cy + (fy - cy) * (1.0 + pg.ze2.w * (nx * 2.0 - 1.0));
+    }
+    let px = fx - cx;
+    let py = fy - cy;
+    fx = cx + px * pg.a4.z + py * pg.a4.y;
+    fy = cy - px * pg.a4.y + py * pg.a4.z;
+    // undo flip -> src coords (src_w x src_h)
+    var sx = fx;
+    var sy = fy;
+    let sw = pg.g2.x;
+    let sh = pg.g2.y;
+    switch pg.g1.w {
         case 3u: {
             sx = f32(sw) - 1.0 - fx;
             sy = f32(sh) - 1.0 - fy;
@@ -1326,12 +1603,12 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     }
     // bilinear sample (black outside); ca_fix splits the R/B taps radially
     var col = vec3<f32>(0.0);
-    if (u.fx0.x != 0.0) {
+    if (pg.fx0.x != 0.0) {
         let wcx = f32(sw) * 0.5;
         let wcy = f32(sh) * 0.5;
         let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
-        let fr = 1.0 - u.fx0.x * 0.05 * rn;
-        let fb = 1.0 + u.fx0.x * 0.05 * rn;
+        let fr = 1.0 - pg.fx0.x * 0.05 * rn;
+        let fb = 1.0 + pg.fx0.x * 0.05 * rn;
         col = vec3<f32>(
             bil_ch(wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0u),
             bil_ch(sx, sy, 1u),
@@ -1354,139 +1631,58 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         }
     }
     var adj = adjust(col);
-    // dodge/burn radial lights (dst-normalized coords)
-    let nl = u32(u.misc.w);
-    for (var li = 0u; li < nl; li = li + 1u) {
-        let lt = u.lts[li];
-        let d = distance(vec2<f32>(nx, ny), lt.xy) / max(lt.z, 1e-3);
-        let f = exp(-d * d * 2.77);
-        adj = adj * (1.0 + lt.w * f * 0.5);
-    }
-    // power windows
-    let nw = u32(u.misc2.x);
-    for (var wi = 0u; wi < nw; wi = wi + 1u) {
-        let w0 = u.wins[wi * 4u];
-        let w1 = u.wins[wi * 4u + 1u];
-        let w2 = u.wins[wi * 4u + 2u];
-        let kb = u32(w2.y);
-        let kind = kb & 1u;
-        var mask = 0.0;
-        if ((kb & 16u) != 0u) {
-            // AI subject matte: bilinear sample (empty buffer -> 0)
-            mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
-        } else if ((kb & 4u) != 0u) {
-            // luminance range over the pre-adjust sample: p=[lo,hi,lof,hif]
-            let l = luma(col);
-            let lf = max(w0.z, 0.005);
-            let hf = max(w0.w, 0.005);
-            mask = sstep(w0.x - lf, w0.x + lf, l) * (1.0 - sstep(w0.y - hf, w0.y + hf, l));
-        } else if (kind == 1u) {
-            // gradient: full cover before the p1..p2 span, soft ramp across
-            let dvec = w0.zw - w0.xy;
-            let len2 = max(dot(dvec, dvec), 1e-6);
-            let t = dot(vec2<f32>(nx, ny) - w0.xy, dvec) / len2;
-            let soft = max(w1.y, 0.02);
-            mask = 1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t);
-        } else {
-            // circle/ellipse
-            let rot = w1.x * 0.0174533;
-            let dd = vec2<f32>(nx, ny) - w0.xy;
-            let rr = max(w0.zw, vec2<f32>(0.005));
-            let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
-            let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
-            let d = length(vec2<f32>(ux, uy));
-            mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
+    let aspect = f32(dw) / f32(dh);
+    adj = local_ops(adj, col, nx, ny, aspect);
+    // serial correction stages (DaVinci serial nodes): suni[i] is the
+    // stage's own param block. Stage key = qualifier x window union,
+    // optionally inverted, scaled by stage opacity (u.sop0/u.sinv0).
+    let n_stg = u32(pg.stg0.x);
+    for (var si = 0u; si < n_stg; si = si + 1u) {
+        pg = suni[si];
+        // mask -> optional invert -> scale by stage opacity (matches CPU)
+        var key = 1.0;
+        if (pg.qf.x > 0.5) { key = key * qual_mask(col); }
+        let snw = u32(pg.misc2.x);
+        if (snw > 0u) {
+            var wu = 0.0;
+            for (var wi = 0u; wi < snw; wi = wi + 1u) {
+                wu = max(wu, win_mask(pg.wins[wi * 4u], pg.wins[wi * 4u + 1u], pg.wins[wi * 4u + 2u], nx, ny, col));
+            }
+            key = key * wu;
         }
-        if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
-        if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
-        mask = mask * w2.z;
-        if (mask > 0.001) {
-            let evg = pow(2.0, w1.z * mask);
-            let l = luma(adj);
-            adj = adj * evg;
-            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + w1.w * mask);
-            adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
+        if (u.sinv0[si] > 0.5) { key = 1.0 - key; }
+        key = key * u.sop0[si];
+        if (key > 0.001) {
+            var a2 = adjust(col);
+            a2 = local_ops(a2, col, nx, ny, aspect);
+            adj = mix(adj, a2, vec3<f32>(key));
         }
     }
-    // adjustment brushes: same local ev/sat/temp inside stroke masks.
-    // Mirrors the finish_linear brush block in develop.rs.
-    let n_str = u32(u.bmisc.x);
-    if (n_str > 0u) {
-        let aspect = f32(dw) / f32(dh);
-        let link_bits = u32(u.bmisc.y);
-        let pax = nx * aspect;
-        let pay = ny;
-        var pm = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
-        var em = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
-        for (var si = 0u; si < n_str; si = si + 1u) {
-            let e0 = u.bstr[si * 3u];
-            let e1 = u.bstr[si * 3u + 1u];
-            let bb = u.bstr[si * 3u + 2u];
-            let rad = e0.x;
-            if (pax < bb.x * aspect - rad || pax > bb.z * aspect + rad) { continue; }
-            if (pay < bb.y - rad || pay > bb.w + rad) { continue; }
-            let inner = rad * (1.0 - e0.y);
-            var w = 0.0;
-            let s0 = u32(e1.x);
-            let s1 = u32(e1.x + e1.y);
-            for (var g = s0; g < s1; g = g + 1u) {
-                let seg = brushsegs[g];
-                let ax = seg.x * aspect;
-                let vx = seg.z * aspect - ax;
-                let vy = seg.w - seg.y;
-                let len2 = max(vx * vx + vy * vy, 1e-9);
-                let t = clamp(((pax - ax) * vx + (pay - seg.y) * vy) / len2, 0.0, 1.0);
-                let dx = pax - ax - t * vx;
-                let dy = pay - seg.y - t * vy;
-                let d = sqrt(dx * dx + dy * dy);
-                w = max(w, 1.0 - sstep(inner, rad, d));
-            }
-            let li = min(u32(e0.w), 3u);
-            if (e0.z >= 0.0) {
-                pm[li] = max(pm[li], w * e0.z);
-            } else {
-                em[li] = max(em[li], w * -e0.z);
-            }
-        }
-        for (var li = 0u; li < 4u; li = li + 1u) {
-            let lp = u.blayers[li];
-            var bmask = clamp(pm[li] - em[li], 0.0, 1.0) * lp.w;
-            if (bmask <= 0.001) { continue; }
-            if ((link_bits & (1u << li)) != 0u) {
-                bmask = bmask * qual_mask(col);
-            }
-            if (bmask <= 0.001) { continue; }
-            let evg = pow(2.0, lp.x * bmask);
-            let l = luma(adj);
-            adj = adj * evg;
-            adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + lp.y * bmask);
-            adj = adj + vec3<f32>(lp.z * bmask * 0.08, 0.0, -lp.z * bmask * 0.08);
-        }
-    }
+    pg = u;
     // lens flare: core + horizontal streak + mirrored ghost ring
-    if (u.flare.z > 0.0) {
-        let dvec = vec2<f32>(nx, ny) - u.flare.xy;
+    if (pg.flare.z > 0.0) {
+        let dvec = vec2<f32>(nx, ny) - pg.flare.xy;
         let core = exp(-dot(dvec, dvec) / 0.004);
-        let streak = exp(-dvec.y * dvec.y / (0.0004 + 0.02 * u.flare.z)) * exp(-abs(dvec.x) / 0.35);
-        let gd = abs(distance(vec2<f32>(nx, ny), vec2<f32>(1.0) - u.flare.xy) - 0.10);
+        let streak = exp(-dvec.y * dvec.y / (0.0004 + 0.02 * pg.flare.z)) * exp(-abs(dvec.x) / 0.35);
+        let gd = abs(distance(vec2<f32>(nx, ny), vec2<f32>(1.0) - pg.flare.xy) - 0.10);
         let ghost = exp(-gd * gd / 0.0008);
-        adj = adj + hue_to_rgb(u.flare.w) * (u.flare.z * (0.5 * core + 0.7 * streak + 0.35 * ghost));
+        adj = adj + hue_to_rgb(pg.flare.w) * (pg.flare.z * (0.5 * core + 0.7 * streak + 0.35 * ghost));
     }
     // film grain (pre-gamma, linear domain)
-    if (u.a4.x > 0.0) {
+    if (pg.a4.x > 0.0) {
         let p = vec2<f32>(f32(dx), f32(dy));
         adj = adj + vec3<f32>(
             hash(p, 0.0) - 0.5,
             hash(p, 17.0) - 0.5,
             hash(p, 43.0) - 0.5,
-        ) * u.a4.x * 0.12;
+        ) * pg.a4.x * 0.12;
     }
     // vignette (post-adjust, pre-gamma; positive darkens corners)
-    if (u.a3.w != 0.0) {
+    if (pg.a3.w != 0.0) {
         let vx = nx * 2.0 - 1.0;
         let vy = ny * 2.0 - 1.0;
         let d = length(vec2<f32>(vx, vy)) * 0.7071;
-        adj = adj * (1.0 - u.a3.w * sstep(0.35, 1.05, d) * 0.9);
+        adj = adj * (1.0 - pg.a3.w * sstep(0.35, 1.05, d) * 0.9);
     }
     let enc = srgb_encode(clamp(adj.x, 0.0, 1.0)) * 255.0 + 0.5;
     let enc2 = srgb_encode(clamp(adj.y, 0.0, 1.0)) * 255.0 + 0.5;
@@ -1519,6 +1715,7 @@ pub struct Gpu {
     glow: Pipe,
     sharpen: Pipe,
     finish: Pipe,
+    seed: Pipe,
 }
 
 fn norm_factors(m: &Mosaic) -> [f32; 4] {
@@ -1576,14 +1773,14 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..13)
+                entries: &(0..15)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: match i {
                                 0 => wgpu::BufferBindingType::Uniform,
-                                3 | 4 | 5 | 7 => {
+                                3 | 4 | 5 | 7 | 14 => {
                                     wgpu::BufferBindingType::Storage { read_only: false }
                                 }
                                 _ => wgpu::BufferBindingType::Storage { read_only: true },
@@ -1624,6 +1821,7 @@ impl Gpu {
             glow: mk("glow_main"),
             sharpen: mk("sharpen_main"),
             finish: mk("finish_main"),
+            seed: mk("seed_main"),
             device,
             queue,
         })
@@ -1718,7 +1916,29 @@ impl Gpu {
             None
         };
         // header after the curve region: [size, amt, dmin*3, dscale*3] then data
-        let lut_len = LUT_N + 8 + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0);
+        let n_stg = r.stages.iter().filter(|s| s.enabled).take(4).count() as u64;
+        // per-stage curve/tone regions follow the base 3D LUT data; each stage's
+        // own .cube block (8-float header + data, header present even when empty)
+        // comes after all stage curve regions. Loads hit lut::load's path cache.
+        let stg_l3: Vec<u64> = r
+            .stages
+            .iter()
+            .filter(|s| s.enabled)
+            .take(4)
+            .map(|s| {
+                if !s.params.lut_file.is_empty() && s.params.lut_amount > 0.0 {
+                    crate::lut::load(&s.params.lut_file)
+                        .map(|c| c.data.len() as u64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .map(|dl| 8 + dl)
+            .collect();
+        let lut_len = LUT_N + 8 + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
+            + n_stg * LUT_N
+            + stg_l3.iter().sum::<u64>();
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lut"),
             size: lut_len * 4,
@@ -1741,6 +1961,21 @@ impl Gpu {
             label: Some("uni"),
             size: std::mem::size_of::<Uni>() as u64,
             usage: U::UNIFORM | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // serial-stage param blocks (one Uni per enabled stage, max 4)
+        let suni_b = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("suni"),
+            size: (n_stg.max(1) * std::mem::size_of::<Uni>() as u64),
+            usage: storage_in,
+            mapped_at_creation: false,
+        });
+        // edge-aware brush seed colours: one 64-stroke block per param set
+        // (base + each enabled stage); written by the seed_main kernel.
+        let seeds_b = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("seeds"),
+            size: (1 + n_stg).max(1) * 64 * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -1919,13 +2154,38 @@ impl Gpu {
                 }
                 a
             },
+            stg0: [0.0; 4],
+            sop0: [0.0; 4],
+            sinv0: [0.0; 4],
+            misc3: [0.0; 4],
+            cs: p.cs,
+            warp: {
+                let mut w = [[0.0f32; 4]; 10];
+                for (i, wp) in p.warper.iter().take(8).enumerate() {
+                    w[i * 2] = [wp[0], wp[1], wp[2], wp[3]];
+                    w[i * 2 + 1] = [wp[4], 0.0, 0.0, 0.0];
+                }
+                w
+            },
+            csn: [
+                p.warper.len().min(8) as f32,
+                if p.has_cs { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
         // a stats-free params build produces identical segments to the main
         // pass's params below.
         let p0 = build_params(m, r, None);
-        let segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
+        let mut segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
+        // per-stage segments appended; each stage Uni records its vec4 base
+        let mut stg_seg_base: Vec<f32> = Vec::new();
+        for (sp, _, _) in p0.stages.iter() {
+            stg_seg_base.push(segs32.len() as f32 / 4.0);
+            segs32.extend(sp.brush_segs.iter().flatten().copied());
+        }
         let segs32 = if segs32.is_empty() {
             vec![0.0f32; 4]
         } else {
@@ -1967,7 +2227,8 @@ impl Gpu {
         let subj_b = mk_buf("subjbuf", bytemuck::cast_slice(&subj32), storage_in);
 
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            let entries: Vec<wgpu::BindGroupEntry> =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
                 .iter()
                 .map(|&i| wgpu::BindGroupEntry {
                     binding: i,
@@ -1984,7 +2245,9 @@ impl Gpu {
                         9 => tap_b.as_entire_binding(),
                         10 => brush_b.as_entire_binding(),
                         11 => den_b.as_entire_binding(),
-                        _ => subj_b.as_entire_binding(),
+                        12 => subj_b.as_entire_binding(),
+                        13 => suni_b.as_entire_binding(),
+                        _ => seeds_b.as_entire_binding(),
                     },
                 })
                 .collect();
@@ -2086,6 +2349,37 @@ impl Gpu {
         lut_buf[2304..2816].copy_from_slice(&p.tone_lut);
         // 3D LUT header + data (shader: size==0 => passthrough)
         lut_buf.resize(lut_len as usize, 0.0);
+        // per-stage curve/tone regions after the base 3D LUT data
+        {
+            let dl = p.lut3d.as_ref().map(|c| c.data.len()).unwrap_or(0);
+            for (i, (sp, _, _)) in p.stages.iter().enumerate() {
+                let sb = LUT_N as usize + 8 + dl + i * LUT_N as usize;
+                lut_buf[sb..sb + 256].copy_from_slice(&sp.lut);
+                for c in 0..3 {
+                    let off = sb + 256 + c * 256;
+                    if sp.chan_luts.is_empty() {
+                        for j in 0..256 {
+                            lut_buf[off + j] = j as f32 / 255.0;
+                        }
+                    } else {
+                        lut_buf[off..off + 256]
+                            .copy_from_slice(&sp.chan_luts[c * 256..(c + 1) * 256]);
+                    }
+                }
+                for (k, f) in hue_defaults.iter().enumerate() {
+                    let off = sb + 1024 + k * 256;
+                    if sp.hue_luts.is_empty() {
+                        for j in 0..256 {
+                            lut_buf[off + j] = f(j as f32 / 255.0);
+                        }
+                    } else {
+                        lut_buf[off..off + 256]
+                            .copy_from_slice(&sp.hue_luts[k * 256..(k + 1) * 256]);
+                    }
+                }
+                lut_buf[sb + 2304..sb + 2816].copy_from_slice(&sp.tone_lut);
+            }
+        }
         if let Some(c) = &p.lut3d {
             lut_buf[LUT_N as usize] = c.size as f32;
             lut_buf[LUT_N as usize + 1] = p.lut_amt;
@@ -2095,8 +2389,62 @@ impl Gpu {
         }
         self.queue
             .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
+        let mut u_main = mk_uni(&p, 0);
+        u_main.stg0 = [p.stages.len() as f32, 0.0, 0.0, 0.0];
+        for (i, (_, sop, sinv)) in p.stages.iter().enumerate() {
+            u_main.sop0[i] = *sop;
+            u_main.sinv0[i] = if *sinv { 1.0 } else { 0.0 };
+        }
         self.queue
-            .write_buffer(&uni_b, 0, bytemuck::bytes_of(&mk_uni(&p, 0)));
+            .write_buffer(&uni_b, 0, bytemuck::bytes_of(&u_main));
+        if !p.stages.is_empty() {
+            // stage curve regions start after the base 3D LUT data; per-stage
+            // .cube blocks (header + data) follow all stage curve regions.
+            let slut0 = LUT_N + 8 + p.lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0);
+            let s3d0 = slut0 + p.stages.len() as u64 * LUT_N;
+            let mut s3d_off = Vec::with_capacity(p.stages.len());
+            {
+                let mut cur = s3d0;
+                for (sp, _, _) in p.stages.iter() {
+                    s3d_off.push(cur);
+                    cur += 8 + sp.lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0);
+                }
+            }
+            let suni: Vec<Uni> = p
+                .stages
+                .iter()
+                .enumerate()
+                .map(|(i, (sp, _, _))| {
+                    let mut uu = mk_uni(sp, 0);
+                    uu.misc3 = [
+                        slut0 as f32 + i as f32 * LUT_N as f32,
+                        1.0,
+                        stg_seg_base.get(i).copied().unwrap_or(0.0),
+                        s3d_off[i] as f32,
+                    ];
+                    // seed block base in the shared seedsb buffer
+                    uu.bmisc[3] = ((i + 1) * 64) as f32;
+                    uu
+                })
+                .collect();
+            self.queue
+                .write_buffer(&suni_b, 0, bytemuck::cast_slice(&suni));
+            // write each stage's .cube header+data at its own offset
+            for (i, (sp, _, _)) in p.stages.iter().enumerate() {
+                let hb = s3d_off[i] as usize;
+                if let Some(c) = &sp.lut3d {
+                    lut_buf[hb] = c.size as f32;
+                    lut_buf[hb + 1] = sp.lut_amt;
+                    lut_buf[hb + 2..hb + 5].copy_from_slice(&c.dmin);
+                    lut_buf[hb + 5..hb + 8].copy_from_slice(&c.dscale);
+                    lut_buf[hb + 8..hb + 8 + c.data.len()].copy_from_slice(&c.data);
+                } else {
+                    lut_buf[hb] = 0.0;
+                }
+            }
+            self.queue
+                .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
+        }
 
         let mut enc = dev.create_command_encoder(&Default::default());
         if stride == 1 {
@@ -2134,6 +2482,9 @@ impl Gpu {
             run(&mut enc, &self.sharpen, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
+        // edge-aware brush seeds: sample the finished linear image at each
+        // flagged stroke's first dab before the per-pixel finish pass
+        run(&mut enc, &self.seed, (1 + n_stg) * 64);
         run(&mut enc, &self.finish, (dw * dh) as u64);
         let out_bytes = (dw * dh * 4) as u64;
         let stg = dev.create_buffer(&wgpu::BufferDescriptor {

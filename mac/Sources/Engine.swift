@@ -2,6 +2,83 @@ import Foundation
 import AppKit
 import CoreGraphics
 
+/// macOS ImageIO never embeds ICC profiles into JPEG/PNG output — the
+/// segments must be injected after encoding. JPEG gets ICC_PROFILE APP2
+/// (64KB-chunked per spec); PNG gets an iCCP chunk (zlib-compressed).
+enum ExportICC {
+    /// ICC bytes of the image's tagged colorspace; nil → keep data unchanged.
+    static func icc(of img: CGImage) -> Data? {
+        img.colorSpace?.copyICCData() as Data?
+    }
+
+    /// insert ICC_PROFILE APP2 segments right after SOI
+    static func jpeg(_ jpeg: Data, icc: Data) -> Data {
+        guard jpeg.count >= 4, jpeg[0] == 0xFF, jpeg[1] == 0xD8 else { return jpeg }
+        let chunkMax = 65519
+        let nSeg = (icc.count + chunkMax - 1) / chunkMax
+        var out = jpeg.subdata(in: 0..<2)
+        for i in 0..<nSeg {
+            let lo = i * chunkMax
+            let hi = min(icc.count, lo + chunkMax)
+            var seg = Data([0xFF, 0xE2])
+            let plen = UInt16(2 + 14 + (hi - lo))
+            seg.append(UInt8(plen >> 8)); seg.append(UInt8(plen & 0xFF))
+            seg.append(contentsOf: "ICC_PROFILE".utf8); seg.append(0)
+            seg.append(UInt8(i + 1)); seg.append(UInt8(nSeg))
+            seg.append(icc.subdata(in: lo..<hi))
+            out.append(seg)
+        }
+        out.append(jpeg.subdata(in: 2..<jpeg.count))
+        return out
+    }
+
+    /// PNG iCCP chunk placed before the first IDAT
+    static func png(_ png: Data, icc: Data) -> Data {
+        guard png.count > 8,
+              png[0..<8].elementsEqual([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+              let comp = try? (icc as NSData).compressed(using: .zlib) as Data
+        else { return png }
+        var payload = Data("ICC Profile".utf8)
+        payload.append(0)      // null separator
+        payload.append(0)      // compression method: zlib
+        payload.append(comp)
+        var chunk = Data()
+        var len = UInt32(payload.count).bigEndian
+        chunk.append(Data(bytes: &len, count: 4))
+        var typeAndData = Data("iCCP".utf8)
+        typeAndData.append(payload)
+        chunk.append(typeAndData)
+        var crc = crc32(typeAndData).bigEndian
+        chunk.append(Data(bytes: &crc, count: 4))
+        // locate first IDAT
+        var pos = 8
+        while pos + 8 <= png.count {
+            let clen = Int(png[pos]) << 24 | Int(png[pos + 1]) << 16
+                | Int(png[pos + 2]) << 8 | Int(png[pos + 3])
+            let ctype = png[pos + 4..<pos + 8]
+            if ctype.elementsEqual([0x49, 0x44, 0x41, 0x54]) { // "IDAT"
+                var out = png.subdata(in: 0..<pos)
+                out.append(chunk)
+                out.append(png.subdata(in: pos..<png.count))
+                return out
+            }
+            pos += 8 + clen + 4
+        }
+        return png
+    }
+
+    private static func crc32(_ d: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for b in d {
+            crc ^= UInt32(b)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) != 0 ? 0xEDB88320 : 0)
+            }
+        }
+        return ~crc
+    }
+}
+
 final class AraEngine: @unchecked Sendable {
     private let handle: UnsafeMutableRawPointer
     private let queue = DispatchQueue(label: "ara.engine", qos: .userInitiated)
@@ -135,6 +212,16 @@ final class AraEngine: @unchecked Sendable {
             path.withCString { p in
                 os.withCString { o in araware_export_opts(handle, p, r, o) }
             }
+        })
+    }
+
+    /// merge several photos at full res ("hdr" | "focus"); each renders
+    /// with its own sidecar recipe, aligned onto the first.
+    func merge(paths: [String], mode: String) -> CGImage? {
+        guard let pj = try? JSONSerialization.data(withJSONObject: paths),
+              let ps = String(data: pj, encoding: .utf8) else { return nil }
+        return cgImage(mode.withCString { m in
+            ps.withCString { p in araware_merge(handle, p, m) }
         })
     }
 
