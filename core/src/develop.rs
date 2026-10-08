@@ -122,6 +122,8 @@ pub struct Params {
     /// keystone trapezoid warps -0.4..0.4
     pub key_v: f32,
     pub key_h: f32,
+    /// lens profile correction amount (baked into virtual sampling)
+    pub lens_corr_amt: f32,
     /// EV-domain tone LUT (512 entries over linear y in 0..1.6): folds
     /// shadows/highlights/whites/blacks + rolloff into one luminance-preserving
     /// curve with an extended-Reinhard shoulder and soft-knee toe.
@@ -684,11 +686,13 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             )
         };
         let lum = w.kind == "lum";
+        let subj = w.kind == "subject";
         wins[i] = [
             (if grad { 1.0 } else { 0.0 })
                 + (if w.invert { 2.0 } else { 0.0 })
                 + (if lum { 4.0 } else { 0.0 })
-                + (if w.link_q { 8.0 } else { 0.0 }),
+                + (if w.link_q { 8.0 } else { 0.0 })
+                + (if subj { 16.0 } else { 0.0 }),
             if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
             if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
             if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
@@ -928,6 +932,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         lut_amt: r.lut_amount.clamp(0.0, 1.0),
         key_v: r.key_v.clamp(-0.4, 0.4),
         key_h: r.key_h.clamp(-0.4, 0.4),
+        lens_corr_amt: r.lens_corr.min(1.0),
         tone_lut: build_tone_lut(r),
         has_tone: r.shadows != 0.0
             || r.highlights != 0.0
@@ -1751,15 +1756,98 @@ fn norm_factors(m: &Mosaic) -> [f32; 4] {
 
 /// Full development: decoded -> rgba8 oriented, fit inside max_px (0 = full res).
 pub fn develop_cpu(d: &Decoded, r: &Recipe, max_px: u32) -> RgbaImage {
+    develop_cpu_ctx(d, r, max_px, None, None)
+}
+
+/// full-res linear image for the AI denoise pre-pass: demosaic -> lens corr ->
+/// WB -> cam->sRGB matrix (stride 1). `r` supplies WB/lens_corr as they stood
+/// when the denoise was baked. Returns (lin, w, h).
+pub fn lin_base(d: &Decoded, r: &Recipe) -> Result<(Vec<[f32; 3]>, usize, usize), String> {
     match d {
-        Decoded::Mosaic(m) => develop_mosaic(m, r, max_px),
-        Decoded::Raster {
-            rgba, w, h, flip, ..
-        } => develop_raster(rgba, *w, *h, *flip, r, max_px),
+        Decoded::Mosaic(m) => {
+            let stride = 1usize;
+            let (vw, vh) = (m.w, m.h);
+            let norm = norm_factors(m);
+            let p = build_params(m, r, None);
+            let plane = demosaic_plane(m, &norm, &build_demosaic_taps(&m.cfa));
+            let corr = if r.lens_corr > 0.001 {
+                crate::lensdb::db().and_then(|d| {
+                    let c = d.correction(
+                        &m.info.lens,
+                        &m.info.make,
+                        &m.info.model,
+                        m.info.focal,
+                        m.info.aperture,
+                    );
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                })
+            } else {
+                None
+            };
+            let plane = match corr.as_ref() {
+                Some(c) => correct_plane(&plane, vw, vh, c, r.lens_corr.min(1.0)),
+                None => plane,
+            };
+            Ok((
+                colorize_plane(m, stride, &norm, &p, Some(&plane), corr.as_ref(), vw, vh),
+                vw,
+                vh,
+            ))
+        }
+        Decoded::Raster { rgba, w, h, .. } => {
+            let mut lin = vec![[0.0f32; 3]; w * h];
+            for (i, px) in rgba.chunks_exact(4).enumerate() {
+                for c in 0..3 {
+                    lin[i][c] = srgb_of(px[c]);
+                }
+            }
+            Ok((lin, *w, *h))
+        }
     }
 }
 
-fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
+/// denoised base produced by the AI pass (SCUNet), stored sRGB-encoded u16 at
+/// the lin-plane resolution. `None` when no cache exists for the file.
+pub struct DenCache {
+    pub data: Vec<u16>, // sRGB-encoded RGB16, w*h*3
+    pub w: usize,
+    pub h: usize,
+}
+
+/// AI subject matte (U-2-Net), stored u16 luma at a modest resolution —
+/// sampled bilinear in normalized coords, so any size works.
+pub struct Matte {
+    pub data: Vec<u16>, // u16 luma, w*h
+    pub w: usize,
+    pub h: usize,
+}
+
+pub fn develop_cpu_ctx(
+    d: &Decoded,
+    r: &Recipe,
+    max_px: u32,
+    den: Option<&DenCache>,
+    subj: Option<&Matte>,
+) -> RgbaImage {
+    match d {
+        Decoded::Mosaic(m) => develop_mosaic(m, r, max_px, den, subj),
+        Decoded::Raster {
+            rgba, w, h, flip, ..
+        } => develop_raster(rgba, *w, *h, *flip, r, max_px, den, subj),
+    }
+}
+
+fn develop_mosaic(
+    m: &Mosaic,
+    r: &Recipe,
+    max_px: u32,
+    den: Option<&DenCache>,
+    subj: Option<&Matte>,
+) -> RgbaImage {
     // virtual stride: subsample to roughly fit max_px, keeping CFA phase
     let period = m.cfa.h.max(1);
     let mut stride = 1usize;
@@ -1880,27 +1968,54 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
         (pl, _) => pl,
     };
 
+    let mut lin = colorize_plane(
+        m,
+        stride,
+        &norm,
+        &p,
+        plane.as_deref(),
+        corr.as_ref(),
+        vw,
+        vh,
+    );
+    blend_denoise(&mut lin, vw, vh, r.ai_denoise, den);
+
+    finish_linear(lin, vw, vh, &p, m.info.flip, max_px, subj)
+}
+
+/// camera-plane -> WB -> camera->sRGB matrix. Shared by the render path and
+/// the AI-denoise pre-pass so both see the identical linear image.
+pub fn colorize_plane(
+    m: &Mosaic,
+    stride: usize,
+    norm: &[f32; 4],
+    p: &Params,
+    plane: Option<&[[f32; 3]]>,
+    corr: Option<&crate::lensdb::Correction>,
+    vw: usize,
+    vh: usize,
+) -> Vec<[f32; 3]> {
     let mut lin = vec![[0.0f32; 3]; vw * vh];
     for vy in 0..vh {
         for vx in 0..vw {
-            let cam = match &plane {
+            let cam = match plane {
                 Some(pl) => pl[vy * vw + vx],
-                None => match &corr {
+                None => match corr {
                     Some(c) => {
-                        let (sx, sy, g) = lens_map(c, vx, vy, vw, vh, r.lens_corr.min(1.0));
+                        let (sx, sy, g) = lens_map(c, vx, vy, vw, vh, p.lens_corr_amt);
                         let mut cc = demosaic_pixel(
                             m,
                             (sx.round() as usize).min(vw - 1),
                             (sy.round() as usize).min(vh - 1),
                             stride,
-                            &norm,
+                            norm,
                         );
                         for v in cc.iter_mut() {
                             *v *= g;
                         }
                         cc
                     }
-                    None => demosaic_pixel(m, vx, vy, stride, &norm),
+                    None => demosaic_pixel(m, vx, vy, stride, norm),
                 },
             };
             // WB in camera space, clip at sensor white -> neutral highlights
@@ -1916,8 +2031,56 @@ fn develop_mosaic(m: &Mosaic, r: &Recipe, max_px: u32) -> RgbaImage {
             lin[vy * vw + vx] = out;
         }
     }
+    lin
+}
 
-    finish_linear(lin, vw, vh, &p, m.info.flip, max_px)
+/// blend the AI-denoised base into the linear image. The cache stores the
+/// denoised lin-plane sRGB-encoded; it is sampled bilinear in normalized
+/// coordinates so it lines up at any preview stride.
+pub fn blend_denoise(
+    lin: &mut [[f32; 3]],
+    vw: usize,
+    vh: usize,
+    amount: f32,
+    den: Option<&DenCache>,
+) {
+    let (den, a) = match (den, amount) {
+        (Some(d), a) if a > 0.001 && d.data.len() >= d.w * d.h * 3 => (d, a.min(1.0)),
+        _ => return,
+    };
+    let (dw, dh) = (den.w as f32, den.h as f32);
+    for y in 0..vh {
+        let fy = ((y as f32 + 0.5) / vh as f32) * dh - 0.5;
+        let y0 = fy.floor().max(0.0).min(dh - 1.0) as usize;
+        let y1 = (y0 + 1).min(den.h - 1);
+        let ty = fy - y0 as f32;
+        for x in 0..vw {
+            let fx = ((x as f32 + 0.5) / vw as f32) * dw - 0.5;
+            let x0 = fx.floor().max(0.0).min(dw - 1.0) as usize;
+            let x1 = (x0 + 1).min(den.w - 1);
+            let tx = fx - x0 as f32;
+            let i = y * vw + x;
+            for c in 0..3 {
+                let s00 = srgb_of(den.data[(y0 * den.w + x0) * 3 + c]);
+                let s10 = srgb_of(den.data[(y0 * den.w + x1) * 3 + c]);
+                let s01 = srgb_of(den.data[(y1 * den.w + x0) * 3 + c]);
+                let s11 = srgb_of(den.data[(y1 * den.w + x1) * 3 + c]);
+                let d =
+                    (s00 * (1.0 - tx) + s10 * tx) * (1.0 - ty) + (s01 * (1.0 - tx) + s11 * tx) * ty;
+                lin[i][c] = lin[i][c] * (1.0 - a) + d * a;
+            }
+        }
+    }
+}
+
+#[inline]
+fn srgb_of(v: u16) -> f32 {
+    let s = v as f32 / 65535.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn develop_raster(
@@ -1927,6 +2090,8 @@ fn develop_raster(
     flip: i32,
     r: &Recipe,
     max_px: u32,
+    den: Option<&DenCache>,
+    subj: Option<&Matte>,
 ) -> RgbaImage {
     let fake = Mosaic {
         data: Vec::new(),
@@ -1992,7 +2157,8 @@ fn develop_raster(
             };
         }
     }
-    finish_linear(lin, w, h, &p, flip, max_px)
+    blend_denoise(&mut lin, w, h, r.ai_denoise, den);
+    finish_linear(lin, w, h, &p, flip, max_px, subj)
 }
 
 /// frame-pixel dims + crop rect + rotation pivot shared by CPU/GPU.
@@ -2241,6 +2407,7 @@ fn finish_linear(
     p: &Params,
     flip: i32,
     max_px: u32,
+    subj: Option<&Matte>,
 ) -> RgbaImage {
     // dehaze's atmosphere scalar is image-dependent: derive it on the actual
     // linear buffer so mosaic and raster paths share the estimate.
@@ -2320,7 +2487,7 @@ fn finish_linear(
             }
             // power windows: local ev/sat/temp inside the mask
             for win in p.wins.iter().take(p.n_wins as usize) {
-                let mut mask = window_mask(win, nx, ny, col) * win[10];
+                let mut mask = window_mask(win, nx, ny, col, subj) * win[10];
                 // link_q: gate the window by the HSL qualifier matte
                 if (win[0] as i32) & 8 != 0 {
                     mask *= qual_mask(col, p);
@@ -2446,14 +2613,17 @@ fn finish_linear(
 }
 
 /// power-window mask value at dst-normalized (nx,ny)
-/// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q, a,b,c,d, rot, soft, ev, sat, temp, strength]
+/// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q + 16=subject, a,b,c,d, rot, soft, ev, sat, temp, strength]
 /// `col` = the sampled pre-adjust colour (lum range + qualifier gating need it)
-fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3]) -> f32 {
+fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>) -> f32 {
     let base = w[0] as i32;
     let kind = base % 2;
     let inv = base & 2 != 0;
     let lum = base & 4 != 0;
-    let mask = if lum {
+    let mask = if base & 16 != 0 {
+        // AI subject matte: bilinear sample in normalized dst coords
+        subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if lum {
         // luminance range: p=[lo,hi,lo_feather,hi_feather] over display luma
         let l = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
         let (lo, hi) = (w[1], w[2]);
@@ -2486,6 +2656,27 @@ fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3]) -> f32 {
     } else {
         mask
     }
+}
+
+/// bilinear sample of the AI subject matte at normalized coords; 0 when empty
+fn matte_bil(m: &Matte, nx: f32, ny: f32) -> f32 {
+    if m.w < 2 || m.h < 2 || m.data.len() < m.w * m.h {
+        return 0.0;
+    }
+    let fx = nx * m.w as f32 - 0.5;
+    let fy = ny * m.h as f32 - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let at = |x: i32, y: i32| -> f32 {
+        let x = x.clamp(0, m.w as i32 - 1) as usize;
+        let y = y.clamp(0, m.h as i32 - 1) as usize;
+        m.data[y * m.w + x] as f32 / 65535.0
+    };
+    let a = at(x0, y0) * (1.0 - tx) + at(x0 + 1, y0) * tx;
+    let b = at(x0, y0 + 1) * (1.0 - tx) + at(x0 + 1, y0 + 1) * tx;
+    a * (1.0 - ty) + b * ty
 }
 
 /// single-channel bilinear sample (for CA-corrected per-channel taps)

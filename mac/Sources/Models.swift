@@ -267,6 +267,8 @@ struct Recipe: Codable, Equatable {
     var lens_corr: Double = 1
     // adjustment-brush layers (LR-style, up to 4 honoured by the engine)
     var brushes: [BrushLayer] = []
+    // AI denoise amount 0..1 — blends against the prepared denoise cache
+    var ai_denoise: Double = 0
 
 }
 
@@ -292,6 +294,7 @@ extension Recipe {
         case beauty, noise_chroma, dehaze, ca_fix, deband, glow, flare
         case zones_ev, wb_pick_size, lut_file, lut_amount, key_v, key_h
         case lens_corr, brushes
+        case ai_denoise
     }
 
     init(from decoder: Decoder) throws {
@@ -377,6 +380,7 @@ extension Recipe {
         key_v = opt(.key_v, Double.self) ?? 0
         key_h = opt(.key_h, Double.self) ?? 0
         lens_corr = opt(.lens_corr, Double.self) ?? 1
+        ai_denoise = opt(.ai_denoise, Double.self) ?? 0
         q_enabled = qh[1] > 0
     }
 }

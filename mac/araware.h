@@ -29,6 +29,7 @@ AraImage araware_render(void* e, const char* path, const char* recipe_json, uint
 AraImage araware_render_h(void* e, const char* path, const char* recipe_json, uint32_t max_px, AraHistogram* hist);
 AraImage araware_scopes(void* e, const char* path, const char* recipe_json, uint32_t max_px, uint32_t* wave, uint32_t* vec, uint32_t* cie, uint32_t* hist);
 AraImage araware_export(void* e, const char* path, const char* recipe_json);
+AraImage araware_export_opts(void* e, const char* path, const char* recipe_json, const char* opts_json);
 char* araware_metadata(void* e, const char* path);
 char* araware_sidecar_read(const char* path);
 int araware_sidecar_write(const char* path, const char* json);
@@ -40,5 +41,9 @@ int araware_set_label(void* e, const char* path, const char* label);
 AraImage araware_reference(const char* path);
 
 char* araware_auto_analyze(void* e, const char* path);
+char* araware_ai_denoise_prepare(void* e, const char* path, const char* recipe_json);
+char* araware_ai_denoise_ready(void* e, const char* path);
+char* araware_ai_subject_prepare(void* e, const char* path);
+char* araware_ai_subject_ready(void* e, const char* path);
 
 #endif

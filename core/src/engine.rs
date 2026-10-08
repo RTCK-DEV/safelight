@@ -40,6 +40,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Result<Engine> {
+        // Resolve the ORT dylib into ORT_DYLIB_PATH up front: `ort`'s
+        // load-dynamic fallback reads that env var, so every ort code path
+        // (including any that might run before ai::ort_ready) can dlopen it.
+        if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+            let lib = crate::ai::ai_dir().join("libonnxruntime.dylib");
+            if lib.exists() {
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib) };
+            }
+        }
         Ok(Engine {
             state: Mutex::new(State {
                 path: None,
@@ -77,11 +86,27 @@ impl Engine {
 
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
+        // AI-denoised base (SCUNet): only loaded when the recipe asks for it.
+        let den = if recipe.ai_denoise > 0.001 {
+            load_denoise_cache(path)
+        } else {
+            None
+        };
+        // AI subject matte (U-2-Net): only needed by 'subject' power windows.
+        let subj = if recipe
+            .windows
+            .iter()
+            .any(|w| w.kind == "subject" && w.enabled)
+        {
+            load_subject_cache(path)
+        } else {
+            None
+        };
         self.with_decoded(path, |d| {
             let mut gpu = self.gpu.lock().unwrap();
             if let (Decoded::Mosaic(m), Some(g)) = (d, gpu.as_ref()) {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    g.develop(m, recipe, max_px)
+                    g.develop(m, recipe, max_px, den.as_ref(), subj.as_ref())
                 }));
                 match r {
                     Ok(Ok(img)) => return Ok(img),
@@ -92,13 +117,104 @@ impl Engine {
                 *gpu = None;
             }
             drop(gpu);
-            Ok(develop::develop_cpu(d, recipe, max_px))
+            Ok(develop::develop_cpu_ctx(
+                d,
+                recipe,
+                max_px,
+                den.as_ref(),
+                subj.as_ref(),
+            ))
         })
     }
 
     /// export: full-res render (max_px = 0)
+    /// run the AI denoise pass on `path` and write the cache file next to it.
+    /// Returns the cache dims. Heavy: caller should run off the UI thread.
+    pub fn ai_denoise_prepare(&self, path: &Path, recipe: &Recipe) -> Result<(usize, usize)> {
+        // session first: CoreML graph compile must happen before the big
+        // buffers exist, or it gets jetsam-killed on large files
+        eprintln!("[aidn] ai prewarm");
+        crate::ai::prewarm()?;
+        eprintln!("[aidn] decoding");
+        let d = crate::decode::decode(path)?;
+        eprintln!("[aidn] lin_base");
+        let (lin, w, h) =
+            develop::lin_base(&d, recipe).map_err(|e| anyhow::anyhow!("lin_base: {e}"))?;
+        eprintln!("[aidn] lin ok {w}x{h}");
+        // lin -> sRGB f32 -> SCUNet tiles -> sRGB u8 cache JPEG
+        let mut flat: Vec<f32> = lin.iter().flat_map(|c| c.iter().copied()).collect();
+        drop(lin);
+        crate::ai::denoise_rgb(&mut flat, w, h)?; // leaves sRGB-encoded pixels
+        let pix: Vec<u8> = flat
+            .iter()
+            .map(|&s| (s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect();
+        let dst = crate::ai::denoise_cache_path(path);
+        eprintln!("[aidn] encode jpeg -> {dst:?}");
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_raw(w as u32, h as u32, pix)
+                .ok_or_else(|| anyhow::anyhow!("cache image alloc"))?;
+        let f = std::fs::File::create(&dst)?;
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(f, 92);
+        enc.encode_image(&img)
+            .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+        Ok((w, h))
+    }
+
+    /// whether a denoise cache exists (and is fresh) for this photo.
+    pub fn ai_denoise_ready(&self, path: &Path) -> bool {
+        load_denoise_cache(path).is_some()
+    }
+
+    /// run U-2-Net on a neutral preview and cache the subject matte as a
+    /// u16 PNG next to the photo. Much lighter than denoise (~seconds).
+    /// (u2net session is created lazily inside subject_mask — no prewarm.)
+    pub fn ai_subject_prepare(&self, path: &Path) -> Result<(usize, usize)> {
+        let img = self.render(path, &Recipe::default(), 1024)?;
+        let (w, h) = (img.width as usize, img.height as usize);
+        let rgb8: Vec<u8> = img
+            .data
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let matte = crate::ai::subject_mask(&rgb8, w, h)?;
+        let pix: Vec<u16> = matte
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16)
+            .collect();
+        let dst = crate::ai::subject_cache_path(path);
+        let img16: image::ImageBuffer<image::Luma<u16>, Vec<u16>> =
+            image::ImageBuffer::from_raw(w as u32, h as u32, pix)
+                .ok_or_else(|| anyhow::anyhow!("matte image alloc"))?;
+        img16
+            .save(&dst)
+            .map_err(|e| anyhow::anyhow!("matte save: {e}"))?;
+        Ok((w, h))
+    }
+
+    /// whether a subject-matte cache exists (and is fresh) for this photo.
+    pub fn ai_subject_ready(&self, path: &Path) -> bool {
+        load_subject_cache(path).is_some()
+    }
+
     pub fn export(&self, path: &Path, recipe: &Recipe) -> Result<RgbaImage> {
         self.render(path, recipe, 0)
+    }
+
+    /// Export with finishing options: `long_edge` (px, area-average
+    /// downscale) and `sharpen` (output unsharp 0..1 applied AFTER resize —
+    /// LR's "sharpen for screen/print" slot).
+    pub fn export_opts(&self, path: &Path, recipe: &Recipe, opts: &Value) -> Result<RgbaImage> {
+        let mut img = self.export(path, recipe)?;
+        let le = opts.get("long_edge").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if le > 0 && (img.width as usize > le || img.height as usize > le) {
+            img = resize_area(&img, le);
+        }
+        let sh = opts.get("sharpen").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        if sh > 0.001 {
+            unsharp_rgb(&mut img, sh);
+        }
+        Ok(img)
     }
 
     /// auto-correction analysis: neutral 512px render -> suggested recipe
@@ -248,13 +364,19 @@ impl Engine {
         let sp = sidecar_path_for(asset);
         if sp.exists() {
             crate::catalog::read_sidecar(&sp)
+        } else if let Some(sc) = crate::xmp::read_xmp(asset) {
+            // Lightroom/darktable XMP without our JSON: adopt its adjustments
+            Ok(sc)
         } else {
             Ok(Sidecar::default())
         }
     }
 
     pub fn write_sidecar(&self, asset: &Path, sc: &Sidecar) -> Result<()> {
-        crate::catalog::write_sidecar(&sidecar_path_for(asset), sc)
+        crate::catalog::write_sidecar(&sidecar_path_for(asset), sc)?;
+        // LR-readable mirror; best-effort (interoperability, not truth)
+        let _ = crate::xmp::write_xmp(asset, sc);
+        Ok(())
     }
 
     pub fn set_rating(&self, asset: &Path, rating: i32) -> Result<()> {
@@ -269,13 +391,21 @@ impl Engine {
         let sp = sidecar_path_for_v(asset, vslot);
         if sp.exists() {
             crate::catalog::read_sidecar(&sp)
+        } else if vslot == 0 {
+            // virtual copies are ours only; the master slot may fall back
+            // to a foreign .xmp (same rule as read_sidecar)
+            Ok(crate::xmp::read_xmp(asset).unwrap_or_default())
         } else {
             Ok(Sidecar::default())
         }
     }
 
     pub fn write_sidecar_v(&self, asset: &Path, vslot: u32, sc: &Sidecar) -> Result<()> {
-        crate::catalog::write_sidecar(&sidecar_path_for_v(asset, vslot), sc)
+        crate::catalog::write_sidecar(&sidecar_path_for_v(asset, vslot), sc)?;
+        if vslot == 0 {
+            let _ = crate::xmp::write_xmp(asset, sc);
+        }
+        Ok(())
     }
 
     /// JSON command surface for library organization — one FFI entry point
@@ -379,5 +509,137 @@ impl Engine {
             "assets" => Ok(json!(self.catalog.assets(&path()?)?)),
             _ => anyhow::bail!("unknown library op: {op}"),
         }
+    }
+}
+
+/// load a subject-matte cache file if it exists and is at least as new as
+/// the photo. Same freshness rule as the denoise cache.
+fn load_subject_cache(path: &Path) -> Option<develop::Matte> {
+    let cp = crate::ai::subject_cache_path(path);
+    let (pm, cm) = (
+        path.metadata().ok()?.modified().ok()?,
+        cp.metadata().ok()?.modified().ok()?,
+    );
+    if cm < pm {
+        return None;
+    }
+    let img = image::open(&cp).ok()?.to_luma16();
+    let (w, h) = img.dimensions();
+    Some(develop::Matte {
+        data: img.into_raw(),
+        w: w as usize,
+        h: h as usize,
+    })
+}
+
+/// load a denoise cache file if it exists and is at least as new as the photo.
+fn load_denoise_cache(path: &Path) -> Option<develop::DenCache> {
+    let cp = crate::ai::denoise_cache_path(path);
+    let (pm, cm) = (
+        path.metadata().ok()?.modified().ok()?,
+        cp.metadata().ok()?.modified().ok()?,
+    );
+    if cm < pm {
+        return None;
+    }
+    let img = image::open(&cp).ok()?.to_rgb16();
+    let (w, h) = img.dimensions();
+    Some(develop::DenCache {
+        data: img.into_raw(),
+        w: w as usize,
+        h: h as usize,
+    })
+}
+
+/// Area-average downscale so the long edge fits `long_edge` px — proper
+/// box filtering, no aliasing (vs plain bilinear which skips source pixels).
+fn resize_area(img: &RgbaImage, long_edge: usize) -> RgbaImage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let sc = long_edge as f64 / w.max(h) as f64;
+    let (nw, nh) = (
+        ((w as f64 * sc).round() as usize).max(1),
+        ((h as f64 * sc).round() as usize).max(1),
+    );
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        let sy0 = y * h / nh;
+        let sy1 = ((y + 1) * h / nh).max(sy0 + 1);
+        for x in 0..nw {
+            let sx0 = x * w / nw;
+            let sx1 = ((x + 1) * w / nw).max(sx0 + 1);
+            let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+            let n = ((sy1 - sy0) * (sx1 - sx0)) as u32;
+            for sy in sy0..sy1.min(h) {
+                for sx in sx0..sx1.min(w) {
+                    let i = (sy * w + sx) * 4;
+                    r += img.data[i] as u32;
+                    g += img.data[i + 1] as u32;
+                    b += img.data[i + 2] as u32;
+                    a += img.data[i + 3] as u32;
+                }
+            }
+            let o = (y * nw + x) * 4;
+            out[o] = (r / n) as u8;
+            out[o + 1] = (g / n) as u8;
+            out[o + 2] = (b / n) as u8;
+            out[o + 3] = (a / n) as u8;
+        }
+    }
+    RgbaImage {
+        width: nw as u32,
+        height: nh as u32,
+        data: out,
+    }
+}
+
+/// Output sharpening: separable [1,2,1]/4 gaussian + `amount` unsharp on RGB.
+/// Blur is stored as u8 (one extra w*h*3 buffer — precision loss is
+/// inaudible at output-sharpen amounts).
+fn unsharp_rgb(img: &mut RgbaImage, amount: f32) {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let src = &img.data;
+    let mut blur = vec![0u8; w * h * 3];
+    // horizontal pass
+    let mut tmp = vec![0u16; w * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let (xm, xp) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            for c in 0..3 {
+                let i = y * w * 4;
+                tmp[x * 3 + c] = (src[i + xm * 4 + c] as u16
+                    + 2 * src[i + x * 4 + c] as u16
+                    + src[i + xp * 4 + c] as u16)
+                    / 4;
+            }
+        }
+        for x in 0..w {
+            for c in 0..3 {
+                blur[(y * w + x) * 3 + c] = tmp[x * 3 + c] as u8;
+            }
+        }
+    }
+    // vertical pass (reuse tmp as the per-column accumulator)
+    let mut col = vec![0u16; h * 3];
+    for x in 0..w {
+        for y in 0..h {
+            let (ym, yp) = (y.saturating_sub(1), (y + 1).min(h - 1));
+            for c in 0..3 {
+                col[y * 3 + c] = (blur[(ym * w + x) * 3 + c] as u16
+                    + 2 * blur[(y * w + x) * 3 + c] as u16
+                    + blur[(yp * w + x) * 3 + c] as u16)
+                    / 4;
+            }
+        }
+        for y in 0..h {
+            for c in 0..3 {
+                blur[(y * w + x) * 3 + c] = col[y * 3 + c] as u8;
+            }
+        }
+    }
+    let img = &mut img.data;
+    for i in 0..w * h * 3 {
+        let o = (i / 3) * 4 + (i % 3);
+        let v = img[o] as f32 + amount * (img[o] as f32 - blur[i] as f32);
+        img[o] = v.round().clamp(0.0, 255.0) as u8;
     }
 }

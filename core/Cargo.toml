@@ -24,3 +24,5 @@ kamadak-exif = "0.5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 log = "0.4"
 roxmltree = "0.21.1"
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "coreml"] }
+ureq = "3"

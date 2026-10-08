@@ -188,6 +188,9 @@ struct Uni {
 @group(0) @binding(8) var<storage, read> tap_idx: array<vec2<u32>>;
 @group(0) @binding(9) var<storage, read> taps: array<vec2<i32>>;
 @group(0) @binding(10) var<storage, read> brushsegs: array<vec4<f32>>;
+// AI-denoised base cache: [0]=w, [1]=h, then 2 u32 per px (r|g<<16, b), sRGB16
+@group(0) @binding(11) var<storage, read> denbuf: array<u32>;
+@group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
 
 fn cfa_col(sx: u32, sy: u32) -> u32 {
     return cfa[(sy % u.g3.y) * u.g3.x + (sx % u.g3.x)];
@@ -651,11 +654,71 @@ fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
     } else {
         cam = demosaic(i % u.g1.x, i / u.g1.x);
     }
-    io_a[i] = vec4<f32>(wb_matrix(cam), 0.0);
+    var lin = wb_matrix(cam);
+    if (u.bmisc.z > 0.001 && denbuf[0] > 0u) {
+        let nx = (f32(i % u.g1.x) + 0.5) / f32(u.g1.x);
+        let ny = (f32(i / u.g1.x) + 0.5) / f32(u.g1.y);
+        lin = mix(lin, den_bil(nx, ny), min(u.bmisc.z, 1.0));
+    }
+    io_a[i] = vec4<f32>(lin, 0.0);
 }
 
 fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// AI denoise cache tap (clamped); sRGB16 -> linear
+fn den_at(ix: i32, iy: i32) -> vec3<f32> {
+    let w = i32(denbuf[0]);
+    let h = i32(denbuf[1]);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let base = 2u + 2u * (u32(y) * u32(w) + u32(x));
+    let rg = denbuf[base];
+    let b = denbuf[base + 1u];
+    return vec3<f32>(
+        srgb_decode(f32(rg & 0xffffu) / 65535.0),
+        srgb_decode(f32(rg >> 16u) / 65535.0),
+        srgb_decode(f32(b & 0xffffu) / 65535.0),
+    );
+}
+
+// bilinear sample of the denoise cache at a normalized position
+fn den_bil(nx: f32, ny: f32) -> vec3<f32> {
+    let fx = nx * f32(denbuf[0]) - 0.5;
+    let fy = ny * f32(denbuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(den_at(x0, y0), den_at(x0 + 1, y0), tx);
+    let b = mix(den_at(x0, y0 + 1), den_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
+// AI subject matte tap (clamped); u16 luma packed 2-per-u32 -> 0..1
+fn subj_at(ix: i32, iy: i32) -> f32 {
+    let w = i32(subjbuf[0]);
+    let h = i32(subjbuf[1]);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y) * u32(w) + u32(x);
+    let word = subjbuf[2u + idx / 2u];
+    let v = select(word & 0xffffu, word >> 16u, (idx & 1u) != 0u);
+    return f32(v) / 65535.0;
+}
+
+// bilinear sample of the subject matte at a normalized position
+fn subj_bil(nx: f32, ny: f32) -> f32 {
+    let fx = nx * f32(subjbuf[0]) - 0.5;
+    let fy = ny * f32(subjbuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(subj_at(x0, y0), subj_at(x0 + 1, y0), tx);
+    let b = mix(subj_at(x0, y0 + 1), subj_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
 }
 
 // chroma smoothing: blur R/B residuals vs luma
@@ -1308,7 +1371,10 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let kb = u32(w2.y);
         let kind = kb & 1u;
         var mask = 0.0;
-        if ((kb & 4u) != 0u) {
+        if ((kb & 16u) != 0u) {
+            // AI subject matte: bilinear sample (empty buffer -> 0)
+            mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+        } else if ((kb & 4u) != 0u) {
             // luminance range over the pre-adjust sample: p=[lo,hi,lof,hif]
             let l = luma(col);
             let lf = max(w0.z, 0.005);
@@ -1510,7 +1576,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..11)
+                entries: &(0..13)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -1564,7 +1630,14 @@ impl Gpu {
     }
 
     /// mosaic -> developed rgba8 (fit inside max_px, 0 = full res)
-    pub fn develop(&self, m: &Mosaic, r: &Recipe, max_px: u32) -> Result<RgbaImage> {
+    pub fn develop(
+        &self,
+        m: &Mosaic,
+        r: &Recipe,
+        max_px: u32,
+        den: Option<&crate::develop::DenCache>,
+        subj: Option<&crate::develop::Matte>,
+    ) -> Result<RgbaImage> {
         use wgpu::BufferUsages as U;
         let dev = &self.device;
         let period = m.cfa.h.max(1) as u32;
@@ -1838,7 +1911,7 @@ impl Gpu {
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
             lens3: [0.0, 0.0, 0.0, if corr.is_some() { lens_amt } else { 0.0 }],
             blayers: p.brush_layers,
-            bmisc: p.brush_misc,
+            bmisc: [p.brush_misc[0], p.brush_misc[1], r.ai_denoise.min(1.0), 0.0],
             bstr: {
                 let mut a = [[0.0f32; 4]; 192];
                 for (i, s) in p.brush_strokes.iter().take(192).enumerate() {
@@ -1860,8 +1933,41 @@ impl Gpu {
         };
         let brush_b = mk_buf("brushsegs", bytemuck::cast_slice(&segs32), storage_in);
 
+        // AI-denoise cache: packed [w, h, rg, b, rg, b, ...]; empty = [0,0]
+        let den32: Vec<u32> = match den {
+            Some(d) if d.data.len() >= d.w * d.h * 3 => {
+                let mut v = Vec::with_capacity(2 + d.w * d.h * 2);
+                v.push(d.w as u32);
+                v.push(d.h as u32);
+                for px in d.data[..d.w * d.h * 3].chunks_exact(3) {
+                    v.push(px[0] as u32 | ((px[1] as u32) << 16));
+                    v.push(px[2] as u32);
+                }
+                v
+            }
+            _ => vec![0u32, 0u32],
+        };
+        let den_b = mk_buf("denbuf", bytemuck::cast_slice(&den32), storage_in);
+
+        // AI subject matte: packed [w, h, u16x2, ...]; empty = [0,0]
+        let subj32: Vec<u32> = match subj {
+            Some(s) if s.data.len() >= s.w * s.h => {
+                let mut v = Vec::with_capacity(2 + s.w * s.h / 2 + 1);
+                v.push(s.w as u32);
+                v.push(s.h as u32);
+                for px in s.data[..s.w * s.h].chunks(2) {
+                    let lo = px[0] as u32;
+                    let hi = px.get(1).copied().unwrap_or(0) as u32;
+                    v.push(lo | (hi << 16));
+                }
+                v
+            }
+            _ => vec![0u32, 0u32],
+        };
+        let subj_b = mk_buf("subjbuf", bytemuck::cast_slice(&subj32), storage_in);
+
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            let entries: Vec<wgpu::BindGroupEntry> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
                 .iter()
                 .map(|&i| wgpu::BindGroupEntry {
                     binding: i,
@@ -1876,7 +1982,9 @@ impl Gpu {
                         7 => stats_b.as_entire_binding(),
                         8 => idx_b.as_entire_binding(),
                         9 => tap_b.as_entire_binding(),
-                        _ => brush_b.as_entire_binding(),
+                        10 => brush_b.as_entire_binding(),
+                        11 => den_b.as_entire_binding(),
+                        _ => subj_b.as_entire_binding(),
                     },
                 })
                 .collect();

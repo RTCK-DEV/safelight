@@ -175,6 +175,11 @@ pub struct Recipe {
     /// inside the stroked mask. Up to 4 layers are honoured.
     #[serde(default)]
     pub brushes: Vec<BrushLayer>,
+    /// AI denoise blend 0..1 (SCUNet real-world denoise). The denoised
+    /// base is produced once by `araware_ai_denoise_prepare` and cached in
+    /// `<photo>.araware.aidn.png`; this field just blends it in.
+    #[serde(default)]
+    pub ai_denoise: f32,
 }
 
 /// one painted stroke inside a brush layer.
@@ -363,6 +368,7 @@ impl Default for Recipe {
             key_h: 0.0,
             lens_corr: 1.0,
             brushes: Vec::new(),
+            ai_denoise: 0.0,
         }
     }
 }

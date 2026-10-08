@@ -248,6 +248,40 @@ pub unsafe extern "C" fn araware_export(
     araware_render(e, path, recipe_json, 0)
 }
 
+/// export with finishing options `opts_json`: {"long_edge": px, "sharpen": 0..1}
+#[no_mangle]
+pub unsafe extern "C" fn araware_export_opts(
+    e: *mut c_void,
+    path: *const c_char,
+    recipe_json: *const c_char,
+    opts_json: *const c_char,
+) -> AraImage {
+    let Some(eng) = engine(e) else {
+        return AraImage {
+            data: std::ptr::null_mut(),
+            len: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+    let recipe: crate::recipe::Recipe =
+        serde_json::from_str(&cstr(recipe_json)).unwrap_or_default();
+    let opts: serde_json::Value =
+        serde_json::from_str(&cstr(opts_json)).unwrap_or(serde_json::json!({}));
+    match eng.export_opts(std::path::Path::new(&cstr(path)), &recipe, &opts) {
+        Ok(img) => into_raw_image(img),
+        Err(err) => {
+            set_err(&err);
+            AraImage {
+                data: std::ptr::null_mut(),
+                len: 0,
+                width: 0,
+                height: 0,
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn araware_metadata(e: *mut c_void, path: *const c_char) -> *mut c_char {
     let Some(eng) = engine(e) else {
@@ -270,7 +304,7 @@ pub unsafe extern "C" fn araware_sidecar_read(path: *const c_char) -> *mut c_cha
     let sc = if sp.exists() {
         crate::catalog::read_sidecar(&sp).unwrap_or_default()
     } else {
-        Sidecar::default()
+        crate::xmp::read_xmp(p).unwrap_or_default()
     };
     into_raw_string(serde_json::to_string(&sc).unwrap_or_else(|_| "{}".into()))
 }
@@ -288,7 +322,10 @@ pub unsafe extern "C" fn araware_sidecar_write(path: *const c_char, json: *const
         }
     };
     match crate::catalog::write_sidecar(&crate::recipe::sidecar_path_for(p), &sc) {
-        Ok(()) => 0,
+        Ok(()) => {
+            let _ = crate::xmp::write_xmp(p, &sc);
+            0
+        }
         Err(err) => {
             set_err(&err);
             -2
@@ -336,6 +373,8 @@ pub unsafe extern "C" fn araware_sidecar_read_v(path: *const c_char, vslot: i32)
     let sp = crate::recipe::sidecar_path_for_v(p, vslot.max(0) as u32);
     let sc = if sp.exists() {
         crate::catalog::read_sidecar(&sp).unwrap_or_default()
+    } else if vslot <= 0 {
+        crate::xmp::read_xmp(p).unwrap_or_default()
     } else {
         Sidecar::default()
     };
@@ -361,7 +400,12 @@ pub unsafe extern "C" fn araware_sidecar_write_v(
         &crate::recipe::sidecar_path_for_v(p, vslot.max(0) as u32),
         &sc,
     ) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if vslot <= 0 {
+                let _ = crate::xmp::write_xmp(p, &sc);
+            }
+            0
+        }
         Err(err) => {
             set_err(&err);
             -2
@@ -433,4 +477,79 @@ pub unsafe extern "C" fn araware_reference(path: *const c_char) -> AraImage {
             null_image()
         }
     }
+}
+
+/// run the AI denoise pre-pass for `path` using `recipe_json` settings
+/// (WB/lens_corr are baked into the denoised base). Blocking; heavy.
+/// Returns JSON {ok, w, h, ms} or {ok:false, error}.
+#[no_mangle]
+pub unsafe extern "C" fn araware_ai_denoise_prepare(
+    e: *mut c_void,
+    path: *const c_char,
+    recipe_json: *const c_char,
+) -> *mut c_char {
+    let Some(eng) = engine(e) else {
+        return into_raw_string(r#"{"ok":false,"error":"no engine"}"#.to_string());
+    };
+    let p = cstr(path);
+    let recipe = cstr(recipe_json);
+    let recipe = if recipe.is_empty() {
+        Recipe::default()
+    } else {
+        Recipe::from_json(&recipe).unwrap_or_default()
+    };
+    let t0 = std::time::Instant::now();
+    let out = match eng.ai_denoise_prepare(std::path::Path::new(&p), &recipe) {
+        Ok((w, h)) => {
+            serde_json::json!({"ok": true, "w": w, "h": h, "ms": t0.elapsed().as_millis() as u64})
+        }
+        Err(err) => serde_json::json!({"ok": false, "error": format!("{err:#}")}),
+    };
+    into_raw_string(out.to_string())
+}
+
+/// JSON {ready: bool}: whether a fresh denoise cache exists for `path`.
+#[no_mangle]
+pub unsafe extern "C" fn araware_ai_denoise_ready(
+    e: *mut c_void,
+    path: *const c_char,
+) -> *mut c_char {
+    let Some(eng) = engine(e) else {
+        return into_raw_string(r#"{"ready":false}"#.to_string());
+    };
+    let ok = eng.ai_denoise_ready(std::path::Path::new(&cstr(path)));
+    into_raw_string(format!("{{\"ready\":{ok}}}"))
+}
+
+/// run the U-2-Net subject-mask pre-pass for `path` (seconds, CPU or
+/// CoreML). Returns JSON {ok, w, h, ms} or {ok:false, error}.
+#[no_mangle]
+pub unsafe extern "C" fn araware_ai_subject_prepare(
+    e: *mut c_void,
+    path: *const c_char,
+) -> *mut c_char {
+    let Some(eng) = engine(e) else {
+        return into_raw_string(r#"{"ok":false,"error":"no engine"}"#.to_string());
+    };
+    let t0 = std::time::Instant::now();
+    let out = match eng.ai_subject_prepare(std::path::Path::new(&cstr(path))) {
+        Ok((w, h)) => {
+            serde_json::json!({"ok": true, "w": w, "h": h, "ms": t0.elapsed().as_millis() as u64})
+        }
+        Err(err) => serde_json::json!({"ok": false, "error": format!("{err:#}")}),
+    };
+    into_raw_string(out.to_string())
+}
+
+/// JSON {ready: bool}: whether a fresh subject-matte cache exists for `path`.
+#[no_mangle]
+pub unsafe extern "C" fn araware_ai_subject_ready(
+    e: *mut c_void,
+    path: *const c_char,
+) -> *mut c_char {
+    let Some(eng) = engine(e) else {
+        return into_raw_string(r#"{"ready":false}"#.to_string());
+    };
+    let ok = eng.ai_subject_ready(std::path::Path::new(&cstr(path)));
+    into_raw_string(format!("{{\"ready\":{ok}}}"))
 }

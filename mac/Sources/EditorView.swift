@@ -165,6 +165,17 @@ struct EditorView: View {
     @State private var showInspector = true
     @State private var showStrip = true
     @State private var autoBusy = false
+    @State private var aidnBusy = false
+    @State private var aidnReady = false
+    @State private var aidnInfo = ""
+    @State private var subjBusy = false
+    @State private var subjReady = false
+    @State private var showExportSheet = false
+    @State private var expFormat = "JPEG"
+    @State private var expQuality: Double = 0.92
+    @State private var expResize = false
+    @State private var expLongEdge: Double = 2048
+    @State private var expSharpen: Double = 0.25
 
     /// letterboxed image rect inside the preview area (zoom/pan applied)
     private func imageRect(in size: CGSize) -> CGRect {
@@ -256,6 +267,7 @@ struct EditorView: View {
         }
         .background(Ara.bg0)
         .background(shortcutLayer)
+        .sheet(isPresented: $showExportSheet) { exportSheet }
         .task { load() }
         .onChange(of: recipe) { old, new in
             dirty = (new != baseline) || versions != baselineVersions
@@ -1311,6 +1323,13 @@ struct EditorView: View {
                         selWindow = w.id
                     }
                     .help("Luminance-range mask: selects a band of the image by brightness")
+                    ToolChip(label: "Subj", icon: "person.crop.square", active: subjBusy) {
+                        runSubjectMask()
+                    }
+                    .help(subjReady
+                          ? "Add an AI subject mask window (U-2-Net matte is prepared)"
+                          : "Run AI subject detection (seconds), then add a mask window")
+                    .opacity(subjBusy ? 0.5 : 1)
                 }
             }) {
                 if recipe.windows.isEmpty {
@@ -1464,6 +1483,33 @@ struct EditorView: View {
                 SliderRow("Deband", $recipe.deband, 0...1)
                 SliderRow("CA Fix", $recipe.ca_fix, 0...1)
                 SliderRow("Beauty", $recipe.beauty, 0...1)
+            }
+            Panel("AI Denoise", trailing: {
+                ToolChip(label: aidnReady ? "Redo" : "Prepare",
+                         icon: "brain",
+                         active: aidnBusy) { runAiDenoise() }
+                    .help("Run the SCUNet denoise model on this photo (several minutes on CPU), then blend it in with Amount")
+                    .opacity(aidnBusy ? 0.5 : 1)
+            }) {
+                HStack(spacing: 8) {
+                    SliderRow("Amount", $recipe.ai_denoise, 0...1)
+                        .opacity(aidnReady ? 1 : 0.4)
+                }
+                .disabled(!aidnReady)
+                HStack(spacing: 6) {
+                    if aidnBusy {
+                        ProgressView().controlSize(.small)
+                        Text("Preparing (several minutes on CPU)…")
+                    } else if aidnReady {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Ara.accent)
+                        Text(aidnInfo.isEmpty ? "Denoised base ready" : aidnInfo)
+                    } else {
+                        Text("Runs the neural denoise once and caches the result next to the photo")
+                    }
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(Ara.text3)
             }
         }
     }
@@ -1780,14 +1826,78 @@ struct EditorView: View {
         lensProfile = ""
         liveFrame = []
         selBrush = 0
+        aidnBusy = false
+        aidnReady = false
+        aidnInfo = ""
+        subjBusy = false
+        subjReady = false
         Task {
             let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
             if let d = meta.data(using: .utf8),
                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
                 lensProfile = (j["lens_profile"] as? String) ?? ""
             }
+            aidnReady = await AraEngine.shared.work { $0.aiDenoiseReady(path: photo.path) }
+            subjReady = await AraEngine.shared.work { $0.aiSubjectReady(path: photo.path) }
         }
         rerender()
+    }
+
+    /// U-2-Net subject matte (engine src/ai.rs): prepares the mask PNG once,
+    /// then adds a 'subject' power window carrying ev/sat/temp.
+    private func runSubjectMask() {
+        guard !subjBusy else { return }
+        let p = photo.path
+        // matte already cached: just add the window
+        if subjReady {
+            addSubjectWindow()
+            return
+        }
+        subjBusy = true
+        Task {
+            let res = await AraEngine.shared.work { $0.aiSubjectPrepare(path: p) }
+            subjBusy = false
+            if res.ok {
+                subjReady = true
+                status = String(format: "Subject matte ready (%.1fs)", Double(res.ms) / 1000.0)
+                addSubjectWindow()
+            } else {
+                status = "Subject detect failed: \(res.error)"
+            }
+        }
+    }
+
+    private func addSubjectWindow() {
+        var w = PowerWindow()
+        w.kind = "subject"
+        w.p = [0, 0, 0, 0, 0, 0]
+        w.ev = 0.6   // sensible starting lift so the mask is visible
+        recipe.windows.append(w)
+        selWindow = w.id
+        status = "Subject window added — tweak EV/Sat/Temp"
+    }
+
+    /// SCUNet denoise pre-pass (engine src/ai.rs): bakes `<photo>.araware.aidn.jpg`
+    /// from the current recipe's linear base, then the Amount slider blends it.
+    private func runAiDenoise() {
+        guard !aidnBusy else { return }
+        aidnBusy = true
+        let p = photo.path
+        let r = recipe
+        Task {
+            let res = await AraEngine.shared.work { $0.aiDenoisePrepare(path: p, recipe: r) }
+            aidnBusy = false
+            if res.ok {
+                aidnReady = true
+                aidnInfo = String(format: "Denoised %dx%d in %.1f min", res.w, res.h, Double(res.ms) / 60000.0)
+                status = "AI denoise ready"
+                if recipe.ai_denoise == 0 { recipe.ai_denoise = 0.5 }
+            } else {
+                aidnInfo = ""
+                status = "AI denoise failed: \(res.error)"
+            }
+            rerender()
+        }
     }
 
     private func save() {
@@ -2205,29 +2315,80 @@ struct EditorView: View {
     }
 
     private func export() {
+        showExportSheet = true
+    }
+
+    /// run the export after the settings sheet picked format/resize/sharpen
+    private func runExport() {
+        let uti: UTType = expFormat == "PNG" ? .png : expFormat == "TIFF" ? .tiff : .jpeg
+        let ext = expFormat == "PNG" ? "png" : expFormat == "TIFF" ? "tiff" : "jpg"
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.jpeg]
+        panel.allowedContentTypes = [uti]
         panel.nameFieldStringValue = photo.name.replacingOccurrences(
             of: "." + (photo.name.split(separator: ".").last.map(String.init) ?? ""),
-            with: ".jpg")
+            with: ".\(ext)")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         rendering = true
         status = "Exporting…"
         let r = recipe
+        let opts: [String: Any] = [
+            "long_edge": expResize ? Int(expLongEdge) : 0,
+            "sharpen": expSharpen,
+        ]
+        let qual = expQuality
         Task.detached { [path = photo.path] in
-            let img = await AraEngine.shared.work { $0.export(path: path, recipe: r) }
+            let img = await AraEngine.shared.work { $0.exportOpts(path: path, recipe: r, opts: opts) }
             await MainActor.run {
                 rendering = false
                 guard let img,
-                      let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+                      let dest = CGImageDestinationCreateWithURL(url as CFURL, uti.identifier as CFString, 1, nil)
                 else {
                     status = "Export failed: \(AraEngine.shared.lastError)"
                     return
                 }
-                CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
+                var props: [CFString: Any] = [:]
+                if uti == .jpeg { props[kCGImageDestinationLossyCompressionQuality] = qual }
+                CGImageDestinationAddImage(dest, img, props as CFDictionary)
                 status = CGImageDestinationFinalize(dest) ? "Exported \(url.lastPathComponent)" : "Export failed"
             }
         }
+    }
+
+    /// LR-style export settings: format, resize, output sharpening.
+    private var exportSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Export").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ara.text1)
+            HStack(spacing: 8) {
+                Text("Format").font(.system(size: 10.5)).foregroundStyle(Ara.text2).frame(width: 78, alignment: .leading)
+                SegPicker([("JPEG", "JPEG"), ("PNG", "PNG"), ("TIFF", "TIFF")],
+                          selection: $expFormat)
+            }
+            if expFormat == "JPEG" {
+                SliderRow("Quality", $expQuality, 0.5...1, reset: 0.92)
+            }
+            HStack(spacing: 8) {
+                Toggle("", isOn: $expResize).labelsHidden().controlSize(.mini).tint(Ara.accent)
+                Text("Resize to long edge").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                Spacer()
+                TextField("", value: $expLongEdge, format: .number)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 10.5))
+                    .frame(width: 72).disabled(!expResize)
+                Text("px").font(.system(size: 10)).foregroundStyle(Ara.text3)
+            }
+            SliderRow("Sharpen", $expSharpen, 0...1)
+            Text("Output sharpening is applied after resize.").font(.system(size: 9)).foregroundStyle(Ara.text3)
+            HStack {
+                Spacer()
+                Button("Cancel") { showExportSheet = false }.buttonStyle(AraSecondaryButton())
+                Button("Export…") {
+                    showExportSheet = false
+                    runExport()
+                }.buttonStyle(AraPrimaryButton())
+            }
+        }
+        .padding(16)
+        .frame(width: 320)
+        .background(Ara.bg1)
     }
 }
 
@@ -3189,10 +3350,12 @@ struct WindowRow: View {
         VStack(spacing: 5) {
             HStack {
                 Image(systemName: w.kind == "gradient" ? "rectangle.lefthalf.filled"
-                        : w.kind == "lum" ? "circle.lefthalf.filled" : "circle")
+                        : w.kind == "lum" ? "circle.lefthalf.filled"
+                        : w.kind == "subject" ? "person.crop.square" : "circle")
                     .font(.system(size: 9))
                     .foregroundStyle(selected ? Ara.accent : .cyan)
-                Text(w.kind == "gradient" ? "Gradient" : w.kind == "lum" ? "Lum Range" : "Circle")
+                Text(w.kind == "gradient" ? "Gradient" : w.kind == "lum" ? "Lum Range"
+                        : w.kind == "subject" ? "Subject" : "Circle")
                     .font(.system(size: 10.5, weight: .medium)).foregroundStyle(Ara.text1)
                 Spacer()
                 // on/off eye (DaVinci per-window visibility)
@@ -3220,6 +3383,8 @@ struct WindowRow: View {
                 SliderRow("Hi", $w.p[1], 0...1, reset: 0.6)
                 SliderRow("Lo Feather", $w.p[2], 0.01...0.4, reset: 0.1)
                 SliderRow("Hi Feather", $w.p[3], 0.01...0.4, reset: 0.1)
+            } else if w.kind == "subject" {
+                EmptyView()
             } else {
                 if w.kind == "circle" {
                     SliderRow("Size", $w.p[2], 0.02...0.6, reset: 0.15)

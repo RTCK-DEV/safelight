@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     if args.len() < 3 {
         eprintln!(
             "usage:
-  araware-cli render <raw> <out.png> [recipe.json] [max_px]
+  araware-cli render <raw>| aidn <raw>| aisub <raw> <out.png> [recipe.json] [max_px]
   araware-cli thumb <raw> <out.png> [max_px]
   araware-cli reference <raw> <out.png>
   araware-cli scan <folder>
@@ -29,8 +29,8 @@ fn main() -> Result<()> {
             // render with the wrong settings and look like success
             let recipe = match args.get(4) {
                 Some(p) => {
-                    let s = std::fs::read_to_string(p)
-                        .with_context(|| format!("read recipe {p}"))?;
+                    let s =
+                        std::fs::read_to_string(p).with_context(|| format!("read recipe {p}"))?;
                     Recipe::from_json(&s)
                         .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
                 }
@@ -39,12 +39,7 @@ fn main() -> Result<()> {
             let max_px: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
             let t = std::time::Instant::now();
             let img = eng.render(path, &recipe, max_px)?;
-            eprintln!(
-                "render {}x{} in {:?}",
-                img.width,
-                img.height,
-                t.elapsed()
-            );
+            eprintln!("render {}x{} in {:?}", img.width, img.height, t.elapsed());
             image::save_buffer(
                 out,
                 &img.data,
@@ -84,6 +79,44 @@ fn main() -> Result<()> {
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        "aidn" => {
+            let path = Path::new(&args[2]);
+            let recipe = args
+                .get(3)
+                .map(|r| Recipe::from_json(r).unwrap_or_default())
+                .unwrap_or_default();
+            let t = std::time::Instant::now();
+            let (w, h) = eng.ai_denoise_prepare(path, &recipe)?;
+            println!(
+                "denoise cache {}x{} in {:?} -> {:?}",
+                w,
+                h,
+                t.elapsed(),
+                araware_core::ai::denoise_cache_path(path)
+            );
+            // skip static teardown: onnxruntime's C++ globals crash on exit
+            // ("mutex lock failed") — _exit bypasses atexit handlers entirely.
+            unsafe extern "C" {
+                fn _exit(code: i32) -> !;
+            }
+            unsafe { _exit(0) };
+        }
+        "aisub" => {
+            let path = Path::new(&args[2]);
+            let t = std::time::Instant::now();
+            let (w, h) = eng.ai_subject_prepare(path)?;
+            println!(
+                "subject matte {}x{} in {:?} -> {:?}",
+                w,
+                h,
+                t.elapsed(),
+                araware_core::ai::subject_cache_path(path)
+            );
+            unsafe extern "C" {
+                fn _exit(code: i32) -> !;
+            }
+            unsafe { _exit(0) };
         }
         "auto" => {
             let r = eng.auto_analyze(Path::new(&args[2]))?;

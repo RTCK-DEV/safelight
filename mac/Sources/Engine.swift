@@ -126,6 +126,18 @@ final class AraEngine: @unchecked Sendable {
         return cgImage(js.withCString { r in path.withCString { araware_export(handle, $0, r) } })
     }
 
+    /// export with finishing opts (long_edge px, output sharpen 0..1)
+    func exportOpts(path: String, recipe: Recipe, opts: [String: Any]) -> CGImage? {
+        guard let js = (try? JSONEncoder().encode(recipe)).flatMap({ String(data: $0, encoding: .utf8) }),
+              let oj = try? JSONSerialization.data(withJSONObject: opts),
+              let os = String(data: oj, encoding: .utf8) else { return nil }
+        return cgImage(js.withCString { r in
+            path.withCString { p in
+                os.withCString { o in araware_export_opts(handle, p, r, o) }
+            }
+        })
+    }
+
     func metadata(path: String) -> String {
         takeString(path.withCString { araware_metadata(handle, $0) }) ?? ""
     }
@@ -137,6 +149,52 @@ final class AraEngine: @unchecked Sendable {
               let data = js.data(using: .utf8)
         else { return nil }
         return try? JSONDecoder().decode(AutoSuggestion.self, from: data)
+    }
+
+    /// Bake the SCUNet-denoised linear base to `<photo>.araware.aidn.jpg`.
+    /// Minutes on CPU — always call via `work`.
+    func aiDenoisePrepare(path: String, recipe: Recipe)
+        -> (ok: Bool, w: Int, h: Int, ms: Int, error: String)
+    {
+        struct R: Decodable { var ok: Bool; var w: Int?; var h: Int?; var ms: Int?; var error: String? }
+        let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        guard let out = takeString(path.withCString { p in
+            js.withCString { araware_ai_denoise_prepare(handle, p, $0) }
+        }), let data = out.data(using: .utf8),
+              let r = try? JSONDecoder().decode(R.self, from: data)
+        else { return (false, 0, 0, 0, "call failed") }
+        return (r.ok, r.w ?? 0, r.h ?? 0, r.ms ?? 0, r.error ?? "")
+    }
+
+    /// Whether a fresh denoise cache exists for `path`.
+    func aiDenoiseReady(path: String) -> Bool {
+        struct R: Decodable { var ready: Bool }
+        guard let out = takeString(path.withCString { araware_ai_denoise_ready(handle, $0) }),
+              let data = out.data(using: .utf8),
+              let r = try? JSONDecoder().decode(R.self, from: data)
+        else { return false }
+        return r.ready
+    }
+
+    /// Run U-2-Net salient-subject detection and cache the matte next to the
+    /// photo (a few seconds — much lighter than the denoise pass).
+    func aiSubjectPrepare(path: String) -> (ok: Bool, w: Int, h: Int, ms: Int, error: String) {
+        struct R: Decodable { var ok: Bool; var w: Int?; var h: Int?; var ms: Int?; var error: String? }
+        guard let out = takeString(path.withCString { araware_ai_subject_prepare(handle, $0) }),
+              let data = out.data(using: .utf8),
+              let r = try? JSONDecoder().decode(R.self, from: data)
+        else { return (false, 0, 0, 0, "call failed") }
+        return (r.ok, r.w ?? 0, r.h ?? 0, r.ms ?? 0, r.error ?? "")
+    }
+
+    /// Whether a fresh subject-matte cache exists for `path`.
+    func aiSubjectReady(path: String) -> Bool {
+        struct R: Decodable { var ready: Bool }
+        guard let out = takeString(path.withCString { araware_ai_subject_ready(handle, $0) }),
+              let data = out.data(using: .utf8),
+              let r = try? JSONDecoder().decode(R.self, from: data)
+        else { return false }
+        return r.ready
     }
 
     func sidecar(path: String, vslot: Int = 0) -> Sidecar {
