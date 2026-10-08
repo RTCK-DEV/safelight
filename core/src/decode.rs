@@ -532,7 +532,11 @@ fn process8(h: &RawHandle) -> Result<Decoded> {
 }
 
 fn decode_raster(path: &Path) -> Result<Decoded> {
-    let img = image::open(path).with_context(|| format!("open {}", path.display()))?;
+    // sniff content, not extension: .insp stills are dual-lens JPEGs and
+    // image::open's format guess rejects unknown extensions outright
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let img = image::load_from_memory(&bytes)
+        .with_context(|| format!("decode {}", path.display()))?;
     // keep 16-bit sources at full depth (to_rgba16 expands 8-bit inputs
     // identically to the old (v<<8)|v path)
     let rgba16 = img.to_rgba16();

@@ -45,7 +45,7 @@ swiftc -O \
   -L "$LIBRAW_PREFIX/lib" -lraw \
   -lc++ \
   -framework Foundation -framework AppKit -framework SwiftUI \
-  -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
+  -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework SceneKit \
   -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
   -Xlinker -rpath -Xlinker "$LIBRAW_PREFIX/lib"
 

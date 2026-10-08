@@ -158,6 +158,16 @@ struct EditorView: View {
     // adjust the EV band under the cursor
     @State private var zoneImgMode = false
     @State private var zoneHover: Int? = nil
+    // 360° viewer (PanoView): equirect pano — Insta360 .insp, DJI Osmo 360
+    // and other GPano 2:1 stills
+    @State private var panoMode = false
+    /// equirect-candidate: .insp by extension, or a 2:1 developed frame
+    private var panoLike: Bool {
+        if photo.name.lowercased().hasSuffix(".insp") { return true }
+        guard let image else { return false }
+        let a = Double(image.width) / Double(image.height)
+        return a > 1.985 && a < 2.015
+    }
     // scope-as-control drag state
     @State private var scopeDragBase: Double? = nil
     @State private var scopeTapTime = Date.distantPast
@@ -328,6 +338,36 @@ struct EditorView: View {
                     Ara.bg0
                     if let image {
                         let rect = imageRect(in: geo.size)
+                        if panoMode && panoLike {
+                            // 360° viewer: developed image mapped onto a sphere
+                            ZStack {
+                                PanoView(image: image)
+                                    .frame(width: rect.width, height: rect.height)
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                                    .position(x: rect.midX, y: rect.midY)
+                                    .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
+                                Rectangle()
+                                    .stroke(Ara.border, lineWidth: 0.5)
+                                    .frame(width: rect.width, height: rect.height)
+                                    .position(x: rect.midX, y: rect.midY)
+                                    .allowsHitTesting(false)
+                                Text("360°")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .tracking(1.5)
+                                    .padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(Capsule().fill(Ara.accent))
+                                    .foregroundStyle(Color.black.opacity(0.85))
+                                    .position(x: rect.minX + 34, y: rect.minY + 16)
+                                    .allowsHitTesting(false)
+                                Text("drag to look · pinch to zoom · double-click to reset")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Ara.text2)
+                                    .padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(Capsule().fill(.black.opacity(0.55)))
+                                    .position(x: rect.midX, y: rect.maxY - 14)
+                                    .allowsHitTesting(false)
+                            }
+                        } else {
                         // compare modes: baseline underneath (or alone)
                         if cmp != .off && cmp != .before {
                             if let baselineImg {
@@ -399,6 +439,7 @@ struct EditorView: View {
                             // pinned to the stage edge — the image rect grows
                             // past the viewport once zoomed in
                             .position(x: geo.size.width - 96, y: geo.size.height - 24)
+                        }
                     } else {
                         ProgressView()
                             .tint(Ara.accent)
@@ -413,6 +454,12 @@ struct EditorView: View {
                             withAnimation(.easeInOut(duration: 0.15)) { showInspector.toggle() }
                         }
                         .help("Inspector")
+                        if panoLike {
+                            IconAction(icon: "globe", active: panoMode) {
+                                panoMode.toggle()
+                            }
+                            .help("360° viewer")
+                        }
                     }
                     .padding(.horizontal, 6).padding(.vertical, 4)
                     .background(Capsule().fill(.black.opacity(0.6))
@@ -430,27 +477,27 @@ struct EditorView: View {
                 .onChange(of: geo.size) { _, s in stageSize = s }
                 .gesture(SpatialTapGesture().onEnded { v in
                     placeAt(v.location, in: geo.size)
-                })
+                }, including: panoMode ? .none : .all)
                 .gesture(DragGesture(minimumDistance: 4)
                     .onChanged { g in stageDrag(g, in: geo.size) }
                     .onEnded { _ in
                         if retouchMode == "brush" { commitBrushStroke() }
                         dragBase = nil
-                    })
+                    }, including: panoMode ? .none : .all)
                 .gesture(MagnifyGesture()
                     .onChanged { v in
                         if !pinching { pinching = true; pinchBase = zoom }
                         zoom = (pinchBase * v.magnification).clamped(to: 0.5...8)
                         if zoom <= 1 { pan = .zero }
                     }
-                    .onEnded { _ in pinching = false })
-                .onTapGesture(count: 2) { _ in
+                    .onEnded { _ in pinching = false }, including: panoMode ? .none : .all)
+                .gesture(TapGesture(count: 2).onEnded { _ in
                     // only reached when the spatial tap for tools didn't claim it
                     if retouchMode == "off" {
                         zoom = zoom > 1.01 ? 1 : 2
                         if zoom <= 1 { pan = .zero }
                     }
-                }
+                }, including: panoMode ? .none : .all)
                 .onHover { stageHover = $0 }
             }
             if showStrip {
@@ -463,6 +510,8 @@ struct EditorView: View {
             keyMon.install()
             scrollMon.handler = { [self] ev in
                 guard stageHover else { return true }
+                // 360 viewer owns its own zoom (pinch); scroll does nothing
+                if panoMode { return true }
                 // darktable tone equalizer: scroll over the photo adjusts the
                 // luminance band under the cursor instead of zooming
                 if zoneImgMode, let zi = zoneIndex(at: lastHover) {
@@ -679,6 +728,7 @@ struct EditorView: View {
     /// Cursor probe: sample the small sRGB probe buffer under the pointer
     /// and format an RT-style readout. Also feeds the zone-EQ badge.
     private func updateProbe(_ loc: CGPoint, in size: CGSize) {
+        guard !panoMode else { probeText = ""; return }
         stageHover = true
         lastHover = loc
         let rect = imageRect(in: size)
@@ -1831,6 +1881,8 @@ struct EditorView: View {
         aidnInfo = ""
         subjBusy = false
         subjReady = false
+        // .insp stills are always equirect — open straight into 360 mode
+        panoMode = photo.name.lowercased().hasSuffix(".insp")
         Task {
             let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
             if let d = meta.data(using: .utf8),
