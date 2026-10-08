@@ -154,6 +154,34 @@ int ara_process8(AraRaw* r, unsigned char** out, int* w, int* h) {
   return 0;
 }
 
+int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
+                   int* format) {
+  if (!r || !out || !len) return -1;
+  libraw_thumbnail_list_t& tl = r->raw->imgdata.thumbs_list;
+  int best = -1;
+  unsigned best_px = 0;
+  for (int i = 0; i < tl.thumbcount && i < LIBRAW_THUMBNAIL_MAXCOUNT; i++) {
+    unsigned px = (unsigned)tl.thumblist[i].twidth * tl.thumblist[i].theight;
+    if (px > best_px) {
+      best_px = px;
+      best = i;
+    }
+  }
+  if (best < 0) return -2;
+  if (r->raw->unpack_thumb_ex(best) != LIBRAW_SUCCESS) return -3;
+  libraw_thumbnail_t& t = r->raw->imgdata.thumbnail;
+  if (!t.thumb || t.tlength <= 0) return -4;
+  unsigned char* buf = (unsigned char*)malloc((size_t)t.tlength);
+  if (!buf) return -5;
+  memcpy(buf, t.thumb, (size_t)t.tlength);
+  *out = buf;
+  *len = t.tlength;
+  if (w) *w = t.twidth;
+  if (h) *h = t.theight;
+  if (format) *format = (int)t.tformat;
+  return 0;
+}
+
 void ara_raw_close(AraRaw* r) {
   if (!r) return;
   if (r->raw) {

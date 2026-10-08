@@ -132,14 +132,60 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     if is_raster(path) {
         return decode_raster(path);
     }
+    // Sigma/Foveon X3F containers are parsed by our own decoder
+    // (libraw X3F support needs the GPL x3f-tools; dcraw is public domain).
+    if crate::x3f::is_x3f(path) {
+        if let Ok(d) = crate::x3f::decode_x3f(path) {
+            return Ok(d);
+        }
+        // unsupported foveon variant (e.g. Quattro layout): embedded JPEG
+        if let Some((off, len)) = crate::x3f::x3f_embedded_jpeg(path) {
+            let f = std::fs::read(path)?;
+            if let Ok(img) = image::load_from_memory(&f[off..off + len]) {
+                let rgba16 = img.to_rgba16();
+                let (w, hh) = (rgba16.width() as usize, rgba16.height() as usize);
+                let mut rgba = Vec::with_capacity(w * hh * 4);
+                rgba.extend_from_slice(rgba16.as_raw());
+                return Ok(Decoded::Raster {
+                    rgba,
+                    w,
+                    h: hh,
+                    info: crate::x3f::probe_x3f(path)
+                        .unwrap_or_else(empty_camera_info),
+                    flip: 0,
+                });
+            }
+        }
+        bail!("x3f decode failed for {}", path.display());
+    }
     let (h, mut info) = open_raw(path)?;
     if info.cfa_kind == 0 {
-        // not a mosaic raw (linear dng / rgb) - use libraw's own pipeline
-        let rgb = process8(&h)?;
-        return Ok(rgb);
+        // not a mosaic raw (linear dng / rgb) - use libraw's own pipeline,
+        // falling back to system codecs / embedded preview on failure
+        match process8(&h) {
+            Ok(rgb) => return Ok(rgb),
+            Err(e) => {
+                if let Ok(d) = imgio_decode(path, &info) {
+                    return Ok(d);
+                }
+                if let Ok(d) = embedded_preview(&h, &info) {
+                    return Ok(d);
+                }
+                return Err(e);
+            }
+        }
     }
     let rc = unsafe { ffi::ara_raw_unpack(h.ptr) };
     if rc != 0 {
+        // sensor compression libraw can't decode (Nikon HE/HE* "TicoRAW",
+        // etc.): try macOS ImageIO (system codec) then the largest embedded
+        // preview — degrade gracefully instead of refusing to open.
+        if let Ok(d) = imgio_decode(path, &info) {
+            return Ok(d);
+        }
+        if let Ok(d) = embedded_preview(&h, &info) {
+            return Ok(d);
+        }
         bail!("libraw_unpack failed ({rc}) for {}", path.display());
     }
     // black level / pre_mul / rgb_cam are only correct after unpack
@@ -236,9 +282,107 @@ fn estimate_black_floor(
     }
 }
 
+fn empty_camera_info() -> CameraInfo {
+    CameraInfo {
+        make: String::new(),
+        model: String::new(),
+        lens: String::new(),
+        iso: 0.0,
+        shutter: 0.0,
+        aperture: 0.0,
+        focal: 0.0,
+        timestamp: 0,
+        flip: 0,
+    }
+}
+
+/// Full-res decode via macOS ImageIO system RAW codecs (real debayer for
+/// formats libraw can't unpack, e.g. Nikon HE/HE*). Returns rgba16 sRGB.
+fn imgio_decode(path: &Path, info: &ffi::AraRawInfo) -> Result<Decoded> {
+    let c = CString::new(path.to_string_lossy().as_bytes())?;
+    let mut out: *mut u16 = std::ptr::null_mut();
+    let (mut w, mut h) = (0i32, 0i32);
+    let rc = unsafe { ffi::ara_imgio_decode(c.as_ptr(), &mut out, &mut w, &mut h) };
+    if rc != 0 || out.is_null() || w <= 0 || h <= 0 {
+        bail!("imgio decode failed ({rc})");
+    }
+    let n = (w * h * 4) as usize;
+    let rgba = unsafe { Vec::from_raw_parts(out, n, n) };
+    // ImageIO returns display-oriented output — do not re-apply dcraw flip.
+    let mut ci = info_of(info);
+    ci.flip = 0;
+    Ok(Decoded::Raster {
+        rgba,
+        w: w as usize,
+        h: h as usize,
+        info: ci,
+        flip: 0,
+    })
+}
+
+/// Largest embedded JPEG/bitmap preview inside the RAW container — the
+/// darktable-style graceful fallback for unsupported sensor compression.
+fn embedded_preview(h: &RawHandle, info: &ffi::AraRawInfo) -> Result<Decoded> {
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);
+    let rc = unsafe {
+        ffi::ara_thumb_best(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt)
+    };
+    if rc != 0 || out.is_null() || len <= 0 {
+        bail!("no embedded preview ({rc})");
+    }
+    let bytes = unsafe { Vec::from_raw_parts(out, len as usize, len as usize) };
+    let (rgba, rw, rh): (Vec<u16>, usize, usize) = match fmt {
+        1 => {
+            let img = image::load_from_memory(&bytes).context("decode embedded jpeg")?;
+            let r16 = img.to_rgba16();
+            (
+                r16.as_raw().to_vec(),
+                r16.width() as usize,
+                r16.height() as usize,
+            )
+        }
+        2 => {
+            // rgb8 bitmap
+            let mut v = Vec::with_capacity(bytes.len() / 3 * 4);
+            for c in bytes.chunks_exact(3) {
+                v.extend_from_slice(&[
+                    (c[0] as u16) << 8,
+                    (c[1] as u16) << 8,
+                    (c[2] as u16) << 8,
+                    u16::MAX,
+                ]);
+            }
+            (v, w as usize, hgt as usize)
+        }
+        3 => {
+            // rgb16 bitmap, big-endian u16 per dcraw
+            let mut v = Vec::with_capacity(bytes.len() / 6 * 4);
+            for c in bytes.chunks_exact(6) {
+                let r = u16::from_be_bytes([c[0], c[1]]);
+                let g = u16::from_be_bytes([c[2], c[3]]);
+                let b = u16::from_be_bytes([c[4], c[5]]);
+                v.extend_from_slice(&[r, g, b, u16::MAX]);
+            }
+            (v, w as usize, hgt as usize)
+        }
+        _ => bail!("unsupported embedded preview format {fmt}"),
+    };
+    Ok(Decoded::Raster {
+        rgba,
+        w: rw,
+        h: rh,
+        info: info_of(info),
+        flip: info.flip,
+    })
+}
+
 /// Header-only camera info without unpacking pixels — fast enough for
 /// catalog scans. Rasters get EXIF make/model/lens.
 pub fn probe(path: &Path) -> Option<CameraInfo> {
+    if crate::x3f::is_x3f(path) {
+        return crate::x3f::probe_x3f(path);
+    }
     if is_raw(path) {
         let (_h, info) = open_raw(path).ok()?;
         return Some(info_of(&info));
@@ -357,6 +501,26 @@ pub struct Thumb {
 }
 
 pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
+    // x3f containers carry JPEG previews libraw can't reach (it can't even
+    // open the file) — parse the FOVb directory ourselves.
+    if crate::x3f::is_x3f(path) {
+        if let Some((off, len)) = crate::x3f::x3f_embedded_jpeg(path) {
+            if let Ok(f) = std::fs::read(path) {
+                if let Ok(img) = image::load_from_memory(&f[off..off + len]) {
+                    let flip = crate::x3f::probe_x3f(path).map(|i| i.flip).unwrap_or(0);
+                    let rgba = img.to_rgba8();
+                    let (tw, th) = (rgba.width() as usize, rgba.height() as usize);
+                    return Ok(Some(Thumb {
+                        w: tw,
+                        h: th,
+                        rgba: rgba.into_raw(),
+                        flip,
+                    }));
+                }
+            }
+        }
+        return Ok(None);
+    }
     let (h, info) = open_raw(path)?;
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);

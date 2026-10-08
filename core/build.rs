@@ -29,6 +29,18 @@ fn main() {
         .warnings(false)
         .compile("ara_shim");
 
+    if cfg!(target_os = "macos") {
+        cc::Build::new()
+            .file("native/ara_imgio.mm")
+            .flag_if_supported("-std=c++17")
+            .flag_if_supported("-fobjc-arc")
+            .warnings(false)
+            .compile("ara_imgio");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=ImageIO");
+        println!("cargo:rustc-link-lib=framework=CoreServices");
+    }
+
     println!("cargo:rustc-link-search=native={prefix}/lib");
     println!("cargo:rustc-link-lib=dylib=raw");
     if cfg!(target_os = "macos") {
@@ -40,5 +52,6 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=native/ara_shim.cpp");
     println!("cargo:rerun-if-changed=native/ara_shim.h");
+    println!("cargo:rerun-if-changed=native/ara_imgio.mm");
     println!("cargo:rerun-if-env-changed=LIBRAW_PREFIX");
 }

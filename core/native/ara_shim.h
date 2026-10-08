@@ -50,6 +50,11 @@ int ara_raw_cfa(AraRaw* r, unsigned short** out, int* count);
 int ara_thumb(AraRaw* r, unsigned char** out, int* len, int* w, int* h, int* format);
 /* renders with libraw's own pipeline -> malloc'ed rgb8 buffer (reference path) */
 int ara_process8(AraRaw* r, unsigned char** out, int* w, int* h);
+/* largest embedded thumbnail -> malloc'ed bytes; format: 1=jpeg,2=bitmap8,3=bitmap16 */
+int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
+                   int* format);
+/* macOS ImageIO decode (full-res via system RAW codecs) -> malloc'ed rgba16 */
+int ara_imgio_decode(const char* path, unsigned short** out, int* w, int* h);
 void ara_raw_close(AraRaw* r);
 void ara_free(void* p);
 

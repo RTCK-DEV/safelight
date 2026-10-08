@@ -56,6 +56,20 @@ extern "C" {
         w: *mut c_int,
         h: *mut c_int,
     ) -> c_int;
+    pub fn ara_thumb_best(
+        r: *mut AraRaw,
+        out: *mut *mut c_uchar,
+        len: *mut c_int,
+        w: *mut c_int,
+        h: *mut c_int,
+        format: *mut c_int,
+    ) -> c_int;
+    pub fn ara_imgio_decode(
+        path: *const c_char,
+        out: *mut *mut c_ushort,
+        w: *mut c_int,
+        h: *mut c_int,
+    ) -> c_int;
     pub fn ara_raw_close(r: *mut AraRaw);
     pub fn ara_free(p: *mut c_void);
 }

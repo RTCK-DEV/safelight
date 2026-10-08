@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod lensdb;
 pub mod lut;
 pub mod recipe;
+pub mod x3f;
 
 pub use develop::{histogram, RgbaImage};
 pub use engine::Engine;

@@ -191,55 +191,8 @@ impl Stats {
     }
 }
 
-fn inv3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
-    let [a, b, c] = m[0];
-    let [d, e, f] = m[1];
-    let [g, h, i] = m[2];
-    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if det.abs() < 1e-8 {
-        return None;
-    }
-    let id = 1.0 / det;
-    Some([
-        [
-            (e * i - f * h) * id,
-            (c * h - b * i) * id,
-            (b * f - c * e) * id,
-        ],
-        [
-            (f * g - d * i) * id,
-            (a * i - c * g) * id,
-            (c * d - a * f) * id,
-        ],
-        [
-            (d * h - e * g) * id,
-            (b * g - a * h) * id,
-            (a * e - b * d) * id,
-        ],
-    ])
-}
 
-fn mat_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut o = [[0.0f32; 3]; 3];
-    for r in 0..3 {
-        for c in 0..3 {
-            o[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c];
-        }
-    }
-    o
-}
 
-fn norm_rows(mut m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    for r in 0..3 {
-        let s: f32 = m[r].iter().sum();
-        if s.abs() > 1e-6 {
-            for c in 0..3 {
-                m[r][c] /= s;
-            }
-        }
-    }
-    m
-}
 
 fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     curve_lut(points, |x| x, 1.0)
