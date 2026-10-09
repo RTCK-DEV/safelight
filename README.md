@@ -1,11 +1,11 @@
-# araware
+# Safelight
 
 RAW development + photo library application. Folder-direct-read style — point it
 at a directory of RAW files, no Lightroom-style import step.
 
 ```
 ┌──────────────┐   C FFI   ┌──────────────────────────────┐
-│ SwiftUI app  ├───────────│ araware-core (Rust engine)   │
+│ SwiftUI app  ├───────────│ safelight-core (Rust engine)   │
 │  (macOS)     │           │  decode → demosaic → develop │
 └──────────────┘           │  catalog (SQLite) + sidecars │
                            └──────────────┬───────────────┘
@@ -18,8 +18,8 @@ at a directory of RAW files, no Lightroom-style import step.
 | piece | path | what it does |
 |---|---|---|
 | engine | `core/` | LibRaw decode (Bayer + X-Trans CFA), develop pipeline (WB as-shot/auto/pick, cam→sRGB, tone + custom/hue curves, exposure, contrast, highlights/shadows, saturation/vibrance, sharpen, luma+chroma NR, clarity, straighten, vignette, grain, DaVinci-style grading, retouch, light effects), embedded-thumbnail extraction, EXIF, scopes |
-| GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→heal/clone→NR→soft→glow→sharpen/clarity→finish (crop+resize+straighten+flip+CA-fix+adjust+windows+flare+dodge/burn+grain+vignette→rgba8). CPU path kept as fallback (`ARA_DISABLE_GPU=1` or any GPU failure) |
-| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.araware/catalog.db`), `<stem>.araware.json` sidecars (rating + label + flag + keywords + recipe + versions), stacks/collections tables, smart rules |
+| GPU pipeline | `core/src/gpu.rs` | wgpu compute (Metal/Vulkan/DX12): stats→demosaic→heal/clone→NR→soft→glow→sharpen/clarity→finish (crop+resize+straighten+flip+CA-fix+adjust+windows+flare+dodge/burn+grain+vignette→rgba8). CPU path kept as fallback (`SAFELIGHT_DISABLE_GPU=1` or any GPU failure) |
+| catalog | `core/src/catalog.rs` | directory scan, RAW+JPEG stem pairing, SQLite db (`~/.safelight/catalog.db`), `<stem>.safelight.json` sidecars (rating + label + flag + keywords + recipe + versions), stacks/collections tables, smart rules |
 | C ABI | `core/src/capi.rs` | opaque engine handle, images as `{data,len,w,h}` RGBA8, JSON in/out |
 | CLI | `cli/` | `render`, `thumb`, `reference`, `scan`, `meta`, `rate` — test harness + batch tool |
 | macOS app | `mac/` | SwiftUI library grid + editor; builds a self-contained `.app` with libraw bundled |
@@ -29,7 +29,7 @@ at a directory of RAW files, no Lightroom-style import step.
 ```sh
 brew install libraw            # engine dependency (LGPL, dynamically linked)
 cargo build --workspace        # engine + cli
-mac/build.sh                   # -> mac/build/araware.app
+mac/build.sh                   # -> mac/build/Safelight.app
 ```
 
 `LIBRAW_PREFIX` overrides the lib search path (default `/opt/homebrew`).
@@ -37,12 +37,12 @@ mac/build.sh                   # -> mac/build/araware.app
 ## CLI quickstart
 
 ```sh
-araware-cli render IMG_1234.ARW out.png            # develop with defaults
-araware-cli render IMG_1234.ARW out.png r.json 900 # recipe + max side 900px
-araware-cli thumb IMG_1234.ARW t.png               # embedded JPEG thumbnail
-araware-cli scan ~/Pictures/2024                   # JSON asset list
-araware-cli rate IMG_1234.ARW 4                    # write sidecar
-araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sanity)
+safelight-cli render IMG_1234.ARW out.png            # develop with defaults
+safelight-cli render IMG_1234.ARW out.png r.json 900 # recipe + max side 900px
+safelight-cli thumb IMG_1234.ARW t.png               # embedded JPEG thumbnail
+safelight-cli scan ~/Pictures/2024                   # JSON asset list
+safelight-cli rate IMG_1234.ARW 4                    # write sidecar
+safelight-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sanity)
 ```
 
 ## Recipe (sidecar `recipe` object)
@@ -98,7 +98,7 @@ araware-cli reference IMG_1234.ARW ref.png         # libraw's own pipeline (sani
 ```
 
 All edits are non-destructive: ratings, recipes and grade versions live in
-`<stem>.araware.json` next to the source file. Named snapshots:
+`<stem>.safelight.json` next to the source file. Named snapshots:
 
 ```json
 "versions": [{"name": "Teal look", "recipe": { ... }}]
@@ -115,7 +115,7 @@ sidecars; the SQLite catalog indexes scans and owns stacks + collections.
 - **Stacks**: `G` groups the selection into a stack; collapsed stacks show
   the cover with a depth badge. Context menu: expand/collapse, ungroup,
   set-as-cover.
-- **Virtual copies**: extra sidecar `<stem>.araware.vN.json` — no file
+- **Virtual copies**: extra sidecar `<stem>.safelight.vN.json` — no file
   duplication, inherits the master's rating/label on creation, can be
   promoted to master.
 - **Collections**: manual (drag-in via context menu) and smart (rule sheet:
@@ -128,7 +128,7 @@ sidecars; the SQLite catalog indexes scans and owns stacks + collections.
   modified / rating / size).
 - **Info card**: camera, lens, ISO / f / shutter / focal chips, flag buttons,
   stack + variant badges, keyword editor.
-- **Thumbnails**: PNG disk cache in `~/.araware/thumbs/` keyed by
+- **Thumbnails**: PNG disk cache in `~/.safelight/thumbs/` keyed by
   path+mtime+size — rescans and scope switches are instant.
 - **Batch export**: context menu "Export Selected…" renders every selected
   photo with its own recipe to a chosen folder.
@@ -180,4 +180,4 @@ sidecars; the SQLite catalog indexes scans and owns stacks + collections.
 - X-Trans renders work; cross-checked on Fuji X-E1 RAF.
 - No lens corrections yet (lensfun integration is the obvious next step).
 - Windows/Linux shell not started — engine is portable by design
-  (`araware-cli` runs the whole pipeline headlessly).
+  (`safelight-cli` runs the whole pipeline headlessly).

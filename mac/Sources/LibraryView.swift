@@ -18,8 +18,8 @@ struct LibraryView: View {
                 Group {
                     if store.scanning || store.merging {
                         ProgressView(store.merging ? "Merging…" : "Scanning…")
-                            .tint(Ara.accent)
-                            .foregroundStyle(Ara.text2)
+                            .tint(Theme.accent)
+                            .foregroundStyle(Theme.text2)
                     } else if store.filtered.isEmpty {
                         emptyState
                     } else if store.surveying {
@@ -30,7 +30,7 @@ struct LibraryView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .background(Ara.bg1)
+            .background(Theme.bg1)
             .navigationTitle(navTitle)
             .toolbar {
                 ToolbarItemGroup {
@@ -46,7 +46,7 @@ struct LibraryView: View {
                         store.surveying.toggle()
                     } label: {
                         Image(systemName: "rectangle.split.2x1")
-                            .foregroundStyle(store.surveying ? Ara.accent : Ara.text2)
+                            .foregroundStyle(store.surveying ? Theme.accent : Theme.text2)
                     }
                     .help("Survey/compare selected (2–4)")
                     .disabled(store.selection.count < 2 || store.selection.count > 4)
@@ -58,20 +58,20 @@ struct LibraryView: View {
                     .id(photo.id)
             } else {
                 ZStack {
-                    Ara.bg0.ignoresSafeArea()
+                    Theme.bg0.ignoresSafeArea()
                     VStack(spacing: 10) {
                         Image(systemName: "camera.aperture")
                             .font(.system(size: 34))
-                            .foregroundStyle(Ara.text3)
+                            .foregroundStyle(Theme.text3)
                         Text("Select a photo")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Ara.text3)
+                            .foregroundStyle(Theme.text3)
                     }
                 }
             }
         }
         .preferredColorScheme(.dark)
-        .tint(Ara.accent)
+        .tint(Theme.accent)
         .sheet(isPresented: $showNewCollection) {
             CollectionNameSheet(title: "New Collection") { name in
                 store.addCollection(name: name, smart: false, rules: "")
@@ -95,7 +95,7 @@ struct LibraryView: View {
         }
         switch store.scope {
         case "all": return "All Photos"
-        case "folder": return store.folder?.lastPathComponent ?? "araware"
+        case "folder": return store.folder?.lastPathComponent ?? "safelight"
         default: return store.scope
         }
     }
@@ -146,7 +146,7 @@ struct LibraryView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Ara.accent)
+                    .foregroundStyle(Theme.accent)
                     .font(.system(size: 11))
                     .padding(.top, 4)
                 }
@@ -155,7 +155,7 @@ struct LibraryView: View {
             }
 
             if let p = store.active {
-                Divider().background(Ara.hairline)
+                Divider().background(Theme.hairline)
                 InfoCard(photo: p)
             }
         }
@@ -164,7 +164,7 @@ struct LibraryView: View {
     private func sectionHeader(_ t: String) -> some View {
         Text(t.uppercased())
             .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(Ara.text3)
+            .foregroundStyle(Theme.text3)
             .padding(.horizontal, 8)
             .padding(.top, 10)
             .padding(.bottom, 3)
@@ -177,10 +177,10 @@ struct LibraryView: View {
             Image(systemName: icon)
                 .font(.system(size: 10))
                 .frame(width: 15)
-                .foregroundStyle(active ? Ara.accent : (dim ? Ara.text3 : Ara.text2))
+                .foregroundStyle(active ? Theme.accent : (dim ? Theme.text3 : Theme.text2))
             Text(title)
                 .font(.system(size: 11, weight: active ? .semibold : .regular))
-                .foregroundStyle(active ? Ara.text1 : (dim ? Ara.text3 : Ara.text2))
+                .foregroundStyle(active ? Theme.text1 : (dim ? Theme.text3 : Theme.text2))
                 .lineLimit(1).truncationMode(.middle)
             Spacer()
             if badge > 0 {
@@ -188,12 +188,12 @@ struct LibraryView: View {
                     .font(.system(size: 9, weight: .semibold).monospacedDigit())
                     .foregroundStyle(.white)
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(active ? Ara.accent : Ara.bg4)
+                    .background(active ? Theme.accent : Theme.bg4)
                     .clipShape(Capsule())
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(active ? Ara.accent.opacity(0.14) : Color.clear)
+        .background(active ? Theme.accent.opacity(0.14) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .contentShape(Rectangle())
         .onTapGesture {
@@ -242,7 +242,7 @@ struct LibraryView: View {
             HStack(spacing: 4) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 9))
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
                 TextField("Search", text: $store.searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 10))
@@ -250,39 +250,39 @@ struct LibraryView: View {
             }
             .padding(.horizontal, 7).padding(.vertical, 3)
             .clipShape(Capsule())
-            .overlay(Capsule().stroke(Ara.border, lineWidth: 1))
+            .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
             if store.selection.count > 1 {
                 Text("\(store.selection.count) selected")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(Ara.accent)
+                    .foregroundStyle(Theme.accent)
             }
             Spacer()
             SortMenu(sel: $store.sortKey)
             Text("\(store.filtered.count)/\(store.photos.count)")
                 .font(.system(size: 10).monospacedDigit())
-                .foregroundStyle(Ara.text3)
+                .foregroundStyle(Theme.text3)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Ara.bg1)
-        .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+        .background(Theme.bg1)
+        .overlay(alignment: .bottom) { Theme.hairline.frame(height: 1) }
     }
 
     private var emptyState: some View {
         VStack(spacing: 14) {
             ZStack {
-                Circle().fill(Ara.bg3).frame(width: 72, height: 72)
+                Circle().fill(Theme.bg3).frame(width: 72, height: 72)
                 Image(systemName: scopeIsCollection ? "tray" : "photo.on.rectangle.angled")
                     .font(.system(size: 28))
-                    .foregroundStyle(Ara.accent)
+                    .foregroundStyle(Theme.accent)
             }
             Text(scopeIsCollection ? "No photos match"
                  : (store.folder == nil ? "Open a folder of RAW files" : "No photos match the filters"))
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Ara.text2)
+                .foregroundStyle(Theme.text2)
             if !scopeIsCollection {
                 Button("Open Folder…") { store.pickFolder() }
-                    .buttonStyle(AraPrimaryButton())
+                    .buttonStyle(SlPrimaryButton())
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -416,11 +416,11 @@ struct LibraryView: View {
         let paths = targets.map(\.path)
         Task.detached {
             await MainActor.run { store.merging = true }
-            let img = await AraEngine.shared.work { $0.merge(paths: paths, mode: mode) }
+            let img = await SafelightEngine.shared.work { $0.merge(paths: paths, mode: mode) }
             await MainActor.run {
                 store.merging = false
                 guard let img else {
-                    store.mergeError = AraEngine.shared.lastError
+                    store.mergeError = SafelightEngine.shared.lastError
                     return
                 }
                 let dir = URL(fileURLWithPath: first.path).deletingLastPathComponent()
@@ -457,8 +457,8 @@ struct LibraryView: View {
         let targets = store.selectedPhotos
         Task.detached {
             for p in targets {
-                let sc = await AraEngine.shared.work { $0.sidecar(path: p.path, vslot: p.vslot) }
-                let img = await AraEngine.shared.work { $0.export(path: p.path, recipe: sc.recipe) }
+                let sc = await SafelightEngine.shared.work { $0.sidecar(path: p.path, vslot: p.vslot) }
+                let img = await SafelightEngine.shared.work { $0.export(path: p.path, recipe: sc.recipe) }
                 if let img {
                     let stem = URL(fileURLWithPath: p.path).deletingPathExtension().lastPathComponent
                     let name = p.vslot > 0 ? "\(stem)_v\(p.vslot).jpg" : "\(stem).jpg"
@@ -545,21 +545,21 @@ struct SurveyView: View {
             }
             .padding(8)
         }
-        .background(Ara.bg0)
+        .background(Theme.bg0)
         .overlay(alignment: .top) {
             HStack {
                 Image(systemName: "rectangle.split.2x1")
-                    .foregroundStyle(Ara.accent)
+                    .foregroundStyle(Theme.accent)
                 Text("Survey — click a tile to flag it Picked · Esc to exit")
                     .font(.system(size: 10))
-                    .foregroundStyle(Ara.text2)
+                    .foregroundStyle(Theme.text2)
                 Spacer()
                 Button("Done") { store.surveying = false }
-                    .buttonStyle(AraPrimaryButton())
+                    .buttonStyle(SlPrimaryButton())
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
-            .background(Ara.bg1.opacity(0.94))
-            .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+            .background(Theme.bg1.opacity(0.94))
+            .overlay(alignment: .bottom) { Theme.hairline.frame(height: 1) }
         }
     }
 }
@@ -571,13 +571,13 @@ struct SurveyTile: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             ZStack {
-                Ara.bg3
+                Theme.bg3
                 if let image {
                     Image(image, scale: 1, label: Text(photo.name))
                         .resizable()
                         .scaledToFit()
                 } else {
-                    ProgressView().tint(Ara.text3)
+                    ProgressView().tint(Theme.text3)
                 }
             }
             .aspectRatio(1.5, contentMode: .fit)
@@ -585,11 +585,11 @@ struct SurveyTile: View {
                 if photo.flag == 1 {
                     Image(systemName: "flag.fill")
                         .font(.system(size: 9))
-                        .foregroundStyle(Ara.accent)
+                        .foregroundStyle(Theme.accent)
                 }
                 Text(photo.name)
                     .font(.system(size: 9))
-                    .foregroundStyle(Ara.text2)
+                    .foregroundStyle(Theme.text2)
             }
             .padding(.horizontal, 6).padding(.vertical, 3)
             .background(.black.opacity(0.6))
@@ -598,11 +598,11 @@ struct SurveyTile: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6)
-            .stroke(photo.flag == 1 ? Ara.accent : Ara.hairline,
+            .stroke(photo.flag == 1 ? Theme.accent : Theme.hairline,
                     lineWidth: photo.flag == 1 ? 2 : 1))
         .task {
-            let sc = await AraEngine.shared.work { $0.sidecar(path: photo.path, vslot: photo.vslot) }
-            let img = await AraEngine.shared.work { $0.render(path: photo.path, recipe: sc.recipe, maxPx: 1200) }
+            let sc = await SafelightEngine.shared.work { $0.sidecar(path: photo.path, vslot: photo.vslot) }
+            let img = await SafelightEngine.shared.work { $0.render(path: photo.path, recipe: sc.recipe, maxPx: 1200) }
             await MainActor.run { image = img.0 }
         }
     }
@@ -620,13 +620,13 @@ struct InfoCard: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(photo.name)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Ara.text1)
+                .foregroundStyle(Theme.text1)
                 .lineLimit(1).truncationMode(.middle)
             if !photo.camera.isEmpty {
-                Text(photo.camera).font(.system(size: 9)).foregroundStyle(Ara.text2)
+                Text(photo.camera).font(.system(size: 9)).foregroundStyle(Theme.text2)
             }
             if !photo.lens.isEmpty {
-                Text(photo.lens).font(.system(size: 9)).foregroundStyle(Ara.text3)
+                Text(photo.lens).font(.system(size: 9)).foregroundStyle(Theme.text3)
                     .lineLimit(1).truncationMode(.middle)
             }
             HStack(spacing: 8) {
@@ -638,24 +638,24 @@ struct InfoCard: View {
                 if photo.focal > 0 { Text("\(Int(photo.focal))mm") }
             }
             .font(.system(size: 8.5).monospacedDigit())
-            .foregroundStyle(Ara.text3)
+            .foregroundStyle(Theme.text3)
             HStack(spacing: 4) {
-                flagButton(1, "flag.fill", Ara.accent)
-                flagButton(0, "flag", Ara.text3)
-                flagButton(-1, "xmark", Ara.red)
+                flagButton(1, "flag.fill", Theme.accent)
+                flagButton(0, "flag", Theme.text3)
+                flagButton(-1, "xmark", Theme.red)
                 Spacer()
                 if photo.stack != 0 {
-                    Text("stack \(photo.stack)").font(.system(size: 8)).foregroundStyle(Ara.text3)
+                    Text("stack \(photo.stack)").font(.system(size: 8)).foregroundStyle(Theme.text3)
                 }
                 if photo.isVariant {
-                    Text("v\(photo.vslot)").font(.system(size: 8, weight: .bold)).foregroundStyle(Ara.accent)
+                    Text("v\(photo.vslot)").font(.system(size: 8, weight: .bold)).foregroundStyle(Theme.accent)
                 }
             }
             TextField("keywords (comma separated)", text: $kwText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 9))
                 .padding(.horizontal, 6).padding(.vertical, 4)
-                .background(Ara.bg3)
+                .background(Theme.bg3)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
                 .onSubmit {
                     let kw = kwText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -666,14 +666,14 @@ struct InfoCard: View {
                 .onChange(of: photo.id) { kwText = photo.keywords.joined(separator: ", ") }
         }
         .padding(10)
-        .background(Ara.bg1)
+        .background(Theme.bg1)
     }
 
     private func flagButton(_ v: Int, _ icon: String, _ tint: Color) -> some View {
         Button { store.setFlag(path: photo.path, vslot: photo.vslot, photo.flag == v ? 0 : v) } label: {
             Image(systemName: icon)
                 .font(.system(size: 9))
-                .foregroundStyle(photo.flag == v ? tint : Ara.text3)
+                .foregroundStyle(photo.flag == v ? tint : Theme.text3)
                 .frame(width: 18, height: 16)
                 .background(photo.flag == v ? tint.opacity(0.15) : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
@@ -701,7 +701,7 @@ struct CollectionNameSheet: View {
                 Button("Create") {
                     if !name.isEmpty { onCreate(name); dismiss() }
                 }
-                .buttonStyle(AraPrimaryButton())
+                .buttonStyle(SlPrimaryButton())
                 .disabled(name.isEmpty)
             }
         }
@@ -792,7 +792,7 @@ struct SmartCollectionSheet: View {
                     store.addCollection(name: name.isEmpty ? "Smart" : name, smart: true, rules: rulesJs)
                     dismiss()
                 }
-                .buttonStyle(AraPrimaryButton())
+                .buttonStyle(SlPrimaryButton())
             }
         }
         .padding(18)
@@ -812,16 +812,16 @@ struct FlagFilter: View {
                 Button { sel = v } label: {
                     Image(systemName: icon)
                         .font(.system(size: 8.5))
-                        .foregroundStyle(sel == v ? .white : Ara.text3)
+                        .foregroundStyle(sel == v ? .white : Theme.text3)
                         .padding(.horizontal, 6).padding(.vertical, 3)
-                        .background(sel == v ? Ara.accent : Color.clear)
+                        .background(sel == v ? Theme.accent : Color.clear)
                 }
                 .buttonStyle(.plain)
                 .help(t)
             }
         }
         .clipShape(Capsule())
-        .overlay(Capsule().stroke(Ara.border, lineWidth: 1))
+        .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
     }
 }
 
@@ -832,14 +832,14 @@ struct RatingFilter: View {
         HStack(spacing: 2) {
             Image(systemName: "star.fill")
                 .font(.system(size: 9))
-                .foregroundStyle(Ara.text3)
+                .foregroundStyle(Theme.text3)
             ForEach(1...5, id: \.self) { i in
                 Image(systemName: i <= rating ? "star.fill" : "star")
                     .font(.system(size: 10))
-                    .foregroundStyle(i <= rating ? Ara.gold : Ara.text3)
+                    .foregroundStyle(i <= rating ? Theme.gold : Theme.text3)
                     .onTapGesture { rating = (rating == i) ? 0 : i }
             }
-            if rating > 0 { Text("+").font(.system(size: 9)).foregroundStyle(Ara.text3) }
+            if rating > 0 { Text("+").font(.system(size: 9)).foregroundStyle(Theme.text3) }
         }
     }
 }
@@ -866,12 +866,12 @@ struct FilterMenu: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 7, weight: .bold))
             }
-            .foregroundStyle(sel.isEmpty ? Ara.text3 : Ara.accent)
+            .foregroundStyle(sel.isEmpty ? Theme.text3 : Theme.accent)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(sel.isEmpty ? Color.clear : Ara.accent.opacity(0.12))
+            .background(sel.isEmpty ? Color.clear : Theme.accent.opacity(0.12))
             .clipShape(Capsule())
-            .overlay(Capsule().stroke(sel.isEmpty ? Ara.border : Ara.accent.opacity(0.6), lineWidth: 1))
+            .overlay(Capsule().stroke(sel.isEmpty ? Theme.border : Theme.accent.opacity(0.6), lineWidth: 1))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -896,10 +896,10 @@ struct SortMenu: View {
                 Text(["date": "Modified", "capture": "Captured", "rating": "Rating", "size": "Size"][sel] ?? "Name")
                     .font(.system(size: 10))
             }
-            .foregroundStyle(Ara.text3)
+            .foregroundStyle(Theme.text3)
             .padding(.horizontal, 7).padding(.vertical, 3)
             .clipShape(Capsule())
-            .overlay(Capsule().stroke(Ara.border, lineWidth: 1))
+            .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -924,7 +924,7 @@ struct LabelFilter: View {
                 Button { label = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 10))
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                 }
                 .buttonStyle(.plain)
             }
@@ -948,13 +948,13 @@ struct ThumbCell: View {
         VStack(alignment: .leading, spacing: 4) {
             ZStack(alignment: .bottom) {
                 ZStack {
-                    Ara.bg3
+                    Theme.bg3
                     if let image {
                         Image(image, scale: 1, label: Text(photo.name))
                             .resizable()
                             .scaledToFill()
                     } else {
-                        ProgressView().controlSize(.small).tint(Ara.text3)
+                        ProgressView().controlSize(.small).tint(Theme.text3)
                     }
                 }
                 .aspectRatio(1.4, contentMode: .fit)
@@ -963,7 +963,7 @@ struct ThumbCell: View {
                 // stack depth behind the cover — LR-style offset outlines
                 if stacked {
                     RoundedRectangle(cornerRadius: 7)
-                        .stroke(Ara.text3.opacity(0.5), lineWidth: 1)
+                        .stroke(Theme.text3.opacity(0.5), lineWidth: 1)
                         .offset(x: 3, y: -3)
                 }
 
@@ -975,27 +975,27 @@ struct ThumbCell: View {
                     if photo.rating > 0 {
                         Text(String(repeating: "★", count: photo.rating))
                             .font(.system(size: 9))
-                            .foregroundStyle(Ara.gold)
+                            .foregroundStyle(Theme.gold)
                     }
                     if photo.flag == 1 {
                         Image(systemName: "flag.fill")
                             .font(.system(size: 8))
-                            .foregroundStyle(Ara.accent)
+                            .foregroundStyle(Theme.accent)
                     } else if photo.flag == -1 {
                         Image(systemName: "xmark")
                             .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(Ara.red)
+                            .foregroundStyle(Theme.red)
                     }
                     Spacer()
                     if photo.isVariant {
                         Text("v\(photo.vslot)")
                             .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(Ara.accent)
+                            .foregroundStyle(Theme.accent)
                     }
                     if photo.has_sidecar {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.system(size: 9))
-                            .foregroundStyle(Ara.accent)
+                            .foregroundStyle(Theme.accent)
                     }
                 }
                 .padding(.horizontal, 6)
@@ -1046,7 +1046,7 @@ struct ThumbCell: View {
                                 ForEach(1...5, id: \.self) { i in
                                     Image(systemName: i <= photo.rating ? "star.fill" : "star")
                                         .font(.system(size: 8))
-                                        .foregroundStyle(i <= photo.rating ? Ara.gold : .white.opacity(0.75))
+                                        .foregroundStyle(i <= photo.rating ? Theme.gold : .white.opacity(0.75))
                                         .frame(width: 13, height: 16)
                                         .contentShape(Rectangle())
                                         .onTapGesture { onRate(i) }
@@ -1064,9 +1064,9 @@ struct ThumbCell: View {
             .clipShape(RoundedRectangle(cornerRadius: 7))
             .overlay(
                 RoundedRectangle(cornerRadius: 7)
-                    .stroke(active ? Ara.accent
-                            : (selected ? Ara.accent.opacity(0.55)
-                               : (hovering ? Ara.border : Ara.hairline)),
+                    .stroke(active ? Theme.accent
+                            : (selected ? Theme.accent.opacity(0.55)
+                               : (hovering ? Theme.border : Theme.hairline)),
                             lineWidth: active ? 2 : (selected ? 1.5 : 1))
             )
             .opacity(photo.flag == -1 ? 0.45 : 1)
@@ -1077,12 +1077,12 @@ struct ThumbCell: View {
 
             Text(photo.name)
                 .font(.system(size: 10, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? Ara.text1 : Ara.text2)
+                .foregroundStyle(selected ? Theme.text1 : Theme.text2)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
         .task {
-            let img = await AraEngine.shared.work { $0.thumbnail(path: photo.path, maxPx: 400) }
+            let img = await SafelightEngine.shared.work { $0.thumbnail(path: photo.path, maxPx: 400) }
             await MainActor.run { image = img }
         }
         .id("thumb-\(photo.id)")

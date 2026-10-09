@@ -4,14 +4,14 @@
 // libraw needs the proprietary GoPro SDK for them; we decode here into
 // an uncompressed DNG that libraw handles normally.
 
-#include "ara_shim.h"
+#include "sl_shim.h"
 
 #include <cstdlib>
 
 #include "gpr.h"
 #include "gpr_buffer.h"
 
-extern "C" int ara_gpr_to_dng(const char *in_path, const char *out_path) {
+extern "C" int sl_gpr_to_dng(const char *in_path, const char *out_path) {
     if (!in_path || !out_path)
         return -1;
 

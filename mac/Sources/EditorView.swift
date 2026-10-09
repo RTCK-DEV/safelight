@@ -91,6 +91,20 @@ enum Palette: String, CaseIterable, Identifiable {
     }
 }
 
+/// One-time adopt of the pre-rename ~/.araware tree as ~/.safelight so
+/// gallery presets / LUTs / thumbs / catalog survive the rename.
+private func safelightMigrateLegacyHome() {
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser
+    let new = home.appendingPathComponent(".safelight", isDirectory: true)
+    let old = home.appendingPathComponent(".araware", isDirectory: true)
+    var isDir: ObjCBool = false
+    if !fm.fileExists(atPath: new.path),
+       fm.fileExists(atPath: old.path, isDirectory: &isDir), isDir.boolValue {
+        try? fm.moveItem(at: old, to: new)
+    }
+}
+
 struct EditorView: View {
     let photo: Photo
     @EnvironmentObject var store: LibraryStore
@@ -301,7 +315,7 @@ struct EditorView: View {
                     .frame(minWidth: 300, idealWidth: 316, maxWidth: 380)
             }
         }
-        .background(Ara.bg0)
+        .background(Theme.bg0)
         .background(shortcutLayer)
         .sheet(isPresented: $showExportSheet) { exportSheet }
         .task { load() }
@@ -366,7 +380,7 @@ struct EditorView: View {
             stageStrip
             GeometryReader { geo in
                 ZStack {
-                    Ara.bg0
+                    Theme.bg0
                     if let image {
                         let rect = imageRect(in: geo.size)
                         if panoMode && panoLike {
@@ -378,7 +392,7 @@ struct EditorView: View {
                                     .position(x: rect.midX, y: rect.midY)
                                     .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
                                 Rectangle()
-                                    .stroke(Ara.border, lineWidth: 0.5)
+                                    .stroke(Theme.border, lineWidth: 0.5)
                                     .frame(width: rect.width, height: rect.height)
                                     .position(x: rect.midX, y: rect.midY)
                                     .allowsHitTesting(false)
@@ -386,13 +400,13 @@ struct EditorView: View {
                                     .font(.system(size: 10, weight: .bold))
                                     .tracking(1.5)
                                     .padding(.horizontal, 8).padding(.vertical, 3)
-                                    .background(Capsule().fill(Ara.accent))
+                                    .background(Capsule().fill(Theme.accent))
                                     .foregroundStyle(Color.black.opacity(0.85))
                                     .position(x: rect.minX + 34, y: rect.minY + 16)
                                     .allowsHitTesting(false)
                                 Text("drag to look · pinch to zoom · double-click to reset")
                                     .font(.system(size: 10))
-                                    .foregroundStyle(Ara.text2)
+                                    .foregroundStyle(Theme.text2)
                                     .padding(.horizontal, 8).padding(.vertical, 3)
                                     .background(Capsule().fill(.black.opacity(0.55)))
                                     .position(x: rect.midX, y: rect.maxY - 14)
@@ -418,7 +432,7 @@ struct EditorView: View {
                                     .position(x: rect.midX, y: rect.midY)
                                     .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
                             } else {
-                                ProgressView().tint(Ara.accent)
+                                ProgressView().tint(Theme.accent)
                             }
                         } else {
                             Image(image, scale: 1, label: Text(photo.name))
@@ -431,7 +445,7 @@ struct EditorView: View {
                                 .opacity(cmp == .mix ? 0.5 : 1)
                         }
                         Rectangle()
-                            .stroke(Ara.border, lineWidth: 0.5)
+                            .stroke(Theme.border, lineWidth: 0.5)
                             .frame(width: rect.width, height: rect.height)
                             .position(x: rect.midX, y: rect.midY)
                         retouchMarkers(in: rect)
@@ -443,7 +457,7 @@ struct EditorView: View {
                                 .font(.system(size: 10, weight: .bold))
                                 .tracking(1.5)
                                 .padding(.horizontal, 8).padding(.vertical, 3)
-                                .background(Capsule().fill(Ara.accent))
+                                .background(Capsule().fill(Theme.accent))
                                 .foregroundStyle(Color.black.opacity(0.85))
                                 .position(x: rect.minX + 46, y: rect.minY + 16)
                         }
@@ -455,10 +469,10 @@ struct EditorView: View {
                         if zoneImgMode, let zi = zoneHover {
                             Text(String(format: "%+d EV band   %+.2f", zi - 4, edit.wrappedValue.zones_ev[zi]))
                                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                                .foregroundStyle(Ara.text1)
+                                .foregroundStyle(Theme.text1)
                                 .padding(.horizontal, 9).padding(.vertical, 4)
                                 .background(Capsule().fill(.black.opacity(0.72))
-                                    .overlay(Capsule().stroke(Ara.accent.opacity(0.5), lineWidth: 0.5)))
+                                    .overlay(Capsule().stroke(Theme.accent.opacity(0.5), lineWidth: 0.5)))
                                 .position(x: min(lastHover.x + 78, geo.size.width - 90),
                                           y: max(lastHover.y - 22, 14))
                                 .allowsHitTesting(false)
@@ -475,7 +489,7 @@ struct EditorView: View {
                         }
                     } else {
                         ProgressView()
-                            .tint(Ara.accent)
+                            .tint(Theme.accent)
                     }
                     // chrome toggles, darktable panel-edge arrows
                     HStack(spacing: 4) {
@@ -496,7 +510,7 @@ struct EditorView: View {
                     }
                     .padding(.horizontal, 6).padding(.vertical, 4)
                     .background(Capsule().fill(.black.opacity(0.6))
-                        .overlay(Capsule().stroke(Ara.hairline, lineWidth: 0.5)))
+                        .overlay(Capsule().stroke(Theme.hairline, lineWidth: 0.5)))
                     .position(x: geo.size.width - 44, y: 18)
                 }
                 .contentShape(Rectangle())
@@ -628,14 +642,14 @@ struct EditorView: View {
             IconAction(icon: "minus") { zoom = max(0.5, zoom - 0.25); if zoom <= 1 { pan = .zero } }
             Text(String(format: "%.0f%%", zoom * 100))
                 .font(.system(size: 10).monospacedDigit())
-                .foregroundStyle(Ara.text1)
+                .foregroundStyle(Theme.text1)
                 .frame(width: 34)
             IconAction(icon: "plus") { zoom = min(8, zoom + 0.25) }
             IconAction(icon: "1.magnifyingglass") { zoom = min(8, 1400 / CGFloat(image?.width ?? 1400)) }
         }
         .padding(.horizontal, 6).padding(.vertical, 4)
         .background(Capsule().fill(.black.opacity(0.6))
-            .overlay(Capsule().stroke(Ara.hairline, lineWidth: 0.5)))
+            .overlay(Capsule().stroke(Theme.hairline, lineWidth: 0.5)))
     }
 
     /// Stage drag routing: window move / gradient draw / pan when zoomed.
@@ -779,10 +793,10 @@ struct EditorView: View {
         ]
         Text(names[retouchMode] ?? retouchMode)
             .font(.system(size: 10.5, weight: .medium))
-            .foregroundStyle(Ara.text1)
+            .foregroundStyle(Theme.text1)
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(Capsule().fill(.black.opacity(0.72))
-                .overlay(Capsule().stroke(Ara.accent.opacity(0.5), lineWidth: 0.5)))
+                .overlay(Capsule().stroke(Theme.accent.opacity(0.5), lineWidth: 0.5)))
     }
 
     /// Cursor probe: sample the small sRGB probe buffer under the pointer
@@ -842,15 +856,15 @@ struct EditorView: View {
             }
             Rectangle()
                 .fill(Color.white.opacity(0.07))
-                .overlay(Rectangle().stroke(Ara.accent, lineWidth: 1.2))
+                .overlay(Rectangle().stroke(Theme.accent, lineWidth: 1.2))
                 .frame(width: max(CGFloat(fx1 - fx0) * nw, 6),
                        height: max(CGFloat(fy1 - fy0) * nh, 6))
                 .offset(x: CGFloat(fx0) * nw, y: CGFloat(fy0) * nh)
         }
         .frame(width: nw, height: nh)
-        .background(Ara.bg1.opacity(0.9))
+        .background(Theme.bg1.opacity(0.9))
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Ara.border, lineWidth: 0.75))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.border, lineWidth: 0.75))
         .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
         .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 0).onChanged { g in
@@ -867,29 +881,29 @@ struct EditorView: View {
     /// spinner and zoom readout — always visible, no inspector needed.
     private var statusBar: some View {
         VStack(spacing: 0) {
-            Ara.hairline.frame(height: 1)
+            Theme.hairline.frame(height: 1)
             HStack(spacing: 10) {
                 Text(probeText.isEmpty ? photo.name : probeText)
                     .font(.system(size: 9.5).monospacedDigit())
-                    .foregroundStyle(probeText.isEmpty ? Ara.text3 : Ara.text2)
+                    .foregroundStyle(probeText.isEmpty ? Theme.text3 : Theme.text2)
                     .lineLimit(1).truncationMode(.middle)
                 Spacer()
                 if rendering {
-                    ProgressView().controlSize(.mini).tint(Ara.accent)
+                    ProgressView().controlSize(.mini).tint(Theme.accent)
                         .frame(width: 10, height: 10)
                 }
                 Text(zoneImgMode ? "zone scroll" : String(format: "%.0f%%", zoom * 100))
                     .font(.system(size: 9.5).monospacedDigit())
-                    .foregroundStyle(zoneImgMode ? Ara.accent : Ara.text3)
+                    .foregroundStyle(zoneImgMode ? Theme.accent : Theme.text3)
             }
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Ara.bg1)
+            .background(Theme.bg1)
         }
     }
 
     private var filmstrip: some View {
         VStack(spacing: 0) {
-            Ara.hairline.frame(height: 1)
+            Theme.hairline.frame(height: 1)
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -905,7 +919,7 @@ struct EditorView: View {
                 .frame(height: 74)
                 .onAppear { proxy.scrollTo(photo.id, anchor: .center) }
             }
-            .background(Ara.bg1)
+            .background(Theme.bg1)
         }
     }
 
@@ -927,12 +941,12 @@ struct EditorView: View {
         return HStack(spacing: 6) {
             Text("\(idx + 1)")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(sel ? Color.black : Ara.text2)
+                .foregroundStyle(sel ? Color.black : Theme.text2)
                 .frame(width: 15, height: 15)
-                .background(Circle().fill(sel ? Ara.accent : Ara.bg3))
+                .background(Circle().fill(sel ? Theme.accent : Theme.bg3))
             Text(isBase ? "Base" : (st!.name.isEmpty ? "Stage \(idx)" : st!.name))
                 .font(.system(size: 10.5, weight: sel ? .semibold : .regular))
-                .foregroundStyle(st?.enabled == false ? Ara.text2.opacity(0.5) : Ara.text1)
+                .foregroundStyle(st?.enabled == false ? Theme.text2.opacity(0.5) : Theme.text1)
                 .lineLimit(1)
             if let s = st {
                 if s.invert {
@@ -944,16 +958,16 @@ struct EditorView: View {
                 } label: {
                     Image(systemName: s.enabled ? "eye" : "eye.slash")
                         .font(.system(size: 8))
-                        .foregroundStyle(s.enabled ? Ara.text2 : Color.orange)
+                        .foregroundStyle(s.enabled ? Theme.text2 : Color.orange)
                 }
                 .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
         .background(RoundedRectangle(cornerRadius: 5)
-            .fill(sel ? Ara.bg3 : Ara.bg2))
+            .fill(sel ? Theme.bg3 : Theme.bg2))
         .overlay(RoundedRectangle(cornerRadius: 5)
-            .stroke(sel ? Ara.accent : Ara.border, lineWidth: sel ? 1.2 : 0.6))
+            .stroke(sel ? Theme.accent : Theme.border, lineWidth: sel ? 1.2 : 0.6))
         .contentShape(Rectangle())
         .onTapGesture { selStage = idx }
         .contextMenu {
@@ -994,16 +1008,16 @@ struct EditorView: View {
                         ForEach(Array(recipe.stages.indices), id: \.self) { i in
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 7, weight: .bold))
-                                .foregroundStyle(Ara.text2.opacity(0.6))
+                                .foregroundStyle(Theme.text2.opacity(0.6))
                             stageChip(i + 1)
                         }
                         if recipe.stages.count < 4 {
                             Button(action: addStage) {
                                 Image(systemName: "plus")
                                     .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(Ara.text2)
+                                    .foregroundStyle(Theme.text2)
                                     .frame(width: 20, height: 20)
-                                    .background(Circle().stroke(Ara.border, lineWidth: 0.8))
+                                    .background(Circle().stroke(Theme.border, lineWidth: 0.8))
                             }
                             .buttonStyle(.plain)
                             .help("Add serial stage (⌥S)")
@@ -1017,17 +1031,17 @@ struct EditorView: View {
                     if geo.size.width >= 340 {
                         HStack(spacing: 4) {
                             Text("Opacity")
-                                .font(.system(size: 9)).foregroundStyle(Ara.text2)
+                                .font(.system(size: 9)).foregroundStyle(Theme.text2)
                             Slider(value: $recipe.stages[i].opacity, in: 0...1)
                                 .frame(width: 90)
                             Text(String(format: "%.2f", recipe.stages[i].opacity))
                                 .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(Ara.text2)
+                                .foregroundStyle(Theme.text2)
                                 .frame(width: 32)
                             Toggle("Invert", isOn: $recipe.stages[i].invert)
                                 .toggleStyle(.checkbox)
                                 .font(.system(size: 9))
-                                .foregroundStyle(Ara.text2)
+                                .foregroundStyle(Theme.text2)
                             stageOpsMenu(i)
                         }
                     } else {
@@ -1042,9 +1056,9 @@ struct EditorView: View {
             .padding(.horizontal, 10).padding(.vertical, 5)
         }
         .frame(height: 32)
-        .background(Ara.bg1)
+        .background(Theme.bg1)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(Ara.border).frame(height: 0.5)
+            Rectangle().fill(Theme.border).frame(height: 0.5)
         }
     }
 
@@ -1074,7 +1088,7 @@ struct EditorView: View {
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.system(size: 11))
-                .foregroundStyle(Ara.text2)
+                .foregroundStyle(Theme.text2)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -1100,10 +1114,10 @@ struct EditorView: View {
                 HStack(spacing: 8) {
                     Text(photo.name)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Ara.text1)
+                        .foregroundStyle(Theme.text1)
                         .lineLimit(1).truncationMode(.middle)
                     if dirty {
-                        Circle().fill(Ara.accent).frame(width: 6, height: 6)
+                        Circle().fill(Theme.accent).frame(width: 6, height: 6)
                     }
                     Spacer()
                     Stars(rating: $rating)
@@ -1145,19 +1159,19 @@ struct EditorView: View {
                             Text(cmp == .off ? "Compare" : cmp.label)
                                 .font(.system(size: 10.5, weight: .medium))
                         }
-                        .foregroundStyle(cmp == .off ? Ara.text2 : Ara.accent)
+                        .foregroundStyle(cmp == .off ? Theme.text2 : Theme.accent)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .background(RoundedRectangle(cornerRadius: 6)
-                            .fill(cmp == .off ? Ara.bg3 : Ara.accentSoft)
+                            .fill(cmp == .off ? Theme.bg3 : Theme.accentSoft)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(
-                                cmp == .off ? Ara.hairline : Ara.accent.opacity(0.4), lineWidth: 0.5)))
+                                cmp == .off ? Theme.hairline : Theme.accent.opacity(0.4), lineWidth: 0.5)))
                     }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
-            .background(Ara.bg1)
-            .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+            .background(Theme.bg1)
+            .overlay(alignment: .bottom) { Theme.hairline.frame(height: 1) }
 
             paletteStrip
 
@@ -1166,7 +1180,7 @@ struct EditorView: View {
                 HStack {
                     Text(palette.title.uppercased())
                         .font(.system(size: 9.5, weight: .semibold)).tracking(1.2)
-                        .foregroundStyle(Ara.text2)
+                        .foregroundStyle(Theme.text2)
                     Spacer()
                     if paletteDirty(palette) {
                         Button {
@@ -1174,7 +1188,7 @@ struct EditorView: View {
                         } label: {
                             Image(systemName: "arrow.counterclockwise")
                                 .font(.system(size: 9.5, weight: .bold))
-                                .foregroundStyle(Ara.accent)
+                                .foregroundStyle(Theme.accent)
                         }
                         .buttonStyle(.plain)
                         .help("Reset this palette")
@@ -1182,12 +1196,12 @@ struct EditorView: View {
                 }
                 Text(palette.hint)
                     .font(.system(size: 8.5))
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
-            .background(Ara.bg1)
-            .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+            .background(Theme.bg1)
+            .overlay(alignment: .bottom) { Theme.hairline.frame(height: 1) }
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     paletteContent
@@ -1199,8 +1213,8 @@ struct EditorView: View {
 
             actionBar
         }
-        .background(Ara.bg1)
-        .overlay(alignment: .leading) { Ara.hairline.frame(width: 1) }
+        .background(Theme.bg1)
+        .overlay(alignment: .leading) { Theme.hairline.frame(width: 1) }
     }
 
     /// DaVinci palette tab strip: icon per palette, underline when active,
@@ -1216,21 +1230,21 @@ struct EditorView: View {
                         ZStack(alignment: .topTrailing) {
                             Image(systemName: p.icon)
                                 .font(.system(size: 12))
-                                .foregroundStyle(palette == p ? Ara.accent : Ara.text2)
+                                .foregroundStyle(palette == p ? Theme.accent : Theme.text2)
                                 .frame(width: 18, height: 16)
                             if paletteDirty(p) {
-                                Circle().fill(Ara.accent)
+                                Circle().fill(Theme.accent)
                                     .frame(width: 4, height: 4)
                                     .offset(x: 3, y: -2)
                             }
                         }
                         Rectangle()
-                            .fill(palette == p ? Ara.accent : .clear)
+                            .fill(palette == p ? Theme.accent : .clear)
                             .frame(height: 2)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 5)
-                    .background(palette == p ? Ara.bg2 : .clear)
+                    .background(palette == p ? Theme.bg2 : .clear)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1238,8 +1252,8 @@ struct EditorView: View {
             }
         }
         .padding(.horizontal, 4)
-        .background(Ara.bg1)
-        .overlay(alignment: .bottom) { Ara.hairline.frame(height: 1) }
+        .background(Theme.bg1)
+        .overlay(alignment: .bottom) { Theme.hairline.frame(height: 1) }
     }
 
     @ViewBuilder
@@ -1272,8 +1286,8 @@ struct EditorView: View {
                 if !hist.isEmpty {
                     HistogramView(hist: hist).frame(height: 72)
                 } else {
-                    Rectangle().fill(Ara.bg3).frame(height: 72)
-                        .overlay(ProgressView().tint(Ara.text3))
+                    Rectangle().fill(Theme.bg3).frame(height: 72)
+                        .overlay(ProgressView().tint(Theme.text3))
                 }
             }
             Panel("White Balance", trailing: {
@@ -1284,8 +1298,8 @@ struct EditorView: View {
                 SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
                            (.manual, "Manual"), (.pick, "Pick")],
                           selection: $recipe.wb_mode)
-                SliderRow("Temp", $recipe.temperature, -1...1, track: Ara.tempTrack)
-                SliderRow("Tint", $recipe.tint, -1...1, track: Ara.tintTrack)
+                SliderRow("Temp", $recipe.temperature, -1...1, track: Theme.tempTrack)
+                SliderRow("Tint", $recipe.tint, -1...1, track: Theme.tintTrack)
             }
             Panel("Tone", trailing: {
                 ToolChip(label: "Auto", icon: "wand.and.stars") { runAuto(.all) }
@@ -1324,8 +1338,8 @@ struct EditorView: View {
                 if !hist.isEmpty {
                     HistogramView(hist: hist).frame(height: 84)
                 } else {
-                    Rectangle().fill(Ara.bg3).frame(height: 84)
-                        .overlay(ProgressView().tint(Ara.text3))
+                    Rectangle().fill(Theme.bg3).frame(height: 84)
+                        .overlay(ProgressView().tint(Theme.text3))
                 }
             }
             Panel("Scopes") {
@@ -1363,7 +1377,7 @@ struct EditorView: View {
                 Text(scopeKind == "parade"
                      ? "Drag up/down on the parade = exposure · double-click resets"
                      : "Switch to Parade for drag-to-expose")
-                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                    .font(.system(size: 8.5)).foregroundStyle(Theme.text3)
             }
         }
     }
@@ -1382,8 +1396,8 @@ struct EditorView: View {
                     SliderRow("Pick Area", $recipe.wb_pick_size, 0.002...0.2, reset: 0.025)
                         .help("Sampling half-width of the WB eyedropper as a fraction of the frame")
                 }
-                SliderRow("Temp", $recipe.temperature, -1...1, track: Ara.tempTrack)
-                SliderRow("Tint", $recipe.tint, -1...1, track: Ara.tintTrack)
+                SliderRow("Temp", $recipe.temperature, -1...1, track: Theme.tempTrack)
+                SliderRow("Tint", $recipe.tint, -1...1, track: Theme.tintTrack)
             }
             Panel("Tone", trailing: {
                 ToolChip(label: "Auto", icon: "wand.and.stars") {
@@ -1395,10 +1409,10 @@ struct EditorView: View {
             }) {
                 HStack(spacing: 6) {
                     Toggle("Auto Exp", isOn: edit.auto_exposure)
-                        .font(.system(size: 10)).foregroundStyle(Ara.text2)
+                        .font(.system(size: 10)).foregroundStyle(Theme.text2)
                         .controlSize(.mini)
                     Toggle("Auto Contrast", isOn: edit.auto_contrast)
-                        .font(.system(size: 10)).foregroundStyle(Ara.text2)
+                        .font(.system(size: 10)).foregroundStyle(Theme.text2)
                         .controlSize(.mini)
                 }
                 SliderRow("Exposure", edit.exposure, -4...4, step: 0.05)
@@ -1430,7 +1444,7 @@ struct EditorView: View {
                 HStack(spacing: 6) {
                     Text("LUT")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(Ara.text2)
+                        .foregroundStyle(Theme.text2)
                         .frame(width: 60, alignment: .leading)
                     ToolChip(label: edit.wrappedValue.lut_file.isEmpty
                              ? "Choose .cube…"
@@ -1448,11 +1462,11 @@ struct EditorView: View {
                 }
             }
             Panel("Split Tone") {
-                SliderRow("Shd Hue", edit.shadow_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
+                SliderRow("Shd Hue", edit.shadow_hue, 0...1, reset: 0.55, track: Theme.hueTrack)
                 SliderRow("Shd Sat", edit.shadow_sat, 0...1)
-                SliderRow("Mid Hue", edit.midtone_hue, 0...1, reset: 0.55, track: Ara.hueTrack)
+                SliderRow("Mid Hue", edit.midtone_hue, 0...1, reset: 0.55, track: Theme.hueTrack)
                 SliderRow("Mid Sat", edit.midtone_sat, 0...1)
-                SliderRow("Hi Hue", edit.highlight_hue, 0...1, reset: 0.08, track: Ara.hueTrack)
+                SliderRow("Hi Hue", edit.highlight_hue, 0...1, reset: 0.08, track: Theme.hueTrack)
                 SliderRow("Hi Sat", edit.highlight_sat, 0...1)
             }
         }
@@ -1474,7 +1488,7 @@ struct EditorView: View {
                     }
                     Spacer()
                     Text(curveName(curveChan))
-                        .font(.system(size: 9.5)).foregroundStyle(Ara.text3)
+                        .font(.system(size: 9.5)).foregroundStyle(Theme.text3)
                 }
             }
         }
@@ -1500,7 +1514,7 @@ struct EditorView: View {
                 Text(zoneImgMode
                      ? "Hover the photo and scroll — the EV badge marks the band under the cursor"
                      : "EV gain per luminance band (−4…+4 EV around mid grey)")
-                    .font(.system(size: 8.5)).foregroundStyle(zoneImgMode ? Ara.accent : Ara.text3)
+                    .font(.system(size: 8.5)).foregroundStyle(zoneImgMode ? Theme.accent : Theme.text3)
             }
             Panel("HDR Zones") {
                 ZoneRow("Dark", edit.z_dark)
@@ -1532,11 +1546,11 @@ struct EditorView: View {
                             Circle()
                                 .fill(Color(hue: Self.sliceHues[i], saturation: 0.85, brightness: on ? 1.0 : 0.55))
                                 .frame(width: 16, height: 16)
-                                .overlay(Circle().stroke(selSlice == i ? Ara.accent : Ara.border,
+                                .overlay(Circle().stroke(selSlice == i ? Theme.accent : Theme.border,
                                                          lineWidth: selSlice == i ? 1.6 : 0.5))
                             Text(Self.sliceNames[i].prefix(1))
                                 .font(.system(size: 7.5))
-                                .foregroundStyle(selSlice == i ? Ara.accent : Ara.text2)
+                                .foregroundStyle(selSlice == i ? Theme.accent : Theme.text2)
                         }
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
@@ -1548,7 +1562,7 @@ struct EditorView: View {
                 HStack {
                     Text(Self.sliceNames[selSlice])
                         .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(Ara.text1)
+                        .foregroundStyle(Theme.text1)
                     Spacer()
                     Toggle("", isOn: Binding(
                         get: { edit.wrappedValue.color_slice[selSlice][3] > 0.5 },
@@ -1569,7 +1583,7 @@ struct EditorView: View {
                     set: { edit.wrappedValue.color_slice[selSlice][2] = -$0; edit.wrappedValue.color_slice[selSlice][3] = 1 }),
                     -0.6...0.6, reset: 0)
                 Text("Density adds depth — positive darkens the wedge, negative lifts it")
-                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                    .font(.system(size: 8.5)).foregroundStyle(Theme.text3)
             }
         }
     }
@@ -1614,7 +1628,7 @@ struct EditorView: View {
                         for k in 1...4 {
                             let rr = r * CGFloat(k) / 4
                             ctx.stroke(Circle().path(in: CGRect(x: c.x - rr, y: c.y - rr, width: rr * 2, height: rr * 2)),
-                                       with: .color(Ara.text2.opacity(k == 4 ? 0.5 : 0.22)), lineWidth: k == 4 ? 1 : 0.5)
+                                       with: .color(Theme.text2.opacity(k == 4 ? 0.5 : 0.22)), lineWidth: k == 4 ? 1 : 0.5)
                         }
                         // spokes every 30° + wedge tint ticks on the rim
                         for k in 0..<12 {
@@ -1622,7 +1636,7 @@ struct EditorView: View {
                             var p = Path()
                             p.move(to: c)
                             p.addLine(to: CGPoint(x: c.x + cos(a) * r, y: c.y + sin(a) * r))
-                            ctx.stroke(p, with: .color(Ara.text2.opacity(0.15)), lineWidth: 0.5)
+                            ctx.stroke(p, with: .color(Theme.text2.opacity(0.15)), lineWidth: 0.5)
                             ctx.fill(Circle().path(in: CGRect(
                                 x: c.x + cos(a) * r - 2.5, y: c.y + sin(a) * r - 2.5,
                                 width: 5, height: 5)),
@@ -1692,10 +1706,10 @@ struct EditorView: View {
                         })
                 }
                 .aspectRatio(1, contentMode: .fit)
-                .background(Ara.bg0)
+                .background(Theme.bg0)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 Text("\(edit.wrappedValue.warper.count) point\(edit.wrappedValue.warper.count == 1 ? "" : "s") — ring = pinned colour, dot = where it moves")
-                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                    .font(.system(size: 8.5)).foregroundStyle(Theme.text3)
             }
         }
     }
@@ -1705,7 +1719,7 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 10) {
             Panel("Qualifier", trailing: {
                 Toggle("", isOn: edit.q_enabled)
-                    .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                    .labelsHidden().controlSize(.mini).tint(Theme.accent)
                     .onChange(of: edit.wrappedValue.q_enabled) { _, on in
                         if !on { edit.wrappedValue.qh[1] = 0; edit.wrappedValue.q_show = false }
                         else if edit.wrappedValue.qh[1] == 0 { edit.wrappedValue.qh[1] = 0.1 }
@@ -1713,7 +1727,7 @@ struct EditorView: View {
             }) {
                 // eyedropper row: pick / add / subtract
                 HStack(spacing: 6) {
-                    Text("Pick").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                    Text("Pick").font(.system(size: 10.5)).foregroundStyle(Theme.text2)
                     ToolChip(label: "New", icon: "eyedropper",
                              active: retouchMode == "qpick") {
                         retouchMode = retouchMode == "qpick" ? "off" : "qpick"
@@ -1765,20 +1779,20 @@ struct EditorView: View {
                     SliderRow("Lum Soft", edit.ql[2], 0.01...0.4, reset: 0.1)
                     Text("MATTE FINESSE")
                         .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                     SliderRow("Clean Blk", edit.q_clean[0], 0...1)
                     SliderRow("Clean Wht", edit.q_clean[1], 0...1, reset: 1)
                     SliderRow("Blur", edit.q_blur, 0...1)
                     HStack {
-                        Text("Invert mask").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                        Text("Invert mask").font(.system(size: 10.5)).foregroundStyle(Theme.text2)
                         Spacer()
                         Toggle("", isOn: edit.q_invert)
-                            .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                            .labelsHidden().controlSize(.mini).tint(Theme.accent)
                     }
                     Text("ADJUST INSIDE KEY")
                         .font(.system(size: 8.5, weight: .semibold)).tracking(1.2)
-                        .foregroundStyle(Ara.text3)
-                    SliderRow("Hue Δ", edit.qadj[0], -0.5...0.5, track: Ara.hueTrack)
+                        .foregroundStyle(Theme.text3)
+                    SliderRow("Hue Δ", edit.qadj[0], -0.5...0.5, track: Theme.hueTrack)
                     SliderRow("Sat Δ", edit.qadj[1], -1...1)
                     SliderRow("Lum Δ", edit.qadj[2], -1...1)
                     SliderRow("Temp Δ", edit.qadj[3], -1...1)
@@ -1818,7 +1832,7 @@ struct EditorView: View {
                 if edit.wrappedValue.windows.isEmpty {
                     Text("Add a circle, gradient, or luminance window, then tap or drag on the image. " +
                          "Select a window row, then drag on the image to move it.")
-                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .font(.system(size: 10)).foregroundStyle(Theme.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach(edit.wrappedValue.windows) { w in
@@ -1850,13 +1864,13 @@ struct EditorView: View {
                     }
                 }
                 HStack {
-                    Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                    Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Theme.text2)
                     Spacer()
                     Toggle("", isOn: Binding(
                         get: { edit.wrappedValue.mono != [0, 0, 0] },
                         set: { edit.wrappedValue.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0] }
                     ))
-                    .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                    .labelsHidden().controlSize(.mini).tint(Theme.accent)
                 }
                 if edit.wrappedValue.mono != [0, 0, 0] {
                     TriRow("Mono", edit.mono, 0...1)
@@ -1878,7 +1892,7 @@ struct EditorView: View {
                     if pendingClone != nil {
                         Text("Tap destination")
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Ara.accent)
+                            .foregroundStyle(Theme.accent)
                     }
                 } else if retouchMode == "dodge" || retouchMode == "burn" {
                     SliderRow("Radius", $lightRadius, 0.05...0.6, reset: 0.25)
@@ -1886,10 +1900,10 @@ struct EditorView: View {
                 }
                 // adjustment brush: paint strokes, layer holds the adjustment
                 if retouchMode == "brush" || !edit.wrappedValue.brushes.isEmpty {
-                    Divider().overlay(Ara.hairline)
+                    Divider().overlay(Theme.hairline)
                     HStack(spacing: 6) {
                         Text("Brush").font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(Ara.text2)
+                            .foregroundStyle(Theme.text2)
                         Spacer()
                         ToolChip(label: "Erase", icon: "eraser", active: brushErase) {
                             brushErase.toggle()
@@ -1924,17 +1938,17 @@ struct EditorView: View {
                         SliderRow("Temp", bl.temp, -1...1)
                         SliderRow("Opacity", bl.opacity, 0...1, reset: 1)
                         HStack(spacing: 6) {
-                            Text("Link Q").font(.system(size: 10)).foregroundStyle(Ara.text2)
+                            Text("Link Q").font(.system(size: 10)).foregroundStyle(Theme.text2)
                             Spacer()
                             Toggle("", isOn: bl.linkQ)
-                                .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                                .labelsHidden().controlSize(.mini).tint(Theme.accent)
                         }
                         .help("Gate this brush layer by the HSL qualifier matte")
                         HStack(spacing: 6) {
-                            Text("Edge Aware").font(.system(size: 10)).foregroundStyle(Ara.text2)
+                            Text("Edge Aware").font(.system(size: 10)).foregroundStyle(Theme.text2)
                             Spacer()
                             Toggle("", isOn: bl.edgeAware)
-                                .labelsHidden().controlSize(.mini).tint(Ara.accent)
+                                .labelsHidden().controlSize(.mini).tint(Theme.accent)
                         }
                         .help("Strokes stick to the colour under their first dab — paint a sky without bleeding into buildings")
                         if bl.edgeAware.wrappedValue {
@@ -1995,14 +2009,14 @@ struct EditorView: View {
                         Text("Preparing (several minutes on CPU)…")
                     } else if aidnReady {
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Ara.accent)
+                            .foregroundStyle(Theme.accent)
                         Text(aidnInfo.isEmpty ? "Denoised base ready" : aidnInfo)
                     } else {
                         Text("Runs the neural denoise once and caches the result next to the photo")
                     }
                 }
                 .font(.system(size: 10))
-                .foregroundStyle(Ara.text3)
+                .foregroundStyle(Theme.text3)
             }
         }
     }
@@ -2019,7 +2033,7 @@ struct EditorView: View {
                 SliderRow("Grain", $recipe.grain, 0...1)
                 SliderRow("Glow", $recipe.glow, 0...1)
                 SliderRow("Flare", $recipe.flare[2], 0...1)
-                SliderRow("Fl Hue", $recipe.flare[3], 0...1, track: Ara.hueTrack)
+                SliderRow("Fl Hue", $recipe.flare[3], 0...1, track: Theme.hueTrack)
             }
         }
     }
@@ -2039,10 +2053,10 @@ struct EditorView: View {
                 HStack(spacing: 6) {
                     Image(systemName: lensProfile.isEmpty ? "camera.metering.unknown" : "checkmark.circle.fill")
                         .font(.system(size: 9))
-                        .foregroundStyle(lensProfile.isEmpty ? Ara.text3 : Ara.accent)
+                        .foregroundStyle(lensProfile.isEmpty ? Theme.text3 : Theme.accent)
                     Text(lensProfile.isEmpty ? "No lens profile" : lensProfile)
                         .font(.system(size: 9.5))
-                        .foregroundStyle(lensProfile.isEmpty ? Ara.text3 : Ara.text1)
+                        .foregroundStyle(lensProfile.isEmpty ? Theme.text3 : Theme.text1)
                         .lineLimit(1).truncationMode(.middle)
                     Spacer()
                 }
@@ -2057,7 +2071,7 @@ struct EditorView: View {
                 HStack(spacing: 4) {
                     Text("Aspect")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(Ara.text2)
+                        .foregroundStyle(Theme.text2)
                         .frame(width: 60, alignment: .leading)
                     ForEach([(name: "Free", k: 0.0), ("1:1", 1.0), ("4:3", 4.0 / 3.0),
                              ("3:2", 1.5), ("16:9", 16.0 / 9.0)], id: \.name) { a in
@@ -2084,8 +2098,8 @@ struct EditorView: View {
             }) {
                 if versions.isEmpty {
                     Text("Save a named snapshot of the current grade, then click it " +
-                         "to jump back. Versions persist inside the .araware.json sidecar.")
-                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                         "to jump back. Versions persist inside the .safelight.json sidecar.")
+                        .font(.system(size: 10)).foregroundStyle(Theme.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach(versions) { v in
@@ -2102,20 +2116,20 @@ struct EditorView: View {
                 if refRecipe != nil {
                     HStack(spacing: 6) {
                         Image(systemName: "rectangle.split.2x1")
-                            .font(.system(size: 10)).foregroundStyle(Ara.accent)
+                            .font(.system(size: 10)).foregroundStyle(Theme.accent)
                         Text("Wipe ref: \(refName)")
-                            .font(.system(size: 10)).foregroundStyle(Ara.text1)
+                            .font(.system(size: 10)).foregroundStyle(Theme.text1)
                             .lineLimit(1)
                         Spacer()
                         Button("Clear") { clearReference() }
-                            .font(.system(size: 10)).foregroundStyle(Ara.accent)
+                            .font(.system(size: 10)).foregroundStyle(Theme.accent)
                             .buttonStyle(.plain)
                     }
                 }
                 if stills.isEmpty {
                     Text("Save the current grade as a reusable still — click one to apply it " +
                          "to this photo, or use it as the wipe reference.")
-                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .font(.system(size: 10)).foregroundStyle(Theme.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -2128,15 +2142,15 @@ struct EditorView: View {
                                             .frame(width: 84, height: 56)
                                             .clipShape(RoundedRectangle(cornerRadius: 4))
                                             .overlay(RoundedRectangle(cornerRadius: 4)
-                                                .stroke(Ara.border, lineWidth: 0.5))
+                                                .stroke(Theme.border, lineWidth: 0.5))
                                     } else {
                                         RoundedRectangle(cornerRadius: 4)
-                                            .fill(Ara.bg3)
+                                            .fill(Theme.bg3)
                                             .frame(width: 84, height: 56)
                                             .overlay(ProgressView().controlSize(.mini))
                                     }
                                     Text(st.name)
-                                        .font(.system(size: 8.5)).foregroundStyle(Ara.text2)
+                                        .font(.system(size: 8.5)).foregroundStyle(Theme.text2)
                                         .lineLimit(1)
                                         .frame(width: 84)
                                 }
@@ -2161,7 +2175,7 @@ struct EditorView: View {
             Panel("Edit History") {
                 if undoStack.isEmpty {
                     Text("Edits appear here as you make them — click a step to jump back.")
-                        .font(.system(size: 10)).foregroundStyle(Ara.text3)
+                        .font(.system(size: 10)).foregroundStyle(Theme.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach(Array(undoStack.enumerated().reversed()), id: \.offset) { i, _ in
@@ -2171,11 +2185,11 @@ struct EditorView: View {
                         HStack(spacing: 7) {
                             Text(i == 0 ? "0" : "\(i)")
                                 .font(.system(size: 9).monospacedDigit())
-                                .foregroundStyle(Ara.text3)
+                                .foregroundStyle(Theme.text3)
                                 .frame(width: 14, alignment: .trailing)
                             Text(i == 0 ? "Original" : "Edit \(i)")
                                 .font(.system(size: 10.5))
-                                .foregroundStyle(Ara.text2)
+                                .foregroundStyle(Theme.text2)
                             Spacer()
                         }
                         .padding(.horizontal, 8).padding(.vertical, 4)
@@ -2187,11 +2201,11 @@ struct EditorView: View {
                 HStack(spacing: 7) {
                     Text("\(undoStack.count)")
                         .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(Ara.accent)
+                        .foregroundStyle(Theme.accent)
                         .frame(width: 14, alignment: .trailing)
                     Text("Current")
                         .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(Ara.text1)
+                        .foregroundStyle(Theme.text1)
                     Spacer()
                 }
                 .padding(.horizontal, 8).padding(.vertical, 4)
@@ -2201,26 +2215,26 @@ struct EditorView: View {
 
     private var actionBar: some View {
         VStack(spacing: 0) {
-            Ara.hairline.frame(height: 1)
+            Theme.hairline.frame(height: 1)
             HStack(spacing: 6) {
                 if rendering {
-                    ProgressView().controlSize(.small).tint(Ara.accent)
+                    ProgressView().controlSize(.small).tint(Theme.accent)
                         .frame(width: 14, height: 14)
                 }
                 Text(status.isEmpty ? (dirty ? "Unsaved changes" : photo.name) : status)
                     .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(dirty && status.isEmpty ? Ara.accent : Ara.text3)
+                    .foregroundStyle(dirty && status.isEmpty ? Theme.accent : Theme.text3)
                     .lineLimit(1).truncationMode(.middle)
                     .help(status)
                 Spacer()
                 IconAction(icon: "doc.on.doc") { copyRecipe() }
                 IconAction(icon: "clipboard") { pasteRecipe() }
                 IconAction(icon: "arrow.counterclockwise") { recipe = Recipe() }
-                Button("Save") { save() }.buttonStyle(AraSecondaryButton())
-                Button("Export") { export() }.buttonStyle(AraPrimaryButton())
+                Button("Save") { save() }.buttonStyle(SlSecondaryButton())
+                Button("Export") { export() }.buttonStyle(SlPrimaryButton())
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
-            .background(Ara.bg1)
+            .background(Theme.bg1)
         }
     }
 
@@ -2252,11 +2266,11 @@ struct EditorView: View {
         status = "Analyzing…"
         let p = photo.path
         Task {
-            let sug = await AraEngine.shared.work { $0.autoAnalyze(path: p) }
+            let sug = await SafelightEngine.shared.work { $0.autoAnalyze(path: p) }
             await MainActor.run {
                 autoBusy = false
                 guard let s = sug else {
-                    status = "Auto analysis failed: \(AraEngine.shared.lastError)"
+                    status = "Auto analysis failed: \(SafelightEngine.shared.lastError)"
                     return
                 }
                 switch scope {
@@ -2357,12 +2371,12 @@ struct EditorView: View {
     }
 
     private func curveTint(_ ch: Int) -> Color {
-        [Color.white, .red, .green, .blue, Ara.accent, Ara.accent, Ara.accent,
-         Ara.accent, Ara.accent][ch]
+        [Color.white, .red, .green, .blue, Theme.accent, Theme.accent, Theme.accent,
+         Theme.accent, Theme.accent][ch]
     }
 
     private func load() {
-        let sc = AraEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
+        let sc = SafelightEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
         baseline = sc.recipe
         baselineVersions = sc.versions
         versions = store.unsavedVersions[photo.id] ?? sc.versions
@@ -2394,13 +2408,13 @@ struct EditorView: View {
         panoMode = photo.name.lowercased().hasSuffix(".insp")
         if stills.isEmpty { loadGallery() }
         Task {
-            let meta = await AraEngine.shared.work { $0.metadata(path: photo.path) }
+            let meta = await SafelightEngine.shared.work { $0.metadata(path: photo.path) }
             if let d = meta.data(using: .utf8),
                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
                 lensProfile = (j["lens_profile"] as? String) ?? ""
             }
-            aidnReady = await AraEngine.shared.work { $0.aiDenoiseReady(path: photo.path) }
-            subjReady = await AraEngine.shared.work { $0.aiSubjectReady(path: photo.path) }
+            aidnReady = await SafelightEngine.shared.work { $0.aiDenoiseReady(path: photo.path) }
+            subjReady = await SafelightEngine.shared.work { $0.aiSubjectReady(path: photo.path) }
         }
         rerender()
     }
@@ -2417,7 +2431,7 @@ struct EditorView: View {
         }
         subjBusy = true
         Task {
-            let res = await AraEngine.shared.work { $0.aiSubjectPrepare(path: p) }
+            let res = await SafelightEngine.shared.work { $0.aiSubjectPrepare(path: p) }
             subjBusy = false
             if res.ok {
                 subjReady = true
@@ -2439,7 +2453,7 @@ struct EditorView: View {
         status = "Subject window added — tweak EV/Sat/Temp"
     }
 
-    /// SCUNet denoise pre-pass (engine src/ai.rs): bakes `<photo>.araware.aidn.jpg`
+    /// SCUNet denoise pre-pass (engine src/ai.rs): bakes `<photo>.safelight.aidn.jpg`
     /// from the current recipe's linear base, then the Amount slider blends it.
     private func runAiDenoise() {
         guard !aidnBusy else { return }
@@ -2447,7 +2461,7 @@ struct EditorView: View {
         let p = photo.path
         let r = recipe
         Task {
-            let res = await AraEngine.shared.work { $0.aiDenoisePrepare(path: p, recipe: r) }
+            let res = await SafelightEngine.shared.work { $0.aiDenoisePrepare(path: p, recipe: r) }
             aidnBusy = false
             if res.ok {
                 aidnReady = true
@@ -2464,15 +2478,15 @@ struct EditorView: View {
 
     private func save() {
         // start from the on-disk sidecar so flag/keywords survive a save
-        var sc = AraEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
+        var sc = SafelightEngine.shared.sidecar(path: photo.path, vslot: photo.vslot)
         sc.rating = rating
         sc.label = label
         sc.recipe = recipe
         sc.versions = versions
         let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
-        let ok = AraEngine.shared.writeSidecar(path: photo.path, vslot: photo.vslot, sc)
-        status = ok ? "Saved \(stem).araware.json"
-                    : "Save failed: \(AraEngine.shared.lastError)"
+        let ok = SafelightEngine.shared.writeSidecar(path: photo.path, vslot: photo.vslot, sc)
+        status = ok ? "Saved \(stem).safelight.json"
+                    : "Save failed: \(SafelightEngine.shared.lastError)"
         if ok {
             baseline = recipe
             baselineVersions = versions
@@ -2523,16 +2537,17 @@ struct EditorView: View {
         if baselineImg != nil { return }
         let r = refRecipe ?? baseline
         Task.detached { [path = photo.path] in
-            let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1400).0 }
+            let img = await SafelightEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 1400).0 }
             await MainActor.run { baselineImg = img }
         }
     }
 
-    // MARK: grade library (~/.araware/gallery)
+    // MARK: grade library (~/.safelight/gallery)
 
     private var galleryDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".araware/gallery", isDirectory: true)
+        safelightMigrateLegacyHome()
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".safelight/gallery", isDirectory: true)
     }
     private var galleryFile: URL { galleryDir.appendingPathComponent("stills.json") }
 
@@ -2564,7 +2579,7 @@ struct EditorView: View {
         // render the thumbnail in the background
         let path = photo.path, r = recipe, id = st.id, dir = galleryDir
         Task.detached {
-            let img = await AraEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 280).0 }
+            let img = await SafelightEngine.shared.work { $0.render(path: path, recipe: r, maxPx: 280).0 }
             var thumb: NSImage?
             if let img {
                 let rep = NSBitmapImageRep(cgImage: img)
@@ -2879,7 +2894,7 @@ struct EditorView: View {
             return
         }
         let prev = store.filtered[i - 1]
-        let r = store.unsavedEdits[prev.id] ?? AraEngine.shared.sidecar(path: prev.path, vslot: prev.vslot).recipe
+        let r = store.unsavedEdits[prev.id] ?? SafelightEngine.shared.sidecar(path: prev.path, vslot: prev.vslot).recipe
         recipe = r
         status = "Applied grade from \(prev.name)"
     }
@@ -2964,7 +2979,7 @@ struct EditorView: View {
         let gen = renderGen
         let r = recipe
         Task.detached { [path = photo.path] in
-            let (img, bins, wv, vc, ce) = await AraEngine.shared.work {
+            let (img, bins, wv, vc, ce) = await SafelightEngine.shared.work {
                 $0.renderScopes(path: path, recipe: r, maxPx: 1400)
             }
             await MainActor.run {
@@ -3004,11 +3019,11 @@ struct EditorView: View {
         let qual = expQuality
         let space = expSpace
         Task.detached { [path = photo.path] in
-            let img = await AraEngine.shared.work { $0.exportOpts(path: path, recipe: r, opts: opts) }
+            let img = await SafelightEngine.shared.work { $0.exportOpts(path: path, recipe: r, opts: opts) }
             await MainActor.run {
                 rendering = false
                 guard let img else {
-                    status = "Export failed: \(AraEngine.shared.lastError)"
+                    status = "Export failed: \(SafelightEngine.shared.lastError)"
                     return
                 }
                 let tagged = convertColorSpace(img, space)
@@ -3066,9 +3081,9 @@ struct EditorView: View {
     /// LR-style export settings: format, resize, output sharpening.
     private var exportSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Export").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ara.text1)
+            Text("Export").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text1)
             HStack(spacing: 8) {
-                Text("Format").font(.system(size: 10.5)).foregroundStyle(Ara.text2).frame(width: 78, alignment: .leading)
+                Text("Format").font(.system(size: 10.5)).foregroundStyle(Theme.text2).frame(width: 78, alignment: .leading)
                 SegPicker([("JPEG", "JPEG"), ("PNG", "PNG"), ("TIFF", "TIFF")],
                           selection: $expFormat)
             }
@@ -3076,34 +3091,34 @@ struct EditorView: View {
                 SliderRow("Quality", $expQuality, 0.5...1, reset: 0.92)
             }
             HStack(spacing: 8) {
-                Toggle("", isOn: $expResize).labelsHidden().controlSize(.mini).tint(Ara.accent)
-                Text("Resize to long edge").font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                Toggle("", isOn: $expResize).labelsHidden().controlSize(.mini).tint(Theme.accent)
+                Text("Resize to long edge").font(.system(size: 10.5)).foregroundStyle(Theme.text2)
                 Spacer()
                 TextField("", value: $expLongEdge, format: .number)
                     .textFieldStyle(.roundedBorder).font(.system(size: 10.5))
                     .frame(width: 72).disabled(!expResize)
-                Text("px").font(.system(size: 10)).foregroundStyle(Ara.text3)
+                Text("px").font(.system(size: 10)).foregroundStyle(Theme.text3)
             }
             SliderRow("Sharpen", $expSharpen, 0...1)
             HStack(spacing: 8) {
-                Text("Color Space").font(.system(size: 10.5)).foregroundStyle(Ara.text2).frame(width: 78, alignment: .leading)
+                Text("Color Space").font(.system(size: 10.5)).foregroundStyle(Theme.text2).frame(width: 78, alignment: .leading)
                 SegPicker([("sRGB", "sRGB"), ("Display P3", "P3"), ("Adobe RGB", "Adobe"), ("ProPhoto", "ProPhoto")],
                           selection: $expSpace)
             }
-            Text("ICC profile is embedded in the file.").font(.system(size: 9)).foregroundStyle(Ara.text3)
-            Text("Output sharpening is applied after resize.").font(.system(size: 9)).foregroundStyle(Ara.text3)
+            Text("ICC profile is embedded in the file.").font(.system(size: 9)).foregroundStyle(Theme.text3)
+            Text("Output sharpening is applied after resize.").font(.system(size: 9)).foregroundStyle(Theme.text3)
             HStack {
                 Spacer()
-                Button("Cancel") { showExportSheet = false }.buttonStyle(AraSecondaryButton())
+                Button("Cancel") { showExportSheet = false }.buttonStyle(SlSecondaryButton())
                 Button("Export…") {
                     showExportSheet = false
                     runExport()
-                }.buttonStyle(AraPrimaryButton())
+                }.buttonStyle(SlPrimaryButton())
             }
         }
         .padding(16)
         .frame(width: 320)
-        .background(Ara.bg1)
+        .background(Theme.bg1)
     }
 }
 
@@ -3116,7 +3131,7 @@ struct FilmCell: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            Ara.bg3
+            Theme.bg3
             if let image {
                 Image(image, scale: 1, label: Text(photo.name))
                     .resizable().scaledToFill()
@@ -3130,7 +3145,7 @@ struct FilmCell: View {
                     HStack {
                         Spacer()
                         Circle()
-                            .fill(Ara.accent)
+                            .fill(Theme.accent)
                             .frame(width: 7, height: 7)
                             .overlay(Circle().stroke(.black.opacity(0.6), lineWidth: 0.75))
                             .padding(4)
@@ -3141,10 +3156,10 @@ struct FilmCell: View {
         .frame(width: 84, height: 56)
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .overlay(RoundedRectangle(cornerRadius: 5)
-            .stroke(selected ? Ara.accent : Ara.hairline, lineWidth: selected ? 2 : 1))
+            .stroke(selected ? Theme.accent : Theme.hairline, lineWidth: selected ? 2 : 1))
         .opacity(selected ? 1 : 0.75)
         .task {
-            let img = await AraEngine.shared.work { $0.thumbnail(path: photo.path, maxPx: 160) }
+            let img = await SafelightEngine.shared.work { $0.thumbnail(path: photo.path, maxPx: 160) }
             await MainActor.run { image = img }
         }
     }
@@ -3166,10 +3181,11 @@ struct LookPicker: View {
     @State private var thumbPath = ""
     @State private var loading = false
 
-    /// DaVinci LUTs folder: ~/.araware/luts scanned for .cube files
+    /// DaVinci LUTs folder: ~/.safelight/luts scanned for .cube files
     private static func lutDir() -> URL {
+        safelightMigrateLegacyHome()
         let d = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".araware/luts", isDirectory: true)
+            .appendingPathComponent(".safelight/luts", isDirectory: true)
         try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         return d
     }
@@ -3228,59 +3244,59 @@ struct LookPicker: View {
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 7))
             }
-            .foregroundStyle(look.isEmpty ? Ara.text2 : Ara.accent)
+            .foregroundStyle(look.isEmpty ? Theme.text2 : Theme.accent)
             .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(Capsule().fill(look.isEmpty ? Ara.bg3 : Ara.accentSoft)
-                .overlay(Capsule().stroke(look.isEmpty ? Ara.hairline : Ara.accent.opacity(0.4), lineWidth: 0.5)))
+            .background(Capsule().fill(look.isEmpty ? Theme.bg3 : Theme.accentSoft)
+                .overlay(Capsule().stroke(look.isEmpty ? Theme.hairline : Theme.accent.opacity(0.4), lineWidth: 0.5)))
         }
         .buttonStyle(.plain)
         .popover(isPresented: $open, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("LOOKS")
                     .font(.system(size: 9, weight: .semibold)).tracking(1.2)
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
                 if !cameraLooks.isEmpty {
                     Text("CAMERA MATCHING")
                         .font(.system(size: 7.5, weight: .semibold)).tracking(1)
-                        .foregroundStyle(Ara.text3.opacity(0.7))
+                        .foregroundStyle(Theme.text3.opacity(0.7))
                 }
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
                           spacing: 8) {
                     ForEach(options, id: \.0) { v, name in
                         VStack(spacing: 3) {
                             ZStack {
-                                Ara.bg3
+                                Theme.bg3
                                 if let img = thumbs[v] {
                                     Image(img, scale: 1, label: Text(name))
                                         .resizable().scaledToFill()
                                 } else {
-                                    ProgressView().controlSize(.mini).tint(Ara.text3)
+                                    ProgressView().controlSize(.mini).tint(Theme.text3)
                                 }
                             }
                             .aspectRatio(1.5, contentMode: .fit)
                             .clipped()
                             Text(name)
                                 .font(.system(size: 8, weight: v == look ? .semibold : .regular))
-                                .foregroundStyle(v == look ? Ara.accent : Ara.text3)
+                                .foregroundStyle(v == look ? Theme.accent : Theme.text3)
                                 .lineLimit(1)
                         }
                         .padding(4)
-                        .background(Ara.bg2)
+                        .background(Theme.bg2)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(RoundedRectangle(cornerRadius: 6)
-                            .stroke(v == look ? Ara.accent : Ara.hairline,
+                            .stroke(v == look ? Theme.accent : Theme.hairline,
                                     lineWidth: v == look ? 1.5 : 0.5))
                         .contentShape(Rectangle())
                         .onTapGesture { look = v; open = false }
                     }
                 }
-                // .cube LUTs (DaVinci LUTs panel): files in ~/.araware/luts
+                // .cube LUTs (DaVinci LUTs panel): files in ~/.safelight/luts
                 Text("LUTS")
                     .font(.system(size: 7.5, weight: .semibold)).tracking(1)
-                    .foregroundStyle(Ara.text3.opacity(0.7))
+                    .foregroundStyle(Theme.text3.opacity(0.7))
                 if lutFiles.isEmpty {
-                    Text("drop .cube files into ~/.araware/luts")
-                        .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                    Text("drop .cube files into ~/.safelight/luts")
+                        .font(.system(size: 8.5)).foregroundStyle(Theme.text3)
                 }
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
                           spacing: 8) {
@@ -3288,26 +3304,26 @@ struct LookPicker: View {
                         let name = URL(fileURLWithPath: f).deletingPathExtension().lastPathComponent
                         VStack(spacing: 3) {
                             ZStack {
-                                Ara.bg3
+                                Theme.bg3
                                 if let img = lutThumbs[f] {
                                     Image(img, scale: 1, label: Text(name))
                                         .resizable().scaledToFill()
                                 } else {
-                                    ProgressView().controlSize(.mini).tint(Ara.text3)
+                                    ProgressView().controlSize(.mini).tint(Theme.text3)
                                 }
                             }
                             .aspectRatio(1.5, contentMode: .fit)
                             .clipped()
                             Text(name)
                                 .font(.system(size: 8, weight: f == lutFile ? .semibold : .regular))
-                                .foregroundStyle(f == lutFile ? Ara.accent : Ara.text3)
+                                .foregroundStyle(f == lutFile ? Theme.accent : Theme.text3)
                                 .lineLimit(1)
                         }
                         .padding(4)
-                        .background(Ara.bg2)
+                        .background(Theme.bg2)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(RoundedRectangle(cornerRadius: 6)
-                            .stroke(f == lutFile ? Ara.accent : Ara.hairline,
+                            .stroke(f == lutFile ? Theme.accent : Theme.hairline,
                                     lineWidth: f == lutFile ? 1.5 : 0.5))
                         .contentShape(Rectangle())
                         .onTapGesture { lutFile = (lutFile == f) ? "" : f; open = false }
@@ -3316,12 +3332,12 @@ struct LookPicker: View {
             }
             .padding(10)
             .frame(width: 300)
-            .background(Ara.bg1)
+            .background(Theme.bg1)
         }
     }
 
     /// One render per look at 220px; engine cache makes this fast enough.
-    /// Same for every .cube in ~/.araware/luts (applied over the base look).
+    /// Same for every .cube in ~/.safelight/luts (applied over the base look).
     private func loadThumbs() {
         if loading { return }
         loading = true
@@ -3336,7 +3352,7 @@ struct LookPicker: View {
             for (v, _) in options {
                 var r = base
                 r.look = v
-                let (img, _) = await AraEngine.shared.work {
+                let (img, _) = await SafelightEngine.shared.work {
                     $0.render(path: path, recipe: r, maxPx: 220)
                 }
                 if let img { out[v] = img }
@@ -3346,7 +3362,7 @@ struct LookPicker: View {
                 var r = base
                 r.lut_file = f
                 r.lut_amount = 1
-                let (img, _) = await AraEngine.shared.work {
+                let (img, _) = await SafelightEngine.shared.work {
                     $0.render(path: path, recipe: r, maxPx: 220)
                 }
                 if let img { lout[f] = img }
@@ -3391,16 +3407,16 @@ struct ColorWheel: View {
                     )
                     .opacity(0.55)
                     Circle().fill(
-                        RadialGradient(colors: [Ara.bg2.opacity(0.85), .clear],
+                        RadialGradient(colors: [Theme.bg2.opacity(0.85), .clear],
                                        center: .center, startRadius: 0, endRadius: r * 0.75)
                     )
-                    Circle().stroke(Ara.border, lineWidth: 0.5)
+                    Circle().stroke(Theme.border, lineWidth: 0.5)
                     // crosshair
                     Path { p in
                         p.move(to: .init(x: cx - r, y: cy)); p.addLine(to: .init(x: cx + r, y: cy))
                         p.move(to: .init(x: cx, y: cy - r)); p.addLine(to: .init(x: cx, y: cy + r))
                     }
-                    .stroke(Ara.text3.opacity(0.4), lineWidth: 0.5)
+                    .stroke(Theme.text3.opacity(0.4), lineWidth: 0.5)
                     let c = chroma
                     let bx = cx + CGFloat(c.u) * r * 4
                     let by = cy - CGFloat(c.w) * r * 4
@@ -3443,11 +3459,11 @@ struct ColorWheel: View {
                 step: 0.01, reset: center, height: 12)
             Text(title.uppercased())
                 .font(.system(size: 8, weight: .semibold)).tracking(1)
-                .foregroundStyle(Ara.text3)
+                .foregroundStyle(Theme.text3)
             Text(String(format: "%.2f  %.2f  %.2f", v[0], v[1], v[2]))
                 .font(.system(size: 7.5).monospacedDigit())
                 .foregroundStyle(
-                    v == [center, center, center] ? Ara.text3 : Ara.accent.opacity(0.8))
+                    v == [center, center, center] ? Theme.text3 : Theme.accent.opacity(0.8))
                 .lineLimit(1).minimumScaleFactor(0.8)
         }
     }
@@ -3476,19 +3492,19 @@ struct ZoneRow: View {
             HStack(spacing: 7) {
                 Text(title.uppercased())
                     .font(.system(size: 9.5, weight: .semibold)).tracking(0.8)
-                    .foregroundStyle(Ara.text2)
+                    .foregroundStyle(Theme.text2)
                     .frame(width: 52, alignment: .leading)
                 TrackSlider(value: $z[2], range: -1...1)
                 Text(String(format: "%+.2f", z[2]))
                     .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(z[2] == 0 ? Ara.text3 : Ara.accent)
+                    .foregroundStyle(z[2] == 0 ? Theme.text3 : Theme.accent)
                     .frame(width: 38, alignment: .trailing)
             }
             HStack(spacing: 5) {
                 Text("hue")
-                    .font(.system(size: 8.5)).foregroundStyle(Ara.text3)
+                    .font(.system(size: 8.5)).foregroundStyle(Theme.text3)
                     .frame(width: 52, alignment: .leading)
-                TrackSlider(value: $z[0], range: 0...1, height: 12, track: Ara.hueTrack)
+                TrackSlider(value: $z[0], range: 0...1, height: 12, track: Theme.hueTrack)
                 TrackSlider(value: $z[1], range: 0...1, height: 12)
                 TrackSlider(value: $z[3], range: -1...1, height: 12)
             }
@@ -3584,7 +3600,7 @@ struct CurveEditor: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Ara.hairline, lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.hairline, lineWidth: 1))
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { g in
@@ -3780,7 +3796,7 @@ struct ScopesView: View {
         }
         .background(Color(red: 0.045, green: 0.045, blue: 0.055))
         .clipShape(RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Ara.hairline, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.hairline, lineWidth: 1))
     }
 }
 
@@ -3825,7 +3841,7 @@ struct HistogramView: View {
         }
         .background(Color(red: 0.05, green: 0.05, blue: 0.06))
         .clipShape(RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Ara.hairline, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.hairline, lineWidth: 1))
     }
 }
 
@@ -3850,7 +3866,7 @@ struct LabelPicker: View {
                 Button { label = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 10))
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                 }
                 .buttonStyle(.plain)
             }
@@ -3900,7 +3916,7 @@ extension EditorView {
             // DaVinci overlay: white-ish outline; the selected window is amber
             // and thicker; a disabled window is dimmed to a hairline.
             let sel = w.id == selWindow
-            let col: Color = sel ? Ara.accent : .cyan
+            let col: Color = sel ? Theme.accent : .cyan
             let alpha: Double = w.enabled ? (sel ? 1.0 : 0.85) : 0.25
             let lw: CGFloat = sel ? 2.5 : 1.5
             if w.kind == "lum" {
@@ -3932,7 +3948,7 @@ extension EditorView {
                     var cr = Path()
                     cr.move(to: .init(x: cx - 6, y: cy)); cr.addLine(to: .init(x: cx + 6, y: cy))
                     cr.move(to: .init(x: cx, y: cy - 6)); cr.addLine(to: .init(x: cx, y: cy + 6))
-                    ctx.stroke(cr, with: .color(Ara.accent.opacity(0.9)), lineWidth: 1)
+                    ctx.stroke(cr, with: .color(Theme.accent.opacity(0.9)), lineWidth: 1)
                 }
             }
         }
@@ -3956,7 +3972,7 @@ extension EditorView {
         for (li, layer) in edit.wrappedValue.brushes.enumerated() {
             let sel = li == selBrush
             for st in layer.strokes where st.pts.count >= 2 {
-                let col: Color = st.erase ? .red : (sel ? Ara.accent : .white)
+                let col: Color = st.erase ? .red : (sel ? Theme.accent : .white)
                 let alpha: Double = layer.enabled ? (sel ? 0.95 : 0.55) : 0.2
                 var ln = Path()
                 ln.move(to: .init(x: fx2sx(st.pts[0][0]), y: fy2sy(st.pts[0][1])))
@@ -3983,7 +3999,7 @@ extension EditorView {
             for pt in liveFrame.dropFirst() {
                 ln.addLine(to: .init(x: fx2sx(pt[0]), y: fy2sy(pt[1])))
             }
-            ctx.stroke(ln, with: .color((brushErase ? Color.red : Ara.accent).opacity(0.95)), lineWidth: 2)
+            ctx.stroke(ln, with: .color((brushErase ? Color.red : Theme.accent).opacity(0.95)), lineWidth: 2)
         }
         // brush cursor: feather circle tracks the mouse in brush mode
         if retouchMode == "brush", stageHover {
@@ -4013,13 +4029,13 @@ struct BrushLayerRow: View {
                 HStack(spacing: 6) {
                     Image(systemName: "paintbrush.fill")
                         .font(.system(size: 9))
-                        .foregroundStyle(selected ? Ara.accent : Ara.text3)
+                        .foregroundStyle(selected ? Theme.accent : Theme.text3)
                     Text("Layer \(index + 1)")
                         .font(.system(size: 10.5, weight: selected ? .semibold : .regular))
-                        .foregroundStyle(selected ? Ara.text1 : Ara.text2)
+                        .foregroundStyle(selected ? Theme.text1 : Theme.text2)
                     Text("×\(layer.strokes.count)")
                         .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -4028,14 +4044,14 @@ struct BrushLayerRow: View {
             Button(action: onToggle) {
                 Image(systemName: layer.enabled ? "eye" : "eye.slash")
                     .font(.system(size: 10))
-                    .foregroundStyle(layer.enabled ? Ara.text2 : Ara.text3)
+                    .foregroundStyle(layer.enabled ? Theme.text2 : Theme.text3)
             }
             .buttonStyle(.plain)
             .help(layer.enabled ? "Hide layer" : "Show layer")
             Button(action: onDelete) {
                 Image(systemName: "trash")
                     .font(.system(size: 10))
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
             }
             .buttonStyle(.plain)
             .help("Delete layer")
@@ -4043,9 +4059,9 @@ struct BrushLayerRow: View {
         .padding(.vertical, 2)
         .padding(.horizontal, 5)
         .background(RoundedRectangle(cornerRadius: 4)
-            .fill(selected ? Ara.accent.opacity(0.12) : Color.clear)
+            .fill(selected ? Theme.accent.opacity(0.12) : Color.clear)
             .overlay(RoundedRectangle(cornerRadius: 4)
-                .stroke(selected ? Ara.accent.opacity(0.4) : Color.clear, lineWidth: 0.5)))
+                .stroke(selected ? Theme.accent.opacity(0.4) : Color.clear, lineWidth: 0.5)))
     }
 }
 
@@ -4061,18 +4077,18 @@ struct MarkRow: View {
     }
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: icon).font(.system(size: 9)).foregroundStyle(Ara.text3)
-            Text(title).font(.system(size: 10.5)).foregroundStyle(Ara.text1)
+            Image(systemName: icon).font(.system(size: 9)).foregroundStyle(Theme.text3)
+            Text(title).font(.system(size: 10.5)).foregroundStyle(Theme.text1)
             Spacer()
             Button { onDelete() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
             }
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 5).fill(Ara.bg3))
+        .background(RoundedRectangle(cornerRadius: 5).fill(Theme.bg3))
     }
 }
 
@@ -4090,7 +4106,7 @@ struct TriRow: View {
         if v.count == 3 {
             HStack(spacing: 5) {
                 Text(title)
-                    .font(.system(size: 10.5)).foregroundStyle(Ara.text2)
+                    .font(.system(size: 10.5)).foregroundStyle(Theme.text2)
                     .frame(width: 34, alignment: .leading)
                 ForEach(0..<3, id: \.self) { i in
                     TrackSlider(value: $v[i], range: range, reset: 0.5)
@@ -4135,24 +4151,24 @@ struct WindowRow: View {
                         : w.kind == "lum" ? "circle.lefthalf.filled"
                         : w.kind == "subject" ? "person.crop.square" : "circle")
                     .font(.system(size: 9))
-                    .foregroundStyle(selected ? Ara.accent : .cyan)
+                    .foregroundStyle(selected ? Theme.accent : .cyan)
                 Text(w.kind == "gradient" ? "Gradient" : w.kind == "lum" ? "Lum Range"
                         : w.kind == "subject" ? "Subject" : "Circle")
-                    .font(.system(size: 10.5, weight: .medium)).foregroundStyle(Ara.text1)
+                    .font(.system(size: 10.5, weight: .medium)).foregroundStyle(Theme.text1)
                 Spacer()
                 // on/off eye (DaVinci per-window visibility)
                 Button { w.enabled.toggle() } label: {
                     Image(systemName: w.enabled ? "eye" : "eye.slash")
                         .font(.system(size: 9.5))
-                        .foregroundStyle(w.enabled ? Ara.text2 : Ara.text3)
+                        .foregroundStyle(w.enabled ? Theme.text2 : Theme.text3)
                 }
                 .buttonStyle(.plain)
                 .help("Window on/off")
-                Text("Inv").font(.system(size: 9.5)).foregroundStyle(Ara.text2)
-                Toggle("", isOn: $w.invert).labelsHidden().controlSize(.mini).tint(Ara.accent)
+                Text("Inv").font(.system(size: 9.5)).foregroundStyle(Theme.text2)
+                Toggle("", isOn: $w.invert).labelsHidden().controlSize(.mini).tint(Theme.accent)
                 Button { onDelete() } label: {
                     Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                 }
                 .buttonStyle(.plain)
             }
@@ -4176,18 +4192,18 @@ struct WindowRow: View {
                 SliderRow("Soft", $w.p[5], 0.02...1, reset: 0.4)
             }
             HStack(spacing: 6) {
-                Text("Link Q").font(.system(size: 9.5)).foregroundStyle(Ara.text2)
-                Toggle("", isOn: $w.linkQ).labelsHidden().controlSize(.mini).tint(Ara.accent)
+                Text("Link Q").font(.system(size: 9.5)).foregroundStyle(Theme.text2)
+                Toggle("", isOn: $w.linkQ).labelsHidden().controlSize(.mini).tint(Theme.accent)
                 Text("gate by Qualifier matte")
-                    .font(.system(size: 9)).foregroundStyle(Ara.text3)
+                    .font(.system(size: 9)).foregroundStyle(Theme.text3)
                 Spacer()
             }
         }
         .padding(8)
-        .background(selected ? Ara.accentSoft.opacity(0.5) : Ara.bg3)
+        .background(selected ? Theme.accentSoft.opacity(0.5) : Theme.bg3)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6)
-            .stroke(selected ? Ara.accent.opacity(0.6) : Ara.hairline, lineWidth: 1))
+            .stroke(selected ? Theme.accent.opacity(0.6) : Theme.hairline, lineWidth: 1))
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
         .opacity(w.enabled ? 1 : 0.65)
@@ -4204,22 +4220,22 @@ struct VersionRow: View {
         HStack(spacing: 8) {
             Image(systemName: "photo.stack")
                 .font(.system(size: 9))
-                .foregroundStyle(active ? Ara.accent : Ara.text3)
+                .foregroundStyle(active ? Theme.accent : Theme.text3)
             Text(v.name.isEmpty ? "Version" : v.name)
                 .font(.system(size: 10.5, weight: active ? .semibold : .regular))
-                .foregroundStyle(active ? Ara.accent : Ara.text1)
+                .foregroundStyle(active ? Theme.accent : Theme.text1)
                 .lineLimit(1)
             Spacer()
             Button { onDelete() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Ara.text3)
+                    .foregroundStyle(Theme.text3)
             }
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 5)
-            .fill(active ? Ara.accentSoft : Ara.bg3))
+            .fill(active ? Theme.accentSoft : Theme.bg3))
         .contentShape(Rectangle())
         .onTapGesture { onApply() }
     }
@@ -4268,7 +4284,7 @@ struct Stars: View {
             ForEach(1...5, id: \.self) { i in
                 Image(systemName: i <= rating ? "star.fill" : "star")
                     .font(.system(size: 12))
-                    .foregroundStyle(i <= rating ? Ara.gold : Ara.text3)
+                    .foregroundStyle(i <= rating ? Theme.gold : Theme.text3)
                     .frame(width: 15, height: 16)
                     .contentShape(Rectangle())
                     .onTapGesture { rating = (rating == i) ? 0 : i }

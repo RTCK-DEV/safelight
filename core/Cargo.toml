@@ -1,8 +1,8 @@
 [package]
-name = "araware-core"
+name = "safelight-core"
 version = "0.1.0"
 edition = "2021"
-description = "araware RAW engine: decode, develop pipeline, catalog"
+description = "safelight RAW engine: decode, develop pipeline, catalog"
 
 [lib]
 crate-type = ["rlib", "staticlib"]

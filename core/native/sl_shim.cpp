@@ -1,17 +1,17 @@
-#include "ara_shim.h"
+#include "sl_shim.h"
 
 #include <libraw/libraw.h>
 
 #include <cstdlib>
 #include <cstring>
 
-struct AraRaw {
+struct SlRaw {
   LibRaw* raw;
 };
 
 extern "C" {
 
-AraRaw* ara_raw_open(const char* path, AraRawInfo* info) {
+SlRaw* sl_raw_open(const char* path, SlRawInfo* info) {
   if (!path || !info) return nullptr;
   LibRaw* r = new LibRaw();
   if (r->open_file(path) != LIBRAW_SUCCESS) {
@@ -74,15 +74,15 @@ AraRaw* ara_raw_open(const char* path, AraRawInfo* info) {
   info->focal = id.other.focal_len;
   info->timestamp = (long)id.other.timestamp;
 
-  return new AraRaw{r};
+  return new SlRaw{r};
 }
 
-int ara_raw_unpack(AraRaw* r) {
+int sl_raw_unpack(SlRaw* r) {
   if (!r) return -1;
   return r->raw->unpack();
 }
 
-void ara_raw_refresh_info(AraRaw* r, AraRawInfo* info) {
+void sl_raw_refresh_info(SlRaw* r, SlRawInfo* info) {
   if (!r || !info) return;
   libraw_data_t& id = r->raw->imgdata;
   info->maximum = id.color.maximum ? id.color.maximum : 65535u;
@@ -94,7 +94,7 @@ void ara_raw_refresh_info(AraRaw* r, AraRawInfo* info) {
   memcpy(info->rgb_cam, id.color.rgb_cam, sizeof(info->rgb_cam));
 }
 
-int ara_raw_cfa(AraRaw* r, unsigned short** out, int* count) {
+int sl_raw_cfa(SlRaw* r, unsigned short** out, int* count) {
   if (!r || !out || !count) return -1;
   libraw_data_t& id = r->raw->imgdata;
   if (!id.rawdata.raw_image) return -2;
@@ -107,7 +107,7 @@ int ara_raw_cfa(AraRaw* r, unsigned short** out, int* count) {
   return 0;
 }
 
-int ara_thumb(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
+int sl_thumb(SlRaw* r, unsigned char** out, int* len, int* w, int* h,
               int* format) {
   if (!r || !out || !len) return -1;
   if (r->raw->unpack_thumb() != LIBRAW_SUCCESS) return -2;
@@ -124,7 +124,7 @@ int ara_thumb(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
   return 0;
 }
 
-int ara_process8(AraRaw* r, unsigned char** out, int* w, int* h) {
+int sl_process8(SlRaw* r, unsigned char** out, int* w, int* h) {
   if (!r || !out) return -1;
   /* reference render uses libraw's own pipeline: sRGB + gamma */
   r->raw->imgdata.params.output_color = 1;
@@ -154,7 +154,7 @@ int ara_process8(AraRaw* r, unsigned char** out, int* w, int* h) {
   return 0;
 }
 
-int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
+int sl_thumb_best(SlRaw* r, unsigned char** out, int* len, int* w, int* h,
                    int* format) {
   if (!r || !out || !len) return -1;
   libraw_thumbnail_list_t& tl = r->raw->imgdata.thumbs_list;
@@ -182,7 +182,7 @@ int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
   return 0;
 }
 
-void ara_raw_close(AraRaw* r) {
+void sl_raw_close(SlRaw* r) {
   if (!r) return;
   if (r->raw) {
     delete r->raw;
@@ -190,6 +190,6 @@ void ara_raw_close(AraRaw* r) {
   delete r;
 }
 
-void ara_free(void* p) { free(p); }
+void sl_free(void* p) { free(p); }
 
 } /* extern "C" */

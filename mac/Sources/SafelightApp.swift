@@ -1,11 +1,11 @@
 import SwiftUI
 
 @main
-struct AraApp: App {
+struct SafelightApp: App {
     @StateObject private var store = LibraryStore()
 
     var body: some Scene {
-        WindowGroup("araware") {
+        WindowGroup("safelight") {
             LibraryView()
                 .environmentObject(store)
                 .frame(minWidth: 1080, minHeight: 660)
@@ -316,7 +316,7 @@ final class LibraryStore: ObservableObject {
         activeId = list[nxt].id
     }
 
-    let eng = AraEngine.shared
+    let eng = SafelightEngine.shared
 
     func pickFolder() {
         let p = NSOpenPanel()
@@ -343,7 +343,7 @@ final class LibraryStore: ObservableObject {
         scanning = true
         reloadCollections()
         Task.detached { [weak self] in
-            let photos = await AraEngine.shared.work { $0.scan(folder: url.path) }
+            let photos = await SafelightEngine.shared.work { $0.scan(folder: url.path) }
             await MainActor.run {
                 // a stale scan finishing after the user opened another
                 // folder must not overwrite the newer folder's list

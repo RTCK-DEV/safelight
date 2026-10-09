@@ -3,7 +3,7 @@
    Used as a fallback when libraw can parse the container but cannot
    decompress the sensor data (e.g. Nikon HE / HE* "TicoRAW", which the
    system codec decodes at full resolution). */
-#include "ara_shim.h"
+#include "sl_shim.h"
 
 #if defined(__APPLE__)
 
@@ -11,7 +11,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 
-extern "C" int ara_imgio_decode(const char* path, unsigned short** out,
+extern "C" int sl_imgio_decode(const char* path, unsigned short** out,
                                 int* w, int* h) {
   @autoreleasepool {
     if (!path || !out || !w || !h) return -1;
@@ -65,7 +65,7 @@ extern "C" int ara_imgio_decode(const char* path, unsigned short** out,
 
 #else
 
-extern "C" int ara_imgio_decode(const char*, unsigned short**, int*, int*) {
+extern "C" int sl_imgio_decode(const char*, unsigned short**, int*, int*) {
   return -1;
 }
 

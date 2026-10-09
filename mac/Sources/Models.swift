@@ -16,7 +16,7 @@ struct Photo: Identifiable, Codable, Hashable {
     /// -1 rejected, 0 none, 1 picked
     var flag: Int
     var keywords: [String]
-    /// virtual copy slot (0 = master, n>0 = .araware.v{n}.json sidecar)
+    /// virtual copy slot (0 = master, n>0 = .safelight.v{n}.json sidecar)
     let vslot: Int
     /// stack id (0 = unstacked) + position within it
     let stack: Int64
@@ -83,7 +83,7 @@ enum WbMode: String, Codable, CaseIterable {
     case pick = "pick"
 }
 
-/// Mirrors araware_core::recipe::PowerWindow (serde).
+/// Mirrors safelight_core::recipe::PowerWindow (serde).
 struct PowerWindow: Codable, Equatable, Identifiable {
     var id = UUID()
     var kind: String = "circle"      // "circle" [cx,cy,rx,ry,rot_deg,soft] | "gradient" [x1,y1,x2,y2,soft,0] | "lum" [lo,hi,lof,hif,0,0]
@@ -117,7 +117,7 @@ struct PowerWindow: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors araware_core::recipe::BrushStroke (serde).
+/// Mirrors safelight_core::recipe::BrushStroke (serde).
 struct BrushStroke: Codable, Equatable, Identifiable {
     var id = UUID()
     var pts: [[Double]] = []   // frame-normalized polyline
@@ -140,7 +140,7 @@ struct BrushStroke: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors araware_core::recipe::BrushLayer (serde).
+/// Mirrors safelight_core::recipe::BrushLayer (serde).
 struct BrushLayer: Codable, Equatable, Identifiable {
     var id = UUID()
     var enabled: Bool = true
@@ -179,7 +179,7 @@ struct BrushLayer: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors araware_core::recipe::Recipe (serde snake_case).
+/// Mirrors safelight_core::recipe::Recipe (serde snake_case).
 struct Recipe: Codable, Equatable {
     var exposure: Double = 0
     var contrast: Double = 0
@@ -289,7 +289,7 @@ struct Recipe: Codable, Equatable {
 }
 
 /// Grade library still (DaVinci Gallery): a saved recipe + thumbnail.
-/// Persisted app-wide at ~/.araware/gallery/stills.json with JPEG thumbs
+/// Persisted app-wide at ~/.safelight/gallery/stills.json with JPEG thumbs
 /// beside it (<id>.jpg).
 struct GradeStill: Codable, Equatable, Identifiable {
     var id = UUID()
@@ -442,7 +442,7 @@ extension Recipe {
     }
 }
 
-/// Mirrors araware_core::recipe::GradeVersion: named recipe snapshot
+/// Mirrors safelight_core::recipe::GradeVersion: named recipe snapshot
 /// (DaVinci grade version / gallery still).
 struct GradeVersion: Codable, Equatable, Identifiable {
     var id = UUID()
@@ -463,7 +463,7 @@ struct GradeVersion: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors araware_core::recipe::Sidecar.
+/// Mirrors safelight_core::recipe::Sidecar.
 struct Sidecar: Codable {
     var version: Int = 1
     var rating: Int = 0
@@ -492,7 +492,7 @@ struct Sidecar: Codable {
     }
 }
 
-/// Suggested corrections from `araware_auto_analyze` (core/src/auto.rs).
+/// Suggested corrections from `safelight_auto_analyze` (core/src/auto.rs).
 struct AutoSuggestion: Codable {
     var rotation_deg: Double = 0
     var key_v: Double = 0

@@ -79,37 +79,37 @@ enum ExportICC {
     }
 }
 
-final class AraEngine: @unchecked Sendable {
+final class SafelightEngine: @unchecked Sendable {
     private let handle: UnsafeMutableRawPointer
     private let queue = DispatchQueue(label: "ara.engine", qos: .userInitiated)
 
-    static let shared: AraEngine = {
-        guard let e = AraEngine() else { fatalError("araware_init failed") }
+    static let shared: SafelightEngine = {
+        guard let e = SafelightEngine() else { fatalError("safelight_init failed") }
         return e
     }()
 
     private init?() {
-        guard let h = araware_init() else { return nil }
+        guard let h = safelight_init() else { return nil }
         handle = h
     }
 
-    deinit { araware_free_engine(handle) }
+    deinit { safelight_free_engine(handle) }
 
     var lastError: String {
-        guard let p = araware_last_error() else { return "" }
-        defer { araware_free_string(p) }
+        guard let p = safelight_last_error() else { return "" }
+        defer { safelight_free_string(p) }
         return String(cString: p)
     }
 
     private func takeString(_ p: UnsafeMutablePointer<CChar>?) -> String? {
         guard let p else { return nil }
-        defer { araware_free_string(p) }
+        defer { safelight_free_string(p) }
         return String(cString: p)
     }
 
-    private func cgImage(_ img: AraImage) -> CGImage? {
+    private func cgImage(_ img: SlImage) -> CGImage? {
         guard img.data != nil, img.width > 0, img.height > 0 else { return nil }
-        let ctx = UnsafeMutablePointer<AraImage>.allocate(capacity: 1)
+        let ctx = UnsafeMutablePointer<SlImage>.allocate(capacity: 1)
         ctx.initialize(to: img)
         let w = Int(img.width), h = Int(img.height), len = img.len
         guard let provider = CGDataProvider(
@@ -118,12 +118,12 @@ final class AraEngine: @unchecked Sendable {
             size: Int(len),
             releaseData: { info, _, _ in
                 guard let info else { return }
-                let i = info.assumingMemoryBound(to: AraImage.self)
-                araware_free_image(i.move())
+                let i = info.assumingMemoryBound(to: SlImage.self)
+                safelight_free_image(i.move())
                 i.deallocate()
             }
         ) else {
-            araware_free_image(ctx.move())
+            safelight_free_image(ctx.move())
             ctx.deallocate()
             return nil
         }
@@ -138,14 +138,14 @@ final class AraEngine: @unchecked Sendable {
     }
 
     /// Run blocking engine calls off the main thread.
-    func work<T>(_ f: @escaping (AraEngine) -> T) async -> T {
+    func work<T>(_ f: @escaping (SafelightEngine) -> T) async -> T {
         await withCheckedContinuation { c in
             queue.async { c.resume(returning: f(self)) }
         }
     }
 
     func scan(folder: String) -> [Photo] {
-        guard let js = takeString(folder.withCString { araware_scan_folder(handle, $0) }),
+        guard let js = takeString(folder.withCString { safelight_scan_folder(handle, $0) }),
               let data = js.data(using: .utf8),
               let photos = try? JSONDecoder().decode([Photo].self, from: data)
         else { return [] }
@@ -153,7 +153,7 @@ final class AraEngine: @unchecked Sendable {
     }
 
     func thumbnail(path: String, maxPx: UInt32 = 512) -> CGImage? {
-        cgImage(path.withCString { araware_thumbnail(handle, $0, maxPx) })
+        cgImage(path.withCString { safelight_thumbnail(handle, $0, maxPx) })
     }
 
     /// Render plus the output-image histogram (R,G,B,luma x 256).
@@ -161,9 +161,9 @@ final class AraEngine: @unchecked Sendable {
         let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
         var bins = [UInt32](repeating: 0, count: 1024)
         let img = bins.withUnsafeMutableBufferPointer { buf in
-            buf.baseAddress!.withMemoryRebound(to: AraHistogram.self, capacity: 1) { hist in
+            buf.baseAddress!.withMemoryRebound(to: SlHistogram.self, capacity: 1) { hist in
                 js.withCString { r in
-                    path.withCString { araware_render_h(handle, $0, r, maxPx, hist) }
+                    path.withCString { safelight_render_h(handle, $0, r, maxPx, hist) }
                 }
             }
         }
@@ -186,7 +186,7 @@ final class AraEngine: @unchecked Sendable {
                     bins.withUnsafeMutableBufferPointer { hs in
                         js.withCString { r in
                             path.withCString {
-                                araware_scopes(handle, $0, r, maxPx,
+                                safelight_scopes(handle, $0, r, maxPx,
                                                wv.baseAddress, vc.baseAddress,
                                                ce.baseAddress, hs.baseAddress)
                             }
@@ -200,7 +200,7 @@ final class AraEngine: @unchecked Sendable {
 
     func export(path: String, recipe: Recipe) -> CGImage? {
         let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        return cgImage(js.withCString { r in path.withCString { araware_export(handle, $0, r) } })
+        return cgImage(js.withCString { r in path.withCString { safelight_export(handle, $0, r) } })
     }
 
     /// export with finishing opts (long_edge px, output sharpen 0..1)
@@ -210,7 +210,7 @@ final class AraEngine: @unchecked Sendable {
               let os = String(data: oj, encoding: .utf8) else { return nil }
         return cgImage(js.withCString { r in
             path.withCString { p in
-                os.withCString { o in araware_export_opts(handle, p, r, o) }
+                os.withCString { o in safelight_export_opts(handle, p, r, o) }
             }
         })
     }
@@ -221,24 +221,24 @@ final class AraEngine: @unchecked Sendable {
         guard let pj = try? JSONSerialization.data(withJSONObject: paths),
               let ps = String(data: pj, encoding: .utf8) else { return nil }
         return cgImage(mode.withCString { m in
-            ps.withCString { p in araware_merge(handle, p, m) }
+            ps.withCString { p in safelight_merge(handle, p, m) }
         })
     }
 
     func metadata(path: String) -> String {
-        takeString(path.withCString { araware_metadata(handle, $0) }) ?? ""
+        takeString(path.withCString { safelight_metadata(handle, $0) }) ?? ""
     }
 
     /// Auto-correction analysis on a neutral preview — returns suggested
     /// recipe values plus confidence fields (see core/src/auto.rs).
     func autoAnalyze(path: String) -> AutoSuggestion? {
-        guard let js = takeString(path.withCString { araware_auto_analyze(handle, $0) }),
+        guard let js = takeString(path.withCString { safelight_auto_analyze(handle, $0) }),
               let data = js.data(using: .utf8)
         else { return nil }
         return try? JSONDecoder().decode(AutoSuggestion.self, from: data)
     }
 
-    /// Bake the SCUNet-denoised linear base to `<photo>.araware.aidn.jpg`.
+    /// Bake the SCUNet-denoised linear base to `<photo>.safelight.aidn.jpg`.
     /// Minutes on CPU — always call via `work`.
     func aiDenoisePrepare(path: String, recipe: Recipe)
         -> (ok: Bool, w: Int, h: Int, ms: Int, error: String)
@@ -246,7 +246,7 @@ final class AraEngine: @unchecked Sendable {
         struct R: Decodable { var ok: Bool; var w: Int?; var h: Int?; var ms: Int?; var error: String? }
         let js = (try? JSONEncoder().encode(recipe)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
         guard let out = takeString(path.withCString { p in
-            js.withCString { araware_ai_denoise_prepare(handle, p, $0) }
+            js.withCString { safelight_ai_denoise_prepare(handle, p, $0) }
         }), let data = out.data(using: .utf8),
               let r = try? JSONDecoder().decode(R.self, from: data)
         else { return (false, 0, 0, 0, "call failed") }
@@ -256,7 +256,7 @@ final class AraEngine: @unchecked Sendable {
     /// Whether a fresh denoise cache exists for `path`.
     func aiDenoiseReady(path: String) -> Bool {
         struct R: Decodable { var ready: Bool }
-        guard let out = takeString(path.withCString { araware_ai_denoise_ready(handle, $0) }),
+        guard let out = takeString(path.withCString { safelight_ai_denoise_ready(handle, $0) }),
               let data = out.data(using: .utf8),
               let r = try? JSONDecoder().decode(R.self, from: data)
         else { return false }
@@ -267,7 +267,7 @@ final class AraEngine: @unchecked Sendable {
     /// photo (a few seconds — much lighter than the denoise pass).
     func aiSubjectPrepare(path: String) -> (ok: Bool, w: Int, h: Int, ms: Int, error: String) {
         struct R: Decodable { var ok: Bool; var w: Int?; var h: Int?; var ms: Int?; var error: String? }
-        guard let out = takeString(path.withCString { araware_ai_subject_prepare(handle, $0) }),
+        guard let out = takeString(path.withCString { safelight_ai_subject_prepare(handle, $0) }),
               let data = out.data(using: .utf8),
               let r = try? JSONDecoder().decode(R.self, from: data)
         else { return (false, 0, 0, 0, "call failed") }
@@ -277,7 +277,7 @@ final class AraEngine: @unchecked Sendable {
     /// Whether a fresh subject-matte cache exists for `path`.
     func aiSubjectReady(path: String) -> Bool {
         struct R: Decodable { var ready: Bool }
-        guard let out = takeString(path.withCString { araware_ai_subject_ready(handle, $0) }),
+        guard let out = takeString(path.withCString { safelight_ai_subject_ready(handle, $0) }),
               let data = out.data(using: .utf8),
               let r = try? JSONDecoder().decode(R.self, from: data)
         else { return false }
@@ -285,8 +285,8 @@ final class AraEngine: @unchecked Sendable {
     }
 
     func sidecar(path: String, vslot: Int = 0) -> Sidecar {
-        let js = takeString(path.withCString { araware_sidecar_read_v($0, Int32(vslot)) })
-            ?? takeString(path.withCString { araware_sidecar_read($0) })
+        let js = takeString(path.withCString { safelight_sidecar_read_v($0, Int32(vslot)) })
+            ?? takeString(path.withCString { safelight_sidecar_read($0) })
         guard let js,
               let data = js.data(using: .utf8),
               let sc = try? JSONDecoder().decode(Sidecar.self, from: data)
@@ -299,18 +299,18 @@ final class AraEngine: @unchecked Sendable {
         guard let data = try? JSONEncoder().encode(sc),
               let js = String(data: data, encoding: .utf8) else { return false }
         return js.withCString { j in
-            path.withCString { araware_sidecar_write_v($0, Int32(vslot), j) }
+            path.withCString { safelight_sidecar_write_v($0, Int32(vslot), j) }
         } == 0
     }
 
     @discardableResult
     func setRating(path: String, _ rating: Int) -> Bool {
-        path.withCString { araware_set_rating(handle, $0, Int32(rating)) } == 0
+        path.withCString { safelight_set_rating(handle, $0, Int32(rating)) } == 0
     }
 
     @discardableResult
     func setLabel(path: String, _ label: String) -> Bool {
-        label.withCString { l in path.withCString { araware_set_label(handle, $0, l) } } == 0
+        label.withCString { l in path.withCString { safelight_set_label(handle, $0, l) } } == 0
     }
 
     // MARK: - library organization (flags / keywords / stacks / variants / collections)
@@ -320,7 +320,7 @@ final class AraEngine: @unchecked Sendable {
     func libraryCmd(_ cmd: [String: Any]) -> [String: Any]? {
         guard let data = try? JSONSerialization.data(withJSONObject: cmd),
               let s = String(data: data, encoding: .utf8),
-              let js = takeString(s.withCString { araware_library(handle, $0) }),
+              let js = takeString(s.withCString { safelight_library(handle, $0) }),
               let out = js.data(using: .utf8),
               let v = try? JSONSerialization.jsonObject(with: out) as? [String: Any]
         else { return nil }
@@ -330,7 +330,7 @@ final class AraEngine: @unchecked Sendable {
     private func libraryList<T: Decodable>(_ cmd: [String: Any]) -> [T] {
         guard let data = try? JSONSerialization.data(withJSONObject: cmd),
               let s = String(data: data, encoding: .utf8),
-              let js = takeString(s.withCString { araware_library(handle, $0) }),
+              let js = takeString(s.withCString { safelight_library(handle, $0) }),
               let out = js.data(using: .utf8),
               let v = try? JSONDecoder().decode([T].self, from: out)
         else { return [] }

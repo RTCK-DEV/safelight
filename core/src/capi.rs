@@ -10,7 +10,7 @@ use crate::engine::Engine;
 use crate::recipe::{Recipe, Sidecar};
 
 #[repr(C)]
-pub struct AraImage {
+pub struct SlImage {
     pub data: *mut u8,
     pub len: usize,
     pub width: u32,
@@ -19,12 +19,12 @@ pub struct AraImage {
 
 /// 256-bin x 4-channel (R,G,B,luma) histogram of the rendered output.
 #[repr(C)]
-pub struct AraHistogram {
+pub struct SlHistogram {
     pub bins: [u32; 1024],
 }
 
 // process-global so errors raised on the engine worker thread are
-// readable by whichever thread calls `araware_last_error` (thread_local
+// readable by whichever thread calls `safelight_last_error` (thread_local
 // made every UI error path read an empty string).
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
@@ -46,9 +46,9 @@ fn into_raw_string(s: String) -> *mut c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 
-fn into_raw_image(img: RgbaImage) -> AraImage {
+fn into_raw_image(img: RgbaImage) -> SlImage {
     let mut v = img.data.into_boxed_slice();
-    let out = AraImage {
+    let out = SlImage {
         data: v.as_mut_ptr(),
         len: v.len(),
         width: img.width,
@@ -58,8 +58,8 @@ fn into_raw_image(img: RgbaImage) -> AraImage {
     out
 }
 
-fn null_image() -> AraImage {
-    AraImage {
+fn null_image() -> SlImage {
+    SlImage {
         data: std::ptr::null_mut(),
         len: 0,
         width: 0,
@@ -76,7 +76,7 @@ fn engine<'a>(e: *mut c_void) -> Option<&'a Engine> {
 }
 
 #[no_mangle]
-pub extern "C" fn araware_init() -> *mut c_void {
+pub extern "C" fn safelight_init() -> *mut c_void {
     match Engine::new() {
         Ok(e) => Box::into_raw(Box::new(e)) as *mut c_void,
         Err(err) => {
@@ -87,14 +87,14 @@ pub extern "C" fn araware_init() -> *mut c_void {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_free_engine(e: *mut c_void) {
+pub unsafe extern "C" fn safelight_free_engine(e: *mut c_void) {
     if !e.is_null() {
         drop(Box::from_raw(e as *mut Engine));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn araware_last_error() -> *mut c_char {
+pub extern "C" fn safelight_last_error() -> *mut c_char {
     let guard = LAST_ERROR.lock().unwrap();
     let bytes = guard.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
     CString::new(bytes)
@@ -103,14 +103,14 @@ pub extern "C" fn araware_last_error() -> *mut c_char {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn safelight_free_string(s: *mut c_char) {
     if !s.is_null() {
         drop(CString::from_raw(s));
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_free_image(img: AraImage) {
+pub unsafe extern "C" fn safelight_free_image(img: SlImage) {
     if !img.data.is_null() && img.len > 0 {
         drop(Box::from_raw(
             std::slice::from_raw_parts_mut(img.data, img.len) as *mut [u8],
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn araware_free_image(img: AraImage) {
 
 /// returns JSON array of assets
 #[no_mangle]
-pub unsafe extern "C" fn araware_scan_folder(e: *mut c_void, folder: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_scan_folder(e: *mut c_void, folder: *const c_char) -> *mut c_char {
     let Some(eng) = engine(e) else {
         return std::ptr::null_mut();
     };
@@ -134,11 +134,11 @@ pub unsafe extern "C" fn araware_scan_folder(e: *mut c_void, folder: *const c_ch
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_thumbnail(
+pub unsafe extern "C" fn safelight_thumbnail(
     e: *mut c_void,
     path: *const c_char,
     max_px: u32,
-) -> AraImage {
+) -> SlImage {
     let Some(eng) = engine(e) else {
         return null_image();
     };
@@ -153,12 +153,12 @@ pub unsafe extern "C" fn araware_thumbnail(
 
 /// recipe_json: serialized Recipe; empty/null = defaults
 #[no_mangle]
-pub unsafe extern "C" fn araware_render(
+pub unsafe extern "C" fn safelight_render(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
     max_px: u32,
-) -> AraImage {
+) -> SlImage {
     let Some(eng) = engine(e) else {
         return null_image();
     };
@@ -177,17 +177,17 @@ pub unsafe extern "C" fn araware_render(
     }
 }
 
-/// like araware_render, and additionally fills `hist` (nullable) with the
+/// like safelight_render, and additionally fills `hist` (nullable) with the
 /// output-image histogram.
 #[no_mangle]
-pub unsafe extern "C" fn araware_render_h(
+pub unsafe extern "C" fn safelight_render_h(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
     max_px: u32,
-    hist: *mut AraHistogram,
-) -> AraImage {
-    let img = araware_render(e, path, recipe_json, max_px);
+    hist: *mut SlHistogram,
+) -> SlImage {
+    let img = safelight_render(e, path, recipe_json, max_px);
     if !hist.is_null() {
         let bins = if img.data.is_null() {
             [0u32; 1024]
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn araware_render_h(
 /// render preview + fill caller buffers: wave 3*256*256, vec 256*256,
 /// cie 256*256, hist 1024 (each nullable, skipped when null)
 #[no_mangle]
-pub unsafe extern "C" fn araware_scopes(
+pub unsafe extern "C" fn safelight_scopes(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
@@ -212,8 +212,8 @@ pub unsafe extern "C" fn araware_scopes(
     vec: *mut u32,
     cie: *mut u32,
     hist: *mut u32,
-) -> AraImage {
-    let img = araware_render(e, path, recipe_json, max_px);
+) -> SlImage {
+    let img = safelight_render(e, path, recipe_json, max_px);
     if !img.data.is_null() {
         let data = std::slice::from_raw_parts(img.data as *const u8, img.len);
         // heap: these exceed a dispatch-queue worker's ~512KB stack
@@ -239,24 +239,24 @@ pub unsafe extern "C" fn araware_scopes(
 
 /// full-res render for export; RGBA8 out
 #[no_mangle]
-pub unsafe extern "C" fn araware_export(
+pub unsafe extern "C" fn safelight_export(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
-) -> AraImage {
-    araware_render(e, path, recipe_json, 0)
+) -> SlImage {
+    safelight_render(e, path, recipe_json, 0)
 }
 
 /// export with finishing options `opts_json`: {"long_edge": px, "sharpen": 0..1}
 #[no_mangle]
-pub unsafe extern "C" fn araware_export_opts(
+pub unsafe extern "C" fn safelight_export_opts(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
     opts_json: *const c_char,
-) -> AraImage {
+) -> SlImage {
     let Some(eng) = engine(e) else {
-        return AraImage {
+        return SlImage {
             data: std::ptr::null_mut(),
             len: 0,
             width: 0,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn araware_export_opts(
         Ok(img) => into_raw_image(img),
         Err(err) => {
             set_err(&err);
-            AraImage {
+            SlImage {
                 data: std::ptr::null_mut(),
                 len: 0,
                 width: 0,
@@ -285,13 +285,13 @@ pub unsafe extern "C" fn araware_export_opts(
 /// `mode` = "hdr" | "focus". Renders each at full res with its own
 /// sidecar recipe, aligns, merges → RGBA8.
 #[no_mangle]
-pub unsafe extern "C" fn araware_merge(
+pub unsafe extern "C" fn safelight_merge(
     e: *mut c_void,
     paths_json: *const c_char,
     mode: *const c_char,
-) -> AraImage {
+) -> SlImage {
     let Some(eng) = engine(e) else {
-        return AraImage {
+        return SlImage {
             data: std::ptr::null_mut(),
             len: 0,
             width: 0,
@@ -305,7 +305,7 @@ pub unsafe extern "C" fn araware_merge(
         Ok(img) => into_raw_image(img),
         Err(err) => {
             set_err(&err);
-            AraImage {
+            SlImage {
                 data: std::ptr::null_mut(),
                 len: 0,
                 width: 0,
@@ -316,7 +316,7 @@ pub unsafe extern "C" fn araware_merge(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_metadata(e: *mut c_void, path: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_metadata(e: *mut c_void, path: *const c_char) -> *mut c_char {
     let Some(eng) = engine(e) else {
         return std::ptr::null_mut();
     };
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn araware_metadata(e: *mut c_void, path: *const c_char) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_sidecar_read(path: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_sidecar_read(path: *const c_char) -> *mut c_char {
     let pstr = cstr(path);
     let p = Path::new(&pstr);
     let sp = crate::recipe::sidecar_path_for(p);
@@ -344,7 +344,7 @@ pub unsafe extern "C" fn araware_sidecar_read(path: *const c_char) -> *mut c_cha
 
 /// json: serialized Sidecar
 #[no_mangle]
-pub unsafe extern "C" fn araware_sidecar_write(path: *const c_char, json: *const c_char) -> i32 {
+pub unsafe extern "C" fn safelight_sidecar_write(path: *const c_char, json: *const c_char) -> i32 {
     let pstr = cstr(path);
     let p = Path::new(&pstr);
     let sc: Sidecar = match serde_json::from_str(&cstr(json)) {
@@ -367,7 +367,7 @@ pub unsafe extern "C" fn araware_sidecar_write(path: *const c_char, json: *const
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_set_rating(
+pub unsafe extern "C" fn safelight_set_rating(
     e: *mut c_void,
     path: *const c_char,
     rating: i32,
@@ -383,7 +383,7 @@ pub unsafe extern "C" fn araware_set_rating(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_set_label(
+pub unsafe extern "C" fn safelight_set_label(
     e: *mut c_void,
     path: *const c_char,
     label: *const c_char,
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn araware_set_label(
 
 /// sidecar read/write for a virtual copy slot (0 = master)
 #[no_mangle]
-pub unsafe extern "C" fn araware_sidecar_read_v(path: *const c_char, vslot: i32) -> *mut c_char {
+pub unsafe extern "C" fn safelight_sidecar_read_v(path: *const c_char, vslot: i32) -> *mut c_char {
     let pstr = cstr(path);
     let p = Path::new(&pstr);
     let sp = crate::recipe::sidecar_path_for_v(p, vslot.max(0) as u32);
@@ -415,7 +415,7 @@ pub unsafe extern "C" fn araware_sidecar_read_v(path: *const c_char, vslot: i32)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn araware_sidecar_write_v(
+pub unsafe extern "C" fn safelight_sidecar_write_v(
     path: *const c_char,
     vslot: i32,
     json: *const c_char,
@@ -451,7 +451,7 @@ pub unsafe extern "C" fn araware_sidecar_write_v(
 /// `cmd_json` example: {"op":"coll_list"} — see Engine::library.
 /// Returns a JSON string (or null + last_error on failure).
 #[no_mangle]
-pub unsafe extern "C" fn araware_library(e: *mut c_void, cmd_json: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_library(e: *mut c_void, cmd_json: *const c_char) -> *mut c_char {
     let Some(eng) = engine(e) else {
         return std::ptr::null_mut();
     };
@@ -473,7 +473,7 @@ pub unsafe extern "C" fn araware_library(e: *mut c_void, cmd_json: *const c_char
 
 /// Auto-correction analysis -> JSON with suggested recipe values.
 #[no_mangle]
-pub unsafe extern "C" fn araware_auto_analyze(e: *mut c_void, path: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_auto_analyze(e: *mut c_void, path: *const c_char) -> *mut c_char {
     let eng = &*(e as *const Engine);
     match eng.auto_analyze(Path::new(&cstr(path))) {
         Ok(r) => match serde_json::to_string(&r) {
@@ -492,7 +492,7 @@ pub unsafe extern "C" fn araware_auto_analyze(e: *mut c_void, path: *const c_cha
 
 /// libraw reference render (sanity check / debugging)
 #[no_mangle]
-pub unsafe extern "C" fn araware_reference(path: *const c_char) -> AraImage {
+pub unsafe extern "C" fn safelight_reference(path: *const c_char) -> SlImage {
     match crate::decode::reference_render(Path::new(&cstr(path))) {
         Ok((rgb, w, h)) => {
             let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
@@ -516,7 +516,7 @@ pub unsafe extern "C" fn araware_reference(path: *const c_char) -> AraImage {
 /// (WB/lens_corr are baked into the denoised base). Blocking; heavy.
 /// Returns JSON {ok, w, h, ms} or {ok:false, error}.
 #[no_mangle]
-pub unsafe extern "C" fn araware_ai_denoise_prepare(
+pub unsafe extern "C" fn safelight_ai_denoise_prepare(
     e: *mut c_void,
     path: *const c_char,
     recipe_json: *const c_char,
@@ -543,7 +543,7 @@ pub unsafe extern "C" fn araware_ai_denoise_prepare(
 
 /// JSON {ready: bool}: whether a fresh denoise cache exists for `path`.
 #[no_mangle]
-pub unsafe extern "C" fn araware_ai_denoise_ready(
+pub unsafe extern "C" fn safelight_ai_denoise_ready(
     e: *mut c_void,
     path: *const c_char,
 ) -> *mut c_char {
@@ -557,7 +557,7 @@ pub unsafe extern "C" fn araware_ai_denoise_ready(
 /// run the U-2-Net subject-mask pre-pass for `path` (seconds, CPU or
 /// CoreML). Returns JSON {ok, w, h, ms} or {ok:false, error}.
 #[no_mangle]
-pub unsafe extern "C" fn araware_ai_subject_prepare(
+pub unsafe extern "C" fn safelight_ai_subject_prepare(
     e: *mut c_void,
     path: *const c_char,
 ) -> *mut c_char {
@@ -576,7 +576,7 @@ pub unsafe extern "C" fn araware_ai_subject_prepare(
 
 /// JSON {ready: bool}: whether a fresh subject-matte cache exists for `path`.
 #[no_mangle]
-pub unsafe extern "C" fn araware_ai_subject_ready(
+pub unsafe extern "C" fn safelight_ai_subject_ready(
     e: *mut c_void,
     path: *const c_char,
 ) -> *mut c_char {

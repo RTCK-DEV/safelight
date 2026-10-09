@@ -1,6 +1,6 @@
 //! Catalog: folder scan + SQLite index + JSON sidecars.
 //! Folder is source of truth for per-file state (rating/label/flag/keywords/
-//! recipes live in `.araware*.json` sidecars); the DB is a search/cache index
+//! recipes live in `.safelight*.json` sidecars); the DB is a search/cache index
 //! plus the home of library organization (stacks, collections).
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::decode;
-use crate::recipe::{sidecar_path_for, sidecar_path_for_v, Sidecar};
+use crate::recipe::{
+    read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Sidecar,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetEntry {
@@ -28,7 +30,7 @@ pub struct AssetEntry {
     /// -1 rejected, 0 none, 1 picked
     pub flag: i32,
     pub keywords: Vec<String>,
-    /// virtual copy slot: 0 = master, n = <stem>.araware.v{n}.json
+    /// virtual copy slot: 0 = master, n = <stem>.safelight.v{n}.json
     pub vslot: u32,
     /// stack id (0 = unstacked) and position inside it
     pub stack: i64,
@@ -62,16 +64,25 @@ pub struct Catalog {
 }
 
 fn db_path() -> PathBuf {
-    let base = std::env::var_os("ARAWARE_HOME")
+    let base = std::env::var_os("SAFELIGHT_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            home.join(".araware")
-        });
+        .unwrap_or_else(app_home);
     let _ = fs::create_dir_all(&base);
     base.join("catalog.db")
+}
+
+/// ~/.safelight — adopts the pre-rename ~/.araware contents once so user
+/// data (catalog, thumbs, AI models, gallery, LUTs) survives the rename.
+pub fn app_home() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let new = home.join(".safelight");
+    let old = home.join(".araware");
+    if !new.exists() && old.exists() {
+        let _ = fs::rename(&old, &new);
+    }
+    new
 }
 
 pub fn thumbs_dir() -> PathBuf {
@@ -149,7 +160,7 @@ impl Catalog {
     }
 
     /// Scan one directory level for supported assets, pairing RAW+JPEG by
-    /// stem and expanding virtual copies (stem.araware.v*.json sidecars).
+    /// stem and expanding virtual copies (stem.safelight.v*.json sidecars).
     pub fn scan(&self, folder: &Path) -> Result<Vec<AssetEntry>> {
         let mut raws: Vec<PathBuf> = Vec::new();
         let mut rasters: Vec<PathBuf> = Vec::new();
@@ -201,7 +212,7 @@ impl Catalog {
 
         let mut push = |p: &PathBuf, kind: &str, pair: Option<String>| {
             let meta = fs::metadata(p).ok();
-            let sc_path = sidecar_path_for(p);
+            let sc_path = read_sidecar_path_for_v(p, 0);
             let sc = read_sidecar(&sc_path).unwrap_or_default();
             let has_sc = sc_path.exists();
             let name = p
@@ -372,8 +383,9 @@ impl Catalog {
     }
 
     pub fn set_rating(&self, asset: &Path, rating: i32) -> Result<()> {
+        // read tolerates the araware-era name; writes go to .safelight
         let sp = sidecar_path_for(asset);
-        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        let mut sc = read_sidecar(&read_sidecar_path_for_v(asset, 0)).unwrap_or_default();
         sc.rating = rating.clamp(0, 5);
         write_sidecar(&sp, &sc)?;
         self.touch_row(asset, "rating", &sc.rating);
@@ -381,8 +393,9 @@ impl Catalog {
     }
 
     pub fn set_label(&self, asset: &Path, label: &str) -> Result<()> {
+        // read tolerates the araware-era name; writes go to .safelight
         let sp = sidecar_path_for(asset);
-        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        let mut sc = read_sidecar(&read_sidecar_path_for_v(asset, 0)).unwrap_or_default();
         sc.label = label.to_string();
         write_sidecar(&sp, &sc)?;
         self.touch_row(asset, "label", &sc.label);
@@ -390,8 +403,9 @@ impl Catalog {
     }
 
     pub fn set_flag(&self, asset: &Path, flag: i32) -> Result<()> {
+        // read tolerates the araware-era name; writes go to .safelight
         let sp = sidecar_path_for(asset);
-        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        let mut sc = read_sidecar(&read_sidecar_path_for_v(asset, 0)).unwrap_or_default();
         sc.flag = flag.clamp(-1, 1);
         write_sidecar(&sp, &sc)?;
         self.touch_row(asset, "flag", &sc.flag);
@@ -399,8 +413,9 @@ impl Catalog {
     }
 
     pub fn set_keywords(&self, asset: &Path, keywords: &[String]) -> Result<()> {
+        // read tolerates the araware-era name; writes go to .safelight
         let sp = sidecar_path_for(asset);
-        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        let mut sc = read_sidecar(&read_sidecar_path_for_v(asset, 0)).unwrap_or_default();
         sc.keywords = keywords.to_vec();
         write_sidecar(&sp, &sc)?;
         self.touch_row(
@@ -414,7 +429,7 @@ impl Catalog {
     /// per-variant sidecar state (rating/label/flag/keywords + recipe)
     pub fn set_flag_v(&self, asset: &Path, vslot: u32, flag: i32) -> Result<()> {
         let sp = sidecar_path_for_v(asset, vslot);
-        let mut sc = read_sidecar(&sp).unwrap_or_default();
+        let mut sc = read_sidecar(&read_sidecar_path_for_v(asset, vslot)).unwrap_or_default();
         sc.flag = flag.clamp(-1, 1);
         write_sidecar(&sp, &sc)
     }
@@ -459,17 +474,17 @@ impl Catalog {
 
     // ---- virtual copies ----------------------------------------------
 
-    /// create `<stem>.araware.v{n}.json` copying `src_vslot`'s sidecar;
+    /// create `<stem>.safelight.v{n}.json` copying `src_vslot`'s sidecar;
     /// returns the new slot number
     pub fn variant_create(&self, asset: &Path, src_vslot: u32) -> Result<u32> {
         let mut n = 1u32;
-        while sidecar_path_for_v(asset, n).exists() {
+        while read_sidecar_path_for_v(asset, n).exists() {
             n += 1;
             if n > 64 {
                 anyhow::bail!("too many virtual copies");
             }
         }
-        let src = read_sidecar(&sidecar_path_for_v(asset, src_vslot)).unwrap_or_default();
+        let src = read_sidecar(&read_sidecar_path_for_v(asset, src_vslot)).unwrap_or_default();
         write_sidecar(&sidecar_path_for_v(asset, n), &src)?;
         Ok(n)
     }
@@ -478,7 +493,7 @@ impl Catalog {
         if vslot == 0 {
             anyhow::bail!("cannot delete master");
         }
-        let p = sidecar_path_for_v(asset, vslot);
+        let p = read_sidecar_path_for_v(asset, vslot);
         if p.exists() {
             fs::remove_file(&p)?;
         }
@@ -694,14 +709,14 @@ impl Catalog {
     }
 }
 
-/// Append virtual-copy rows for `<stem>.araware.v{n}.json` siblings (v1..v64).
+/// Append virtual-copy rows for `<stem>.safelight.v{n}.json` siblings (v1..v64).
 /// Variants are never stored in the files table — they exist as sidecars on
 /// disk, so both scan() and assets() probe for them identically.
 fn expand_variants(entries: &mut Vec<AssetEntry>) {
     let mut variants: Vec<AssetEntry> = Vec::new();
     for e in entries.iter() {
         for n in 1..=64u32 {
-            let vp = sidecar_path_for_v(Path::new(&e.path), n);
+            let vp = read_sidecar_path_for_v(Path::new(&e.path), n);
             if !vp.exists() {
                 break;
             }
@@ -740,7 +755,7 @@ pub fn read_sidecar(sc_path: &Path) -> Result<Sidecar> {
 }
 
 pub fn write_sidecar(sc_path: &Path, sc: &Sidecar) -> Result<()> {
-    let tmp = sc_path.with_extension("araware.tmp");
+    let tmp = sc_path.with_extension("safelight.tmp");
     fs::write(&tmp, serde_json::to_string_pretty(sc)?)?;
     fs::rename(&tmp, sc_path)?;
     Ok(())
@@ -752,7 +767,7 @@ mod tests {
     use std::io::Write;
 
     fn tmpdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ara_cat_{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("sl_cat_{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

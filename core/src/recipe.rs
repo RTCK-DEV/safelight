@@ -176,8 +176,8 @@ pub struct Recipe {
     #[serde(default)]
     pub brushes: Vec<BrushLayer>,
     /// AI denoise blend 0..1 (SCUNet real-world denoise). The denoised
-    /// base is produced once by `araware_ai_denoise_prepare` and cached in
-    /// `<photo>.araware.aidn.png`; this field just blends it in.
+    /// base is produced once by `safelight_ai_denoise_prepare` and cached in
+    /// `<photo>.safelight.aidn.png`; this field just blends it in.
     #[serde(default)]
     pub ai_denoise: f32,
     /// serial correction stages (DaVinci serial nodes): each stage runs the
@@ -455,7 +455,7 @@ impl Default for GradeVersion {
     }
 }
 
-/// Sidecar file contents stored next to each asset as `<stem>.araware.json`.
+/// Sidecar file contents stored next to each asset as `<stem>.safelight.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sidecar {
@@ -489,9 +489,31 @@ pub fn sidecar_path_for(asset: &std::path::Path) -> std::path::PathBuf {
     sidecar_path_for_v(asset, 0)
 }
 
-/// Sidecar for a virtual copy: slot 0 = master `<stem>.araware.json`,
-/// slot n = `<stem>.araware.v{n}.json`.
+/// Sidecar for a virtual copy: slot 0 = master `<stem>.safelight.json`,
+/// slot n = `<stem>.safelight.v{n}.json`.
 pub fn sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
+    let mut p = asset.to_path_buf();
+    let stem = asset
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("asset")
+        .to_string();
+    let name = if vslot == 0 {
+        format!("{stem}.safelight.json")
+    } else {
+        format!("{stem}.safelight.v{vslot}.json")
+    };
+    p.set_file_name(name);
+    p
+}
+
+/// The same sidecar under the pre-rename `<stem>.araware.json` naming.
+/// Reads fall back to this so existing libraries keep their edits; new
+/// writes always go to the .safelight name.
+pub fn legacy_sidecar_path_for_v(
+    asset: &std::path::Path,
+    vslot: u32,
+) -> std::path::PathBuf {
     let mut p = asset.to_path_buf();
     let stem = asset
         .file_stem()
@@ -504,5 +526,23 @@ pub fn sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::Pat
         format!("{stem}.araware.v{vslot}.json")
     };
     p.set_file_name(name);
+    p
+}
+
+/// Path a reader should use: the .safelight sidecar if present, else the
+/// araware-era one if present, else the .safelight path (nonexistent) so
+/// callers' exists()/default handling still works.
+pub fn read_sidecar_path_for_v(
+    asset: &std::path::Path,
+    vslot: u32,
+) -> std::path::PathBuf {
+    let p = sidecar_path_for_v(asset, vslot);
+    if p.exists() {
+        return p;
+    }
+    let l = legacy_sidecar_path_for_v(asset, vslot);
+    if l.exists() {
+        return l;
+    }
     p
 }

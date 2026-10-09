@@ -1,5 +1,5 @@
-#ifndef ARA_SHIM_H
-#define ARA_SHIM_H
+#ifndef SL_SHIM_H
+#define SL_SHIM_H
 
 /* SPDX-License-Identifier: MIT */
 
@@ -7,9 +7,9 @@
 extern "C" {
 #endif
 
-typedef struct AraRaw AraRaw;
+typedef struct SlRaw SlRaw;
 
-typedef struct AraRawInfo {
+typedef struct SlRawInfo {
   char make[64];
   char model[64];
   char lens[128];
@@ -37,28 +37,28 @@ typedef struct AraRawInfo {
   float aperture;
   float focal;
   long timestamp;
-} AraRawInfo;
+} SlRawInfo;
 
-AraRaw* ara_raw_open(const char* path, AraRawInfo* info);
-int ara_raw_unpack(AraRaw* r);
+SlRaw* sl_raw_open(const char* path, SlRawInfo* info);
+int sl_raw_unpack(SlRaw* r);
 /* re-read fields that libraw computes during unpack (black level,
-   maximum, pre_mul, rgb_cam). Call after ara_raw_unpack(). */
-void ara_raw_refresh_info(AraRaw* r, AraRawInfo* info);
-/* returns malloc'ed copy of raw sensor data (cfa mosaic); free with ara_free */
-int ara_raw_cfa(AraRaw* r, unsigned short** out, int* count);
+   maximum, pre_mul, rgb_cam). Call after sl_raw_unpack(). */
+void sl_raw_refresh_info(SlRaw* r, SlRawInfo* info);
+/* returns malloc'ed copy of raw sensor data (cfa mosaic); free with sl_free */
+int sl_raw_cfa(SlRaw* r, unsigned short** out, int* count);
 /* returns malloc'ed thumbnail bytes; format: 1=jpeg,2=bitmap8,3=bitmap16 */
-int ara_thumb(AraRaw* r, unsigned char** out, int* len, int* w, int* h, int* format);
+int sl_thumb(SlRaw* r, unsigned char** out, int* len, int* w, int* h, int* format);
 /* renders with libraw's own pipeline -> malloc'ed rgb8 buffer (reference path) */
-int ara_process8(AraRaw* r, unsigned char** out, int* w, int* h);
+int sl_process8(SlRaw* r, unsigned char** out, int* w, int* h);
 /* largest embedded thumbnail -> malloc'ed bytes; format: 1=jpeg,2=bitmap8,3=bitmap16 */
-int ara_thumb_best(AraRaw* r, unsigned char** out, int* len, int* w, int* h,
+int sl_thumb_best(SlRaw* r, unsigned char** out, int* len, int* w, int* h,
                    int* format);
 /* macOS ImageIO decode (full-res via system RAW codecs) -> malloc'ed rgba16 */
-int ara_imgio_decode(const char* path, unsigned short** out, int* w, int* h);
+int sl_imgio_decode(const char* path, unsigned short** out, int* w, int* h);
 /* GoPro GPR (VC-5 DNG) -> uncompressed DNG file at out_path. 0 = ok */
-int ara_gpr_to_dng(const char* in_path, const char* out_path);
-void ara_raw_close(AraRaw* r);
-void ara_free(void* p);
+int sl_gpr_to_dng(const char* in_path, const char* out_path);
+void sl_raw_close(SlRaw* r);
+void sl_free(void* p);
 
 #ifdef __cplusplus
 }
