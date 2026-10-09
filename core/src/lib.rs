@@ -7,6 +7,7 @@ pub mod ai;
 pub mod auto;
 pub mod capi;
 pub mod catalog;
+pub mod dcp;
 pub mod decode;
 pub mod develop;
 pub mod engine;

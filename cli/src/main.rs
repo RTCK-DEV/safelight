@@ -26,13 +26,18 @@ fn main() -> Result<()> {
             let path = Path::new(&args[2]);
             let out = args.get(3).map(String::as_str).unwrap_or("out.png");
             // a recipe path argument must read + parse — silent fallback would
-            // render with the wrong settings and look like success
+            // render with the wrong settings and look like success.
+            // .xmp files are parsed as Lightroom develop presets (crs:*).
             let recipe = match args.get(4) {
                 Some(p) => {
                     let s =
                         std::fs::read_to_string(p).with_context(|| format!("read recipe {p}"))?;
-                    Recipe::from_json(&s)
-                        .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
+                    if p.ends_with(".xmp") {
+                        safelight_core::xmp::crs_to_recipe(&s)
+                    } else {
+                        Recipe::from_json(&s)
+                            .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
+                    }
                 }
                 None => Recipe::default(),
             };

@@ -144,6 +144,16 @@ pub struct Params {
     pub has_cs: bool,
     /// ColorWarper control points [h, s, dh, ds, radius], max 8 honoured
     pub warper: Vec<[f32; 5]>,
+    // ---- .dcp camera profile (Adobe colour pipeline) ----
+    /// hue/sat/val shift table applied in WB-scaled camera space,
+    /// BEFORE the cam->XYZ matrix (DNG ProfileHueSatMap)
+    pub profile_hsm: Option<crate::dcp::HsMap>,
+    /// same table shape applied to the working-space HSV
+    /// (DNG ProfileLookTable) — the profile's "look"
+    pub profile_look: Option<crate::dcp::HsMap>,
+    /// profile tone curve as a 256-entry LUT on each channel 0..1,
+    /// applied at the start of adjust() (empty = identity)
+    pub profile_tone_lut: Vec<f32>,
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -207,6 +217,20 @@ impl Stats {
         1.0
     }
 }
+
+/// base display curve applied when the recipe has no explicit point curve —
+/// Adobe's renderer likewise never outputs raw scene-linear; this is the
+/// ACR "Medium Contrast" preset shape, a mild filmic S. `linear_output`
+/// or an explicit `curve` replaces it entirely.
+const BASE_TONE_CURVE: &[[f32; 2]] = &[
+    [0.0, 0.0],
+    [0.125, 0.086],
+    [0.25, 0.22],
+    [0.5, 0.5],
+    [0.75, 0.78],
+    [0.878, 0.902],
+    [1.0, 1.0],
+];
 
 fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     curve_lut(points, |x| x, 1.0)
@@ -529,6 +553,94 @@ fn apply_look(p: &mut Params, look: &str) {
     }
 }
 
+/// resolve + parse the recipe's .dcp profile. Results are cached by path.
+/// `recipe.profile` is either an absolute/relative .dcp path, or a profile
+/// name ("Adobe Standard", "Camera Standard", ...) matched against
+/// `m.info.make`/`model` via crate::dcp::find_profile.
+fn load_dcp_profile(
+    r: &Recipe,
+    m: &Mosaic,
+) -> Option<std::sync::Arc<crate::dcp::DcpProfile>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<crate::dcp::DcpProfile>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    let name = r.profile.trim();
+    let name = if name.is_empty() {
+        // named looks upgrade to the real .dcp when the file is present:
+        // "adobe_standard" -> "Adobe Standard", "camera_vivid" -> "Camera Vivid".
+        match r.look.as_str() {
+            "adobe_standard" => "Adobe Standard",
+            "camera_standard" | "camera_neutral" | "camera_vivid" | "camera_portrait"
+            | "camera_landscape" | "camera_faithful" => {
+                let mut s = String::from("Camera ");
+                s.push_str(&r.look[7..8].to_uppercase());
+                s.push_str(&r.look[8..]);
+                // borrow dance: return owned below
+                let key = format!("{}|{}|{}", s, m.info.make, m.info.model);
+                return resolve_dcp(cache, &key, &s, m);
+            }
+            _ => return None,
+        }
+    } else {
+        name
+    };
+    let key = format!("{}|{}|{}", name, m.info.make, m.info.model);
+    resolve_dcp(cache, &key, name, m)
+}
+
+fn resolve_dcp(
+    cache: &std::sync::Mutex<
+        std::collections::HashMap<String, Option<std::sync::Arc<crate::dcp::DcpProfile>>>,
+    >,
+    key: &str,
+    name: &str,
+    m: &Mosaic,
+) -> Option<std::sync::Arc<crate::dcp::DcpProfile>> {
+    use std::sync::Arc;
+    if let Some(hit) = cache.lock().ok()?.get(key) {
+        return hit.clone();
+    }
+    let path = {
+        let p = std::path::Path::new(name);
+        if p.is_file() {
+            Some(p.to_path_buf())
+        } else {
+            crate::dcp::find_profile(&m.info.make, &m.info.model, name)
+        }
+    };
+    let prof = path.and_then(|p| crate::dcp::DcpProfile::load(&p)).map(Arc::new);
+    if std::env::var_os("SL_DEBUG").is_some() {
+        match &prof {
+            Some(pr) => eprintln!(
+                "[dcp] '{}' loaded for {} {}: cm1={} cm2={} fwd={} hsm={} look={} tone={} be={:.2}",
+                pr.name,
+                m.info.make,
+                m.info.model,
+                pr.color_matrix1.is_some(),
+                pr.color_matrix2.is_some(),
+                pr.forward_matrix1.is_some() || pr.forward_matrix2.is_some(),
+                pr.hsm1.is_some() || pr.hsm2.is_some(),
+                pr.look_table.is_some(),
+                pr.tone_curve.len(),
+                pr.baseline_exposure
+            ),
+            None => eprintln!(
+                "[dcp] profile '{}' not found for {} {}",
+                name, m.info.make, m.info.model
+            ),
+        }
+    }
+    if let Ok(mut c) = cache.lock() {
+        if c.len() > 64 {
+            c.clear();
+        }
+        c.insert(key.to_string(), prof.clone());
+    }
+    prof
+}
+
 pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // as-shot WB: prefer libraw's effective pre_mul (dcraw's actual channel
     // scaling), normalized to green. Fall back to cam_mul when absent.
@@ -571,21 +683,109 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             }
         }
     }
-    // relative temperature/tint shift (v1 approximation)
-    let t = r.temperature.clamp(-1.0, 1.0);
-    let ti = r.tint.clamp(-1.0, 1.0);
-    wb[0] *= 1.0 + t * 0.35 + ti * 0.12;
-    wb[1] *= 1.0 - ti * 0.30;
-    wb[2] *= 1.0 - t * 0.35 + ti * 0.12;
+    // resolve the .dcp profile early: an absolute-kelvin WB needs the
+    // profile's color matrix to derive camera-space neutral gains.
+    // heuristic camera-look names a real .dcp replaces entirely
+    const DCP_LOOK_NAMES: &[&str] = &[
+        "adobe_standard",
+        "camera_standard",
+        "camera_neutral",
+        "camera_vivid",
+        "camera_portrait",
+        "camera_landscape",
+        "camera_faithful",
+    ];
+    let prof = if !r.profile.is_empty() || DCP_LOOK_NAMES.contains(&r.look.as_str()) {
+        load_dcp_profile(r, m)
+    } else {
+        None
+    };
+    let dcp_active = prof.is_some();
+
+    if r.temp_abs > 0.0 {
+        // absolute kelvin WB (Lightroom WhiteBalance="Custom" +
+        // crs:Temperature semantics): find the camera-space neutral for
+        // the target illuminant through the active color matrix, WB gains
+        // are its per-channel reciprocal normalized to green.
+        let t_k = r.temp_abs.clamp(1500.0, 40000.0);
+        let mut xy = crate::dcp::kelvin_to_xy(t_k);
+        // tint: slide along the perpendicular green/magenta axis (±150 LR)
+        xy[1] += r.tint_abs.clamp(-150.0, 150.0) * -0.0004;
+        let xyz = crate::dcp::xy_to_xyz(xy);
+        let cam_neutral = if let Some(pr) = &prof {
+            pr.color_matrix_at(t_k).map(|cm| crate::dcp::mat_mul_vec(cm, xyz))
+        } else {
+            None
+        };
+        let n = match cam_neutral {
+            Some(n) => n,
+            None => {
+                // no profile: XYZ -> sRGB -> cam via inverse of libraw's
+                // cam->sRGB rgb_cam
+                let rgb = crate::dcp::mat_mul_vec(crate::dcp::XYZ_TO_SRGB, xyz);
+                let inv = crate::dcp::invert([
+                    [m.rgb_cam[0][0], m.rgb_cam[0][1], m.rgb_cam[0][2]],
+                    [m.rgb_cam[1][0], m.rgb_cam[1][1], m.rgb_cam[1][2]],
+                    [m.rgb_cam[2][0], m.rgb_cam[2][1], m.rgb_cam[2][2]],
+                ]);
+                inv.map(|im| crate::dcp::mat_mul_vec(im, rgb))
+                    .unwrap_or([1.0, 1.0, 1.0])
+            }
+        };
+        let g = n[1].max(1e-4);
+        wb = [
+            (g / n[0].max(1e-4)).clamp(0.05, 20.0),
+            1.0,
+            (g / n[2].max(1e-4)).clamp(0.05, 20.0),
+        ];
+    } else {
+        // relative temperature/tint shift (v1 approximation)
+        let t = r.temperature.clamp(-1.0, 1.0);
+        let ti = r.tint.clamp(-1.0, 1.0);
+        wb[0] *= 1.0 + t * 0.35 + ti * 0.12;
+        wb[1] *= 1.0 - ti * 0.30;
+        wb[2] *= 1.0 - t * 0.35 + ti * 0.12;
+    }
 
     // cam -> sRGB: use libraw's precomputed rgb_cam (cam->sRGB, row-normalized).
     // WB is applied separately with a post-WB clip so blown highlights stay
     // white instead of shifting magenta.
-    let cam2srgb = [
+    let mut cam2srgb = [
         [m.rgb_cam[0][0], m.rgb_cam[0][1], m.rgb_cam[0][2]],
         [m.rgb_cam[1][0], m.rgb_cam[1][1], m.rgb_cam[1][2]],
         [m.rgb_cam[2][0], m.rgb_cam[2][1], m.rgb_cam[2][2]],
     ];
+
+    // ---- .dcp camera profile (Adobe colour pipeline) ----
+    // recipe.profile names a profile ("Adobe Standard", "Camera Standard", ...)
+    // or a .dcp path. When present we replace the libraw matrix with the
+    // WB-interpolated forward matrix and keep the profile's HSV maps +
+    // tone curve for colorize/adjust. BaselineExposure folds into
+    // exposure_mul so the profile's expected gain happens automatically.
+    let mut profile_hsm = None;
+    let mut profile_look = None;
+    let mut profile_tone_lut: Vec<f32> = Vec::new();
+    let mut profile_baseline_ev = 0.0f32;
+    {
+        let wb_neutral = [1.0 / wb[0].max(1e-4), 1.0 / wb[1].max(1e-4), 1.0 / wb[2].max(1e-4)];
+        if let Some(prof) = &prof {
+            if let Some(mtx) = prof.cam_to_xyz_d50(wb_neutral) {
+                cam2srgb = crate::dcp::mat_mul(crate::dcp::xyz_d50_to_srgb(), mtx);
+            }
+            profile_hsm = prof.hue_sat_map(wb_neutral).cloned();
+            profile_look = prof.look_table.clone();
+            if prof.tone_curve.len() >= 2 {
+                profile_tone_lut = catmull_lut(
+                    &prof
+                        .tone_curve
+                        .iter()
+                        .map(|(x, y)| [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])
+                        .collect::<Vec<_>>(),
+                );
+            }
+            profile_baseline_ev = prof.baseline_exposure;
+        }
+    }
 
     // post-WB+matrix mean luma: luma/M/WB are all linear, so luma of the
     // mean equals the mean of luma — exact scene-mean in the working space.
@@ -597,8 +797,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         }
         l
     };
-    // auto exposure: steer scene mean luma toward 18% gray, cap ±3EV
-    let mut exposure_mul = (2.0f32).powf(r.exposure);
+    // auto exposure: steer scene mean luma toward 18% gray, cap ±3EV.
+    // BaselineExposure from a .dcp folds in here — the profile's expected
+    // gain is part of the conversion, not a user edit.
+    let mut exposure_mul = (2.0f32).powf(r.exposure + profile_baseline_ev);
     if r.auto_exposure {
         if let Some(s) = stats {
             let l = post_mean_luma(s);
@@ -839,7 +1041,13 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut p = Params {
         wb,
         m: cam2srgb,
-        lut: catmull_lut(&r.curve),
+        lut: if r.linear_output {
+            catmull_lut(&r.curve)
+        } else if r.curve.is_empty() {
+            catmull_lut(BASE_TONE_CURVE)
+        } else {
+            catmull_lut(&r.curve)
+        },
         exposure_mul,
         contrast: r.contrast,
         highlights: r.highlights,
@@ -979,8 +1187,15 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         cs: r.color_slice,
         has_cs: r.color_slice.iter().any(|s| s[3] > 0.5),
         warper: r.warper.iter().take(8).cloned().collect(),
+        profile_hsm,
+        profile_look,
+        profile_tone_lut,
     };
-    apply_look(&mut p, &r.look);
+    // heuristic look adjustments are skipped when the named look was
+    // upgraded to a real .dcp (the profile IS the look now)
+    if !(dcp_active && DCP_LOOK_NAMES.contains(&r.look.as_str())) {
+        apply_look(&mut p, &r.look);
+    }
     // serial stages: each stage is a full Recipe evaluated with the same
     // mosaic+stats context. Nested stages are stripped to bound the work.
     p.stages = r
@@ -991,8 +1206,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         .map(|s| {
             let mut sr = (*s.params).clone();
             sr.stages = Vec::new();
-            // stage masks/brush coords live in the base stage's dst space
+            // stage masks/brush coords live in the base stage's dst space;
+            // stages compose ON TOP of the base look — their empty curve
+            // must mean "identity", not a second base tone curve.
             sr.crop = r.crop;
+            sr.linear_output = true;
             (
                 build_params(m, &sr, stats),
                 s.opacity.clamp(0.0, 1.0),
@@ -1108,6 +1326,17 @@ fn zone_ev_at(l: f32, z: &[f32; 9]) -> f32 {
 ///        contrast -> shadows/highlights -> saturation/vibrance -> split tone -> LUT
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     let mut x = rgb;
+    // .dcp profile "look": ProfileLookTable (HSV shift in working space)
+    // then ProfileToneCurve — the profile's base rendering, applied before
+    // user edits (dcpsim order: matrix -> looktable -> tonecurve -> user).
+    if let Some(lt) = &p.profile_look {
+        x = lt.apply(x);
+    }
+    if !p.profile_tone_lut.is_empty() {
+        for c in &mut x {
+            *c = lut_at(&p.profile_tone_lut, c.clamp(0.0, 1.0));
+        }
+    }
     // exposure
     for c in &mut x {
         *c *= p.exposure_mul;
@@ -2125,6 +2354,12 @@ pub fn colorize_plane(
                 (cam[1] * p.wb[1]).clamp(0.0, 1.0),
                 (cam[2] * p.wb[2]).clamp(0.0, 1.0),
             ];
+            // DNG ProfileHueSatMap: per-hue sat/val shifts in camera space,
+            // applied between WB and the color matrix (DNG spec order).
+            let cw = match &p.profile_hsm {
+                Some(h) => h.apply(cw),
+                None => cw,
+            };
             let mut out = [0.0f32; 3];
             for c in 0..3 {
                 out[c] = p.m[c][0] * cw[0] + p.m[c][1] * cw[1] + p.m[c][2] * cw[2];

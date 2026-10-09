@@ -193,6 +193,25 @@ pub struct Recipe {
     /// max 8 honoured.
     #[serde(default)]
     pub warper: Vec<[f32; 5]>,
+    /// camera profile: "Adobe Standard", "Camera Standard", a .dcp path,
+    /// or "" for the built-in libraw matrix. Resolved against
+    /// ~/.safelight/profiles and (when installed) Lightroom's CameraProfiles.
+    #[serde(default)]
+    pub profile: String,
+    /// absolute white balance in kelvin (Lightroom crs:Temperature).
+    /// 0 = unset; when >0 it replaces the as-shot/auto/pick multipliers
+    /// entirely (the camera-neutral is derived from the illuminant's
+    /// chromaticity through the active color matrix).
+    #[serde(default)]
+    pub temp_abs: f32,
+    /// absolute tint along the magenta(+)/green(-) axis, LR scale ±150.
+    #[serde(default)]
+    pub tint_abs: f32,
+    /// skip the default filmic base tone curve (Adobe's renderer always
+    /// applies a medium-contrast display transform on scene-linear data;
+    /// we match that by default). Set true for unshaped linear output.
+    #[serde(default)]
+    pub linear_output: bool,
 }
 
 /// one serial correction stage. `params` reuses the Recipe struct — only the
@@ -425,6 +444,10 @@ impl Default for Recipe {
             stages: Vec::new(),
             color_slice: [[0.0; 4]; 7],
             warper: Vec::new(),
+            profile: String::new(),
+            temp_abs: 0.0,
+            tint_abs: 0.0,
+            linear_output: false,
         }
     }
 }

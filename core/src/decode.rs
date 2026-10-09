@@ -369,6 +369,12 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
 
 /// Full-res decode via macOS ImageIO system RAW codecs (real debayer for
 /// formats libraw can't unpack, e.g. Nikon HE/HE*). Returns rgba16 sRGB.
+#[cfg(not(target_os = "macos"))]
+fn imgio_decode(_path: &Path, _info: &ffi::SlRawInfo) -> Result<Decoded> {
+    bail!("imgio decode unavailable off macOS")
+}
+
+#[cfg(target_os = "macos")]
 fn imgio_decode(path: &Path, info: &ffi::SlRawInfo) -> Result<Decoded> {
     let c = CString::new(path.to_string_lossy().as_bytes())?;
     let mut out: *mut u16 = std::ptr::null_mut();
