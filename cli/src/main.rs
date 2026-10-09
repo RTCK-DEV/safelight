@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use araware_core::{Engine, Recipe};
+use safelight_core::{Engine, Recipe};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -9,13 +9,13 @@ fn main() -> Result<()> {
     if args.len() < 3 {
         eprintln!(
             "usage:
-  araware-cli render <raw>| aidn <raw>| aisub <raw> <out.png> [recipe.json] [max_px]
-  araware-cli thumb <raw> <out.png> [max_px]
-  araware-cli reference <raw> <out.png>
-  araware-cli scan <folder>
-  araware-cli meta <file>
-  araware-cli auto <file>
-  araware-cli rate <file> <0-5>"
+  safelight-cli render <raw>| aidn <raw>| aisub <raw> <out.png> [recipe.json] [max_px]
+  safelight-cli thumb <raw> <out.png> [max_px]
+  safelight-cli reference <raw> <out.png>
+  safelight-cli scan <folder>
+  safelight-cli meta <file>
+  safelight-cli auto <file>
+  safelight-cli rate <file> <0-5>"
         );
         std::process::exit(2);
     }
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         "reference" => {
             let path = Path::new(&args[2]);
             let out = args.get(3).map(String::as_str).unwrap_or("ref.png");
-            let (rgb, w, h) = araware_core::decode::reference_render(path)?;
+            let (rgb, w, h) = safelight_core::decode::reference_render(path)?;
             let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
             for c in rgb.chunks_exact(3) {
                 rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
@@ -107,7 +107,7 @@ fn main() -> Result<()> {
                 w,
                 h,
                 t.elapsed(),
-                araware_core::ai::denoise_cache_path(path)
+                safelight_core::ai::denoise_cache_path(path)
             );
             // skip static teardown: onnxruntime's C++ globals crash on exit
             // ("mutex lock failed") — _exit bypasses atexit handlers entirely.
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
                 w,
                 h,
                 t.elapsed(),
-                araware_core::ai::subject_cache_path(path)
+                safelight_core::ai::subject_cache_path(path)
             );
             unsafe extern "C" {
                 fn _exit(code: i32) -> !;

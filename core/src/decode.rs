@@ -99,25 +99,25 @@ pub enum Decoded {
 }
 
 struct RawHandle {
-    ptr: *mut ffi::AraRaw,
+    ptr: *mut ffi::SlRaw,
 }
 impl Drop for RawHandle {
     fn drop(&mut self) {
-        unsafe { ffi::ara_raw_close(self.ptr) }
+        unsafe { ffi::sl_raw_close(self.ptr) }
     }
 }
 
-fn open_raw(path: &Path) -> Result<(RawHandle, ffi::AraRawInfo)> {
+fn open_raw(path: &Path) -> Result<(RawHandle, ffi::SlRawInfo)> {
     let c = CString::new(path.to_string_lossy().as_bytes())?;
-    let mut info = unsafe { std::mem::zeroed::<ffi::AraRawInfo>() };
-    let ptr = unsafe { ffi::ara_raw_open(c.as_ptr(), &mut info) };
+    let mut info = unsafe { std::mem::zeroed::<ffi::SlRawInfo>() };
+    let ptr = unsafe { ffi::sl_raw_open(c.as_ptr(), &mut info) };
     if ptr.is_null() {
         bail!("libraw cannot open {}", path.display());
     }
     Ok((RawHandle { ptr }, info))
 }
 
-fn info_of(i: &ffi::AraRawInfo) -> CameraInfo {
+fn info_of(i: &ffi::SlRawInfo) -> CameraInfo {
     CameraInfo {
         make: ffi::cstr_field(&i.make),
         model: ffi::cstr_field(&i.model),
@@ -187,12 +187,12 @@ pub fn decode(path: &Path) -> Result<Decoded> {
             }
         }
     }
-    let rc = unsafe { ffi::ara_raw_unpack(h.ptr) };
+    let rc = unsafe { ffi::sl_raw_unpack(h.ptr) };
     if rc != 0 {
         // Nikon HE/HE* ("TicoRAW"): our own decoder extracts the actual
         // Bayer mosaic — real CFA data beats any sRGB fallback, so try it
         // before the OS codec and the embedded preview.
-        if std::env::var_os("ARA_NO_HE").is_none() {
+        if std::env::var_os("SAFELIGHT_NO_HE").is_none() {
             if let Ok((bayer, bw, bh)) = crate::nef_he::decode_nef_he(path) {
                 return mosaic_decoded(&info, bayer, bw, bh);
             }
@@ -209,12 +209,12 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         bail!("libraw_unpack failed ({rc}) for {}", path.display());
     }
     // black level / pre_mul / rgb_cam are only correct after unpack
-    unsafe { ffi::ara_raw_refresh_info(h.ptr, &mut info) };
+    unsafe { ffi::sl_raw_refresh_info(h.ptr, &mut info) };
     let mut out: *mut u16 = std::ptr::null_mut();
     let mut count: i32 = 0;
-    let rc = unsafe { ffi::ara_raw_cfa(h.ptr, &mut out, &mut count) };
+    let rc = unsafe { ffi::sl_raw_cfa(h.ptr, &mut out, &mut count) };
     if rc != 0 || out.is_null() {
-        bail!("ara_raw_cfa failed ({rc})");
+        bail!("sl_raw_cfa failed ({rc})");
     }
     let data = unsafe { Vec::from_raw_parts(out, count as usize, count as usize) };
     mosaic_decoded(
@@ -229,7 +229,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
 /// Nikon HE decoder). `raw_w`/`raw_h` are the decoded buffer's dimensions;
 /// the visible frame/margins/CFA/color data come from libraw's metadata.
 fn mosaic_decoded(
-    info: &ffi::AraRawInfo,
+    info: &ffi::SlRawInfo,
     data: Vec<u16>,
     raw_w: usize,
     raw_h: usize,
@@ -352,7 +352,7 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
         .map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())
         .unwrap_or(0)
         .hash(&mut hasher);
-    let dir = std::env::temp_dir().join("araware-gpr");
+    let dir = std::env::temp_dir().join("safelight-gpr");
     std::fs::create_dir_all(&dir)?;
     let out = dir.join(format!("g{:016x}.dng", hasher.finish()));
     if out.is_file() {
@@ -360,7 +360,7 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
     }
     let cin = CString::new(path.to_string_lossy().as_ref())?;
     let cout = CString::new(out.to_string_lossy().as_ref())?;
-    let rc = unsafe { ffi::ara_gpr_to_dng(cin.as_ptr(), cout.as_ptr()) };
+    let rc = unsafe { ffi::sl_gpr_to_dng(cin.as_ptr(), cout.as_ptr()) };
     if rc != 0 || !out.is_file() {
         bail!("gpr→dng conversion failed ({rc})");
     }
@@ -369,11 +369,11 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
 
 /// Full-res decode via macOS ImageIO system RAW codecs (real debayer for
 /// formats libraw can't unpack, e.g. Nikon HE/HE*). Returns rgba16 sRGB.
-fn imgio_decode(path: &Path, info: &ffi::AraRawInfo) -> Result<Decoded> {
+fn imgio_decode(path: &Path, info: &ffi::SlRawInfo) -> Result<Decoded> {
     let c = CString::new(path.to_string_lossy().as_bytes())?;
     let mut out: *mut u16 = std::ptr::null_mut();
     let (mut w, mut h) = (0i32, 0i32);
-    let rc = unsafe { ffi::ara_imgio_decode(c.as_ptr(), &mut out, &mut w, &mut h) };
+    let rc = unsafe { ffi::sl_imgio_decode(c.as_ptr(), &mut out, &mut w, &mut h) };
     if rc != 0 || out.is_null() || w <= 0 || h <= 0 {
         bail!("imgio decode failed ({rc})");
     }
@@ -393,10 +393,10 @@ fn imgio_decode(path: &Path, info: &ffi::AraRawInfo) -> Result<Decoded> {
 
 /// Largest embedded JPEG/bitmap preview inside the RAW container — the
 /// darktable-style graceful fallback for unsupported sensor compression.
-fn embedded_preview(h: &RawHandle, info: &ffi::AraRawInfo) -> Result<Decoded> {
+fn embedded_preview(h: &RawHandle, info: &ffi::SlRawInfo) -> Result<Decoded> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);
-    let rc = unsafe { ffi::ara_thumb_best(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
+    let rc = unsafe { ffi::sl_thumb_best(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
     if rc != 0 || out.is_null() || len <= 0 {
         bail!("no embedded preview ({rc})");
     }
@@ -499,7 +499,7 @@ pub fn reference_render(path: &Path) -> Result<(Vec<u8>, usize, usize)> {
 fn process8(h: &RawHandle) -> Result<Decoded> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut w, mut hgt) = (0i32, 0i32);
-    let rc = unsafe { ffi::ara_process8(h.ptr, &mut out, &mut w, &mut hgt) };
+    let rc = unsafe { ffi::sl_process8(h.ptr, &mut out, &mut w, &mut hgt) };
     if rc != 0 || out.is_null() {
         bail!("libraw dcraw_process failed ({rc})");
     }
@@ -597,7 +597,7 @@ pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
     let (h, info) = open_raw(path)?;
     let mut out: *mut u8 = std::ptr::null_mut();
     let (mut len, mut w, mut hgt, mut fmt) = (0i32, 0i32, 0i32, 0i32);
-    let rc = unsafe { ffi::ara_thumb(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
+    let rc = unsafe { ffi::sl_thumb(h.ptr, &mut out, &mut len, &mut w, &mut hgt, &mut fmt) };
     if rc != 0 || out.is_null() || len <= 0 {
         return Ok(None);
     }

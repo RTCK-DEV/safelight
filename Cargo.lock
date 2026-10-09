@@ -101,41 +101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "araware-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "araware-core",
- "env_logger",
- "image",
- "log",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "araware-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cc",
- "image",
- "kamadak-exif",
- "log",
- "ort",
- "pollster",
- "roxmltree",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "ureq",
- "walkdir",
- "wgpu",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,6 +1822,41 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "safelight-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "image",
+ "log",
+ "safelight-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "safelight-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cc",
+ "image",
+ "kamadak-exif",
+ "log",
+ "ort",
+ "pollster",
+ "roxmltree",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ureq",
+ "walkdir",
+ "wgpu",
+]
 
 [[package]]
 name = "same-file"

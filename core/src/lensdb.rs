@@ -629,7 +629,7 @@ fn lerp_tca(t: &[TcaCal], f: f32) -> [f32; 4] {
 static DB: OnceLock<Option<LensDb>> = OnceLock::new();
 
 fn db_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("ARA_LENSFUN_DB") {
+    if let Ok(d) = std::env::var("SAFELIGHT_LENSFUN_DB") {
         let p = PathBuf::from(d);
         if p.is_dir() {
             return Some(p);

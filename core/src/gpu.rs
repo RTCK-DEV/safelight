@@ -2,7 +2,7 @@
 //! Mirrors the math in develop.rs: demosaic -> chroma NR -> sharpen/clarity ->
 //! straighten/flip/fit-resize -> tone/color adjust -> grain/vignette -> gamma.
 //! Intermediates are vec4<f32> storage buffers; the last pass writes packed
-//! rgba8. The CPU path remains as fallback (ARA_DISABLE_GPU or no adapter).
+//! rgba8. The CPU path remains as fallback (SAFELIGHT_DISABLE_GPU or no adapter).
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 
@@ -1728,8 +1728,8 @@ fn norm_factors(m: &Mosaic) -> [f32; 4] {
 
 impl Gpu {
     pub fn try_new() -> Option<Gpu> {
-        if std::env::var_os("ARA_DISABLE_GPU").is_some() {
-            log::info!("GPU disabled via ARA_DISABLE_GPU");
+        if std::env::var_os("SAFELIGHT_DISABLE_GPU").is_some() {
+            log::info!("GPU disabled via SAFELIGHT_DISABLE_GPU");
             return None;
         }
         match Self::init() {
@@ -1761,7 +1761,7 @@ impl Gpu {
         limits.max_compute_invocations_per_workgroup = al.max_compute_invocations_per_workgroup;
         limits.max_storage_buffers_per_shader_stage = al.max_storage_buffers_per_shader_stage;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("araware"),
+            label: Some("safelight"),
             required_limits: limits,
             ..Default::default()
         }))
