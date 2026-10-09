@@ -996,75 +996,104 @@ struct EditorView: View {
     }
 
     private var stageStrip: some View {
-        HStack(spacing: 4) {
-            stageChip(0)
-            ForEach(Array(recipe.stages.indices), id: \.self) { i in
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(Theme.text2.opacity(0.6))
-                stageChip(i + 1)
-            }
-            if recipe.stages.count < 4 {
-                Button(action: addStage) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Theme.text2)
-                        .frame(width: 20, height: 20)
-                        .background(Circle().stroke(Theme.border, lineWidth: 0.8))
-                }
-                .buttonStyle(.plain)
-                .help("Add serial stage (⌥S)")
-            }
-            Spacer()
-            if selStage > 0, selStage <= recipe.stages.count {
-                let i = selStage - 1
-                Text("Opacity")
-                    .font(.system(size: 9)).foregroundStyle(Theme.text2)
-                Slider(value: $recipe.stages[i].opacity, in: 0...1)
-                    .frame(width: 90)
-                Text(String(format: "%.2f", recipe.stages[i].opacity))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(Theme.text2)
-                    .frame(width: 32)
-                Toggle("Invert", isOn: $recipe.stages[i].invert)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 9))
-                    .foregroundStyle(Theme.text2)
-                // reliable path to stage ops — the chip's .contextMenu
-                // doesn't fire on some macOS/SwiftUI combos
-                Menu {
-                    Button("Rename…") {
-                        stageRenameText = recipe.stages[i].name
-                        showStageRename = true
-                    }
-                    Button("Duplicate stage") {
+        // measure the strip so controls can switch full ↔ compact below the
+        // width where the full set would clip (chips scroll either way)
+        GeometryReader { geo in
+            HStack(spacing: 4) {
+                // chips live in a horizontal scroller so crowded strips can't
+                // push the trailing controls (Opacity/Invert/⋯) off the edge
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        stageChip(0)
+                        ForEach(Array(recipe.stages.indices), id: \.self) { i in
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundStyle(Theme.text2.opacity(0.6))
+                            stageChip(i + 1)
+                        }
                         if recipe.stages.count < 4 {
-                            var c = recipe.stages[i]
-                            c.id = UUID(); c.name += " copy"
-                            recipe.stages.insert(c, at: selStage)
+                            Button(action: addStage) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(Theme.text2)
+                                    .frame(width: 20, height: 20)
+                                    .background(Circle().stroke(Theme.border, lineWidth: 0.8))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Add serial stage (⌥S)")
                         }
                     }
-                    Divider()
-                    Button("Delete stage", role: .destructive) {
-                        recipe.stages.remove(at: i)
-                        if selStage > recipe.stages.count { selStage = recipe.stages.count }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.text2)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: 18)
-                .help("Stage options")
+                .layoutPriority(-1)
+                Spacer(minLength: 4)
+                if selStage > 0, selStage <= recipe.stages.count {
+                    let i = selStage - 1
+                    if geo.size.width >= 340 {
+                        HStack(spacing: 4) {
+                            Text("Opacity")
+                                .font(.system(size: 9)).foregroundStyle(Theme.text2)
+                            Slider(value: $recipe.stages[i].opacity, in: 0...1)
+                                .frame(width: 90)
+                            Text(String(format: "%.2f", recipe.stages[i].opacity))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Theme.text2)
+                                .frame(width: 32)
+                            Toggle("Invert", isOn: $recipe.stages[i].invert)
+                                .toggleStyle(.checkbox)
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.text2)
+                            stageOpsMenu(i)
+                        }
+                    } else {
+                        HStack(spacing: 4) {
+                            Slider(value: $recipe.stages[i].opacity, in: 0...1)
+                                .frame(minWidth: 24, idealWidth: 60, maxWidth: 90)
+                            stageOpsMenu(i)
+                        }
+                    }
+                }
             }
+            .padding(.horizontal, 10).padding(.vertical, 5)
         }
-        .padding(.horizontal, 10).padding(.vertical, 5)
+        .frame(height: 32)
         .background(Theme.bg1)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Theme.border).frame(height: 0.5)
         }
+    }
+
+    // reliable path to stage ops — the chip's .contextMenu doesn't fire on
+    // some macOS/SwiftUI combos; Invert lives here too so it stays reachable
+    // when the strip collapses to its compact form at narrow widths
+    private func stageOpsMenu(_ i: Int) -> some View {
+        Menu {
+            Toggle("Invert", isOn: $recipe.stages[i].invert)
+            Divider()
+            Button("Rename…") {
+                stageRenameText = recipe.stages[i].name
+                showStageRename = true
+            }
+            Button("Duplicate stage") {
+                if recipe.stages.count < 4 {
+                    var c = recipe.stages[i]
+                    c.id = UUID(); c.name += " copy"
+                    recipe.stages.insert(c, at: selStage)
+                }
+            }
+            Divider()
+            Button("Delete stage", role: .destructive) {
+                recipe.stages.remove(at: i)
+                if selStage > recipe.stages.count { selStage = recipe.stages.count }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.text2)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: 18)
+        .help("Stage options")
         .alert("Stage name", isPresented: $showStageRename) {
             TextField("Name", text: $stageRenameText)
             Button("OK") {
