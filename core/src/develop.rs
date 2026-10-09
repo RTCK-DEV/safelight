@@ -2016,7 +2016,7 @@ fn develop_mosaic(
             (acc[2] / s.count as f64) as f32,
         ];
         s.luma_mean = (luma / s.count as f64) as f32;
-        if std::env::var_os("ARA_STATS").is_some() {
+        if std::env::var_os("SAFELIGHT_STATS").is_some() {
             eprintln!(
                 "[stats] means={:?} luma_mean={:.4} count={}",
                 s.means, s.luma_mean, s.count

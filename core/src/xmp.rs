@@ -3,11 +3,11 @@
 //! `write_sidecar` also emits `<photo>.xmp` mirroring the recipe in the
 //! `crs:` (Camera Raw Settings) namespace so Lightroom Classic / Camera Raw /
 //! darktable can read our basic adjustments — and we read the same fields
-//! back when a folder contains LR-authored XMP without an `.araware.json`.
+//! back when a folder contains LR-authored XMP without an `.safelight.json`.
 //!
 //! Round-trip fidelity: LR fields cover only a subset of the recipe and
 //! rescale our [-1,1] ranges to LR's integer [-100,+100] convention, so the
-//! full recipe is also embedded verbatim in `<ara:Recipe>` — araware reads
+//! full recipe is also embedded verbatim in `<ara:Recipe>` — safelight reads
 //! that first and treats crs: only as a fallback for foreign files.
 
 use crate::recipe::{Recipe, Sidecar};
@@ -58,12 +58,12 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     let r = &sc.recipe;
     let mut a = String::with_capacity(4096);
     a.push_str("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
-    a.push_str("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"araware\">\n");
+    a.push_str("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"safelight\">\n");
     a.push_str(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
     a.push_str("  <rdf:Description rdf:about=\"\"\n");
     a.push_str("   xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n");
     a.push_str("   xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n");
-    a.push_str("   xmlns:ara=\"https://araware.app/ns/1.0/\"\n");
+    a.push_str("   xmlns:sl=\"https://safelight.app/ns/1.0/\"\n");
     a.push_str("   crs:Version=\"15.0\" crs:ProcessVersion=\"11.0\" crs:RawFileName=\"");
     a.push_str(&esc(&asset
         .file_name()
@@ -251,7 +251,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_ara_recipe_lossless() {
+    fn roundtrip_sl_recipe_lossless() {
         let dir = std::env::temp_dir().join(format!("xmp_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let asset = dir.join("photo.arw");

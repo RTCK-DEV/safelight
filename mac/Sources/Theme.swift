@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// araware "darkroom" theme — near-black surfaces, warm amber accent.
-enum Ara {
+/// safelight "darkroom" theme — near-black surfaces, warm amber accent.
+enum Theme {
     static let bg0 = Color(red: 0.035, green: 0.035, blue: 0.042)   // stage / window
     static let bg1 = Color(red: 0.075, green: 0.077, blue: 0.086)   // sidebar / inspector
     static let bg2 = Color(red: 0.115, green: 0.118, blue: 0.130)   // cards / panels
@@ -72,18 +72,18 @@ struct TrackSlider: View {
                 if let track {
                     Capsule().fill(track)
                         .frame(width: w, height: 5)
-                        .overlay(Capsule().stroke(Ara.border, lineWidth: 0.5))
+                        .overlay(Capsule().stroke(Theme.border, lineWidth: 0.5))
                 } else {
-                    Capsule().fill(Ara.track)
+                    Capsule().fill(Theme.track)
                         .frame(width: w, height: 4)
                 }
-                Capsule().fill(track == nil ? Ara.accent.opacity(0.85) : Color.white.opacity(0.55))
+                Capsule().fill(track == nil ? Theme.accent.opacity(0.85) : Color.white.opacity(0.55))
                     .frame(width: max(abs(kx - dx), 2), height: track == nil ? 4 : 5)
                     .offset(x: min(kx, dx))
                 Circle()
                     .fill(Color.white)
                     .frame(width: 11, height: 11)
-                    .overlay(Circle().stroke(Ara.accent.opacity(0.95), lineWidth: 2))
+                    .overlay(Circle().stroke(Theme.accent.opacity(0.95), lineWidth: 2))
                     .shadow(color: .black.opacity(0.5), radius: 1, y: 0.5)
                     .position(x: kx.clamped(to: 5.5...(w - 5.5)), y: geo.size.height / 2)
             }
@@ -176,7 +176,7 @@ struct NumValue: View {
                 TextField(String(format: "%.\(digits)f", value), text: $text)
                     .textFieldStyle(.plain)
                     .font(.system(size: 10.5).monospacedDigit())
-                    .foregroundStyle(Ara.accent)
+                    .foregroundStyle(Theme.accent)
                     .multilineTextAlignment(.trailing)
                     .frame(width: width + 8, alignment: .trailing)
                     .focused($focus)
@@ -187,12 +187,12 @@ struct NumValue: View {
             } else {
                 Text(String(format: "%.\(digits)f", value))
                     .font(.system(size: 10.5).monospacedDigit())
-                    .foregroundStyle(abs(value - def) < 1e-9 ? Ara.text3 : Ara.accent)
+                    .foregroundStyle(abs(value - def) < 1e-9 ? Theme.text3 : Theme.accent)
                     // generous hitbox: pads catch taps that would otherwise land
                     // on the track just left of the number
                     .frame(minWidth: width, alignment: .trailing)
                     .padding(.horizontal, 5).padding(.vertical, 3)
-                    .background(Ara.bg3.opacity(0.001))   // invisible grab surface
+                    .background(Theme.bg3.opacity(0.001))   // invisible grab surface
                     .contentShape(Rectangle())
                     .onTapGesture(count: 1) { editing = true }
             }
@@ -233,15 +233,15 @@ struct VSlider: View {
             let ky = fy(value)
             let zy = fy(reset)
             ZStack {
-                Capsule().fill(Ara.track)
+                Capsule().fill(Theme.track)
                     .frame(width: 4, height: h)
-                Capsule().fill(Ara.accent.opacity(0.85))
+                Capsule().fill(Theme.accent.opacity(0.85))
                     .frame(width: 4, height: max(abs(ky - zy), 2))
                     .offset(y: (min(ky, zy) + max(ky, zy)) / 2 - h / 2)
                 Circle()
                     .fill(Color.white)
                     .frame(width: 9, height: 9)
-                    .overlay(Circle().stroke(Ara.accent.opacity(0.95), lineWidth: 1.5))
+                    .overlay(Circle().stroke(Theme.accent.opacity(0.95), lineWidth: 1.5))
                     .shadow(color: .black.opacity(0.5), radius: 1, y: 0.5)
                     .position(x: w / 2, y: ky.clamped(to: 4.5...(h - 4.5)))
             }
@@ -303,7 +303,7 @@ struct ZoneEQ: View {
                         range: -4...4, step: 0.25, reset: 0, height: 62)
                     Text("\(i - 4)")
                         .font(.system(size: 7.5).monospacedDigit())
-                        .foregroundStyle(zones.count > i && zones[i] != 0 ? Ara.accent : Ara.text3)
+                        .foregroundStyle(zones.count > i && zones[i] != 0 ? Theme.accent : Theme.text3)
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -335,7 +335,7 @@ struct SliderRow: View {
         HStack(spacing: 7) {
             Text(title)
                 .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(Ara.text2)
+                .foregroundStyle(Theme.text2)
                 .frame(width: 60, alignment: .leading)
                 .lineLimit(1)
             TrackSlider(value: $value, range: range, step: step, reset: reset, track: track)
@@ -358,7 +358,7 @@ struct RangeBar: View {
         HStack(spacing: 7) {
             Text(title)
                 .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(Ara.text2)
+                .foregroundStyle(Theme.text2)
                 .frame(width: 60, alignment: .leading)
                 .lineLimit(1)
             GeometryReader { geo in
@@ -367,12 +367,12 @@ struct RangeBar: View {
                 let hx = CGFloat(hi.clamped(to: 0...1)) * w
                 ZStack {
                     Capsule().fill(gradient).frame(width: w, height: 8)
-                        .overlay(Capsule().stroke(Ara.border, lineWidth: 0.5))
+                        .overlay(Capsule().stroke(Theme.border, lineWidth: 0.5))
                     // dim outside the selected range
                     HStack(spacing: 0) {
-                        Rectangle().fill(Ara.bg0.opacity(0.55)).frame(width: max(lx, 0))
+                        Rectangle().fill(Theme.bg0.opacity(0.55)).frame(width: max(lx, 0))
                         Spacer(minLength: 0)
-                        Rectangle().fill(Ara.bg0.opacity(0.55)).frame(width: max(w - hx, 0))
+                        Rectangle().fill(Theme.bg0.opacity(0.55)).frame(width: max(w - hx, 0))
                     }
                     .clipShape(Capsule())
                     .frame(width: w, height: 8)
@@ -398,7 +398,7 @@ struct RangeBar: View {
         RoundedRectangle(cornerRadius: 2)
             .fill(Color.white)
             .frame(width: 5, height: 12)
-            .overlay(RoundedRectangle(cornerRadius: 2).stroke(Ara.accent, lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 2).stroke(Theme.accent, lineWidth: 1))
             .shadow(color: .black.opacity(0.5), radius: 1, y: 0.5)
             .position(x: x.clamped(to: 2...max(w - 2, 2)), y: y)
     }
@@ -428,13 +428,13 @@ struct Panel<Content: View, Trailing: View>: View {
                 if expanded != nil {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(Ara.text3)
+                        .foregroundStyle(Theme.text3)
                         .rotationEffect(.degrees(expanded?.wrappedValue == true ? 90 : 0))
                 }
                 Text(title.uppercased())
                     .font(.system(size: 9.5, weight: .semibold))
                     .tracking(1.2)
-                    .foregroundStyle(Ara.text2)
+                    .foregroundStyle(Theme.text2)
                 Spacer()
                 trailing
             }
@@ -455,9 +455,9 @@ struct Panel<Content: View, Trailing: View>: View {
                     .padding(.top, 2)
             }
         }
-        .background(Ara.bg2)
+        .background(Theme.bg2)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Ara.hairline, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline, lineWidth: 1))
     }
 }
 
@@ -484,13 +484,13 @@ struct SegPicker<T: Hashable>: View {
                 Button { selection = opt.value } label: {
                     Text(opt.label)
                         .font(.system(size: 10, weight: selection == opt.value ? .semibold : .regular))
-                        .foregroundStyle(selection == opt.value ? .white : Ara.text2)
+                        .foregroundStyle(selection == opt.value ? .white : Theme.text2)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 5)
                         .background(
-                            Capsule().fill(selection == opt.value ? Ara.bg4 : .clear)
+                            Capsule().fill(selection == opt.value ? Theme.bg4 : .clear)
                                 .overlay(Capsule().stroke(
-                                    selection == opt.value ? Ara.border : .clear, lineWidth: 0.5))
+                                    selection == opt.value ? Theme.border : .clear, lineWidth: 0.5))
                         )
                         .padding(2)
                 }
@@ -498,30 +498,30 @@ struct SegPicker<T: Hashable>: View {
             }
         }
         .padding(1)
-        .background(Ara.bg3)
+        .background(Theme.bg3)
         .clipShape(Capsule())
     }
 }
 
-struct AraPrimaryButton: ButtonStyle {
+struct SlPrimaryButton: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(Color.black.opacity(0.85))
             .padding(.horizontal, 12).padding(.vertical, 5)
-            .background(Capsule().fill(Ara.accent))
+            .background(Capsule().fill(Theme.accent))
             .opacity(configuration.isPressed ? 0.75 : 1)
     }
 }
 
-struct AraSecondaryButton: ButtonStyle {
+struct SlSecondaryButton: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(Ara.text1)
+            .foregroundStyle(Theme.text1)
             .padding(.horizontal, 11).padding(.vertical, 5)
-            .background(Capsule().fill(Ara.bg3)
-                .overlay(Capsule().stroke(Ara.border, lineWidth: 0.5)))
+            .background(Capsule().fill(Theme.bg3)
+                .overlay(Capsule().stroke(Theme.border, lineWidth: 0.5)))
             .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
@@ -538,11 +538,11 @@ struct IconAction: View {
                 Image(systemName: icon).font(.system(size: 11, weight: .medium))
                 if let label { Text(label).font(.system(size: 10.5, weight: .medium)) }
             }
-            .foregroundStyle(active ? Ara.accent : Ara.text2)
+            .foregroundStyle(active ? Theme.accent : Theme.text2)
             .padding(.horizontal, label != nil ? 8 : 6)
             .padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 6).fill(active ? Ara.accentSoft : Ara.bg3)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(active ? Ara.accent.opacity(0.4) : Ara.hairline, lineWidth: 0.5)))
+            .background(RoundedRectangle(cornerRadius: 6).fill(active ? Theme.accentSoft : Theme.bg3)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(active ? Theme.accent.opacity(0.4) : Theme.hairline, lineWidth: 0.5)))
         }
         .buttonStyle(.plain)
     }
@@ -560,10 +560,10 @@ struct ToolChip: View {
                 if let icon { Image(systemName: icon).font(.system(size: 9, weight: .bold)) }
                 Text(label).font(.system(size: 10, weight: .medium))
             }
-            .foregroundStyle(active ? Ara.accent : Ara.text1)
+            .foregroundStyle(active ? Theme.accent : Theme.text1)
             .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(Capsule().fill(active ? Ara.accentSoft : Ara.bg3)
-                .overlay(Capsule().stroke(active ? Ara.accent.opacity(0.5) : Ara.hairline, lineWidth: 0.5)))
+            .background(Capsule().fill(active ? Theme.accentSoft : Theme.bg3)
+                .overlay(Capsule().stroke(active ? Theme.accent.opacity(0.5) : Theme.hairline, lineWidth: 0.5)))
         }
         .buttonStyle(.plain)
     }

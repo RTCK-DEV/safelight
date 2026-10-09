@@ -1,4 +1,4 @@
-//! araware-core: RAW development + library engine.
+//! safelight-core: RAW development + library engine.
 //!
 //! decode (LibRaw) -> develop pipeline (CPU reference, wgpu for speed)
 //! -> catalog (folder scan + SQLite index + JSON sidecars) -> C FFI.

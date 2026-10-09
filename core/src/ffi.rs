@@ -1,11 +1,11 @@
-//! FFI bindings to the ara_shim C++ wrapper around LibRaw.
+//! FFI bindings to the sl_shim C++ wrapper around LibRaw.
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
 use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ushort, c_void};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct AraRawInfo {
+pub struct SlRawInfo {
     pub make: [c_char; 64],
     pub model: [c_char; 64],
     pub lens: [c_char; 128],
@@ -35,44 +35,44 @@ pub struct AraRawInfo {
     pub timestamp: c_long,
 }
 
-pub enum AraRaw {}
+pub enum SlRaw {}
 
 extern "C" {
-    pub fn ara_raw_open(path: *const c_char, info: *mut AraRawInfo) -> *mut AraRaw;
-    pub fn ara_raw_unpack(r: *mut AraRaw) -> c_int;
-    pub fn ara_raw_refresh_info(r: *mut AraRaw, info: *mut AraRawInfo);
-    pub fn ara_raw_cfa(r: *mut AraRaw, out: *mut *mut c_ushort, count: *mut c_int) -> c_int;
-    pub fn ara_thumb(
-        r: *mut AraRaw,
+    pub fn sl_raw_open(path: *const c_char, info: *mut SlRawInfo) -> *mut SlRaw;
+    pub fn sl_raw_unpack(r: *mut SlRaw) -> c_int;
+    pub fn sl_raw_refresh_info(r: *mut SlRaw, info: *mut SlRawInfo);
+    pub fn sl_raw_cfa(r: *mut SlRaw, out: *mut *mut c_ushort, count: *mut c_int) -> c_int;
+    pub fn sl_thumb(
+        r: *mut SlRaw,
         out: *mut *mut c_uchar,
         len: *mut c_int,
         w: *mut c_int,
         h: *mut c_int,
         format: *mut c_int,
     ) -> c_int;
-    pub fn ara_process8(
-        r: *mut AraRaw,
+    pub fn sl_process8(
+        r: *mut SlRaw,
         out: *mut *mut c_uchar,
         w: *mut c_int,
         h: *mut c_int,
     ) -> c_int;
-    pub fn ara_thumb_best(
-        r: *mut AraRaw,
+    pub fn sl_thumb_best(
+        r: *mut SlRaw,
         out: *mut *mut c_uchar,
         len: *mut c_int,
         w: *mut c_int,
         h: *mut c_int,
         format: *mut c_int,
     ) -> c_int;
-    pub fn ara_imgio_decode(
+    pub fn sl_imgio_decode(
         path: *const c_char,
         out: *mut *mut c_ushort,
         w: *mut c_int,
         h: *mut c_int,
     ) -> c_int;
-    pub fn ara_gpr_to_dng(in_path: *const c_char, out_path: *const c_char) -> c_int;
-    pub fn ara_raw_close(r: *mut AraRaw);
-    pub fn ara_free(p: *mut c_void);
+    pub fn sl_gpr_to_dng(in_path: *const c_char, out_path: *const c_char) -> c_int;
+    pub fn sl_raw_close(r: *mut SlRaw);
+    pub fn sl_free(p: *mut c_void);
 }
 
 pub fn cstr_field(buf: &[c_char]) -> String {

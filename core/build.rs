@@ -22,20 +22,20 @@ fn main() {
 
     cc::Build::new()
         .cpp(true)
-        .file("native/ara_shim.cpp")
+        .file("native/sl_shim.cpp")
         .include("native")
         .include(format!("{prefix}/include"))
         .flag_if_supported("-std=c++17")
         .warnings(false)
-        .compile("ara_shim");
+        .compile("sl_shim");
 
     if cfg!(target_os = "macos") {
         cc::Build::new()
-            .file("native/ara_imgio.mm")
+            .file("native/sl_imgio.mm")
             .flag_if_supported("-std=c++17")
             .flag_if_supported("-fobjc-arc")
             .warnings(false)
-            .compile("ara_imgio");
+            .compile("sl_imgio");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=ImageIO");
         println!("cargo:rustc-link-lib=framework=CoreServices");
@@ -113,15 +113,15 @@ fn main() {
             b.files(&cs)
                 .flag_if_supported("-std=c99")
                 .warnings(false)
-                .compile("ara_gpr_c");
+                .compile("sl_gpr_c");
         }
         let mut b = mk();
         b.files(&cpps)
-            .file("native/ara_gpr.cpp")
+            .file("native/sl_gpr.cpp")
             .cpp(true)
             .flag_if_supported("-std=c++17")
             .warnings(false)
-            .compile("ara_gpr_cpp");
+            .compile("sl_gpr_cpp");
     }
 
     println!("cargo:rustc-link-search=native={prefix}/lib");
@@ -133,8 +133,8 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=stdc++");
     }
-    println!("cargo:rerun-if-changed=native/ara_shim.cpp");
-    println!("cargo:rerun-if-changed=native/ara_shim.h");
-    println!("cargo:rerun-if-changed=native/ara_imgio.mm");
+    println!("cargo:rerun-if-changed=native/sl_shim.cpp");
+    println!("cargo:rerun-if-changed=native/sl_shim.h");
+    println!("cargo:rerun-if-changed=native/sl_imgio.mm");
     println!("cargo:rerun-if-env-changed=LIBRAW_PREFIX");
 }

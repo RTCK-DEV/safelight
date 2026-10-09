@@ -17,5 +17,5 @@ Attribution-ShareAlike licence. Attribution: "Lens distortion database
 by the lensfun project (https://lensfun.github.io/)". ShareAlike applies
 to the database files, not to application code.
 
-araware does **not** link or embed the lensfun library — it parses this
+safelight does **not** link or embed the lensfun library — it parses this
 data with its own reader (`core/src/lensdb.rs`).

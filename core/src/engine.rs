@@ -10,7 +10,9 @@ use crate::catalog::{AssetEntry, Catalog};
 use crate::decode::{self, Decoded};
 use crate::develop::{self, RgbaImage};
 use crate::gpu::Gpu;
-use crate::recipe::{sidecar_path_for, sidecar_path_for_v, Recipe, Sidecar};
+use crate::recipe::{
+    read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Recipe, Sidecar,
+};
 
 struct State {
     path: Option<PathBuf>,
@@ -240,7 +242,7 @@ impl Engine {
     }
 
     /// fast preview: embedded thumbnail if any, else small develop.
-    /// Results are cached on disk under ~/.araware/thumbs keyed by
+    /// Results are cached on disk under ~/.safelight/thumbs keyed by
     /// path+mtime+size+max_px so library rescans are instant.
     pub fn thumbnail(&self, path: &Path, max_px: u32) -> Result<RgbaImage> {
         let key = format!(
@@ -380,7 +382,7 @@ impl Engine {
     }
 
     pub fn read_sidecar(&self, asset: &Path) -> Result<Sidecar> {
-        let sp = sidecar_path_for(asset);
+        let sp = read_sidecar_path_for_v(asset, 0);
         if sp.exists() {
             crate::catalog::read_sidecar(&sp)
         } else if let Some(sc) = crate::xmp::read_xmp(asset) {
@@ -407,7 +409,7 @@ impl Engine {
     }
 
     pub fn read_sidecar_v(&self, asset: &Path, vslot: u32) -> Result<Sidecar> {
-        let sp = sidecar_path_for_v(asset, vslot);
+        let sp = read_sidecar_path_for_v(asset, vslot);
         if sp.exists() {
             crate::catalog::read_sidecar(&sp)
         } else if vslot == 0 {

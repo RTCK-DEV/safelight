@@ -1,6 +1,6 @@
 // AI features via ONNX Runtime: real-world denoise (SCUNet, MIT) and subject
 // detection (U-2-Net, Apache-2.0). The ONNX Runtime dylib and model weights are
-// resolved from the app bundle / ~/.araware/ai, downloading from public sources
+// resolved from the app bundle / ~/.safelight/ai, downloading from public sources
 // on first use. Everything degrades gracefully: no runtime or no model → error.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,16 +18,10 @@ const SCUNET_OVERLAP: usize = 48;
 const U2NET_SIZE: usize = 320;
 
 pub fn ai_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("ARAWARE_AI_DIR") {
+    if let Ok(p) = std::env::var("SAFELIGHT_AI_DIR") {
         return PathBuf::from(p);
     }
-    dirs_home().join(".araware").join("ai")
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    crate::catalog::app_home().join("ai")
 }
 
 fn download(url: &str, dest: &Path) -> Result<()> {
@@ -101,7 +95,7 @@ fn ort_dylib() -> Result<PathBuf> {
 
 fn model_file(names: &[&str], urls: &[String]) -> Result<PathBuf> {
     let dir = ai_dir();
-    if let Ok(extra) = std::env::var("ARAWARE_MODEL_DIR") {
+    if let Ok(extra) = std::env::var("SAFELIGHT_MODEL_DIR") {
         let p = PathBuf::from(extra).join(names[0]);
         if p.exists() {
             return Ok(p);
@@ -382,21 +376,21 @@ fn make_session(which: u8) -> Result<ort::session::Session> {
         let use_coreml = use_coreml && allow_coreml;
         let mut builder =
             ort::session::Session::builder().map_err(|e| anyhow!("ort session builder: {e}"))?;
-        if std::env::var_os("ARAWARE_ORT_VERBOSE").is_some() {
+        if std::env::var_os("SAFELIGHT_ORT_VERBOSE").is_some() {
             builder = builder
                 .with_log_level(ort::logging::LogLevel::Verbose)
                 .map_err(|e| anyhow!("ort log: {e}"))?;
         }
-        if std::env::var_os("ARAWARE_NO_ARENA").is_some() {
+        if std::env::var_os("SAFELIGHT_NO_ARENA").is_some() {
             builder = builder
                 .with_memory_pattern(false)
                 .map_err(|e| anyhow!("ort mem: {e}"))?;
         }
         #[cfg(target_os = "macos")]
-        if use_coreml && std::env::var_os("ARAWARE_NO_COREML").is_none() {
+        if use_coreml && std::env::var_os("SAFELIGHT_NO_COREML").is_none() {
             let cache = ai_dir().join("coreml-cache");
             let _ = std::fs::create_dir_all(&cache);
-            let units = match std::env::var("ARAWARE_COREML_UNITS")
+            let units = match std::env::var("SAFELIGHT_COREML_UNITS")
                 .unwrap_or_default()
                 .as_str()
             {
@@ -741,9 +735,9 @@ pub fn subject_mask(rgb8: &[u8], w: usize, h: usize) -> Result<Vec<f32>> {
 /// anyway, and linear-space blending against the noisy original adds natural
 /// dither over any JPEG quantization.
 pub fn denoise_cache_path(photo: &Path) -> PathBuf {
-    photo.with_extension("araware.aidn.jpg")
+    photo.with_extension("safelight.aidn.jpg")
 }
 
 pub fn subject_cache_path(photo: &Path) -> PathBuf {
-    photo.with_extension("araware.aimask.png")
+    photo.with_extension("safelight.aimask.png")
 }
