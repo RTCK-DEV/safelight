@@ -877,6 +877,31 @@ fn sky_bil(nx: f32, ny: f32) -> f32 {
     return mix(a, b, ty);
 }
 
+// vegetation matte: second packed region after the sky words in skybuf
+fn veg_at(ix: i32, iy: i32) -> f32 {
+    let w = i32(skybuf[0]);
+    let h = i32(skybuf[1]);
+    let npw = (u32(w) * u32(h) + 1u) / 2u;
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = skybuf[2u + npw + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn veg_bil(nx: f32, ny: f32) -> f32 {
+    let fx = nx * f32(skybuf[0]) - 0.5;
+    let fy = ny * f32(skybuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(veg_at(x0, y0), veg_at(x0 + 1, y0), tx);
+    let b = mix(veg_at(x0, y0 + 1), veg_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
 // bilinear sample of the subject matte at a normalized position
 fn subj_bil(nx: f32, ny: f32) -> f32 {
     let fx = nx * f32(subjbuf[0]) - 0.5;
@@ -1622,14 +1647,17 @@ fn skymat_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let mh = min(h, 384u);
     let np = mw * mh;
     if (i * 2u >= np) { return; }
+    let npw = (np + 1u) / 2u;
     if (i == 0u) { skybuf[0] = mw; skybuf[1] = mh; }
     var packed = 0u;
+    var pveg = 0u;
     for (var k = 0u; k < 2u; k = k + 1u) {
         let px = i * 2u + k;
         if (px < np) {
             let mx = i32(px % mw);
             let my = i32(px / mw);
             var acc = 0.0;
+            var vacc = 0.0;
             var wsum = 0.0;
             for (var dy = -2; dy <= 2; dy = dy + 1) {
                 for (var dx = -2; dx <= 2; dx = dx + 1) {
@@ -1651,16 +1679,40 @@ fn skymat_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
                     let lg = sstep(0.12, 0.45, hsv.z);
                     let vert = 0.35 + 0.65 * (1.0 - f32(ny2) / f32(mh));
                     acc = acc + clamp(hg * sg * lg * vert, 0.0, 1.0) * sw;
+                    // vegetation: green hue band × saturation × brightness
+                    var vd = abs(hsv.x * 360.0 - 120.0);
+                    if (vd > 180.0) { vd = 360.0 - vd; }
+                    let vh = 1.0 - sstep(45.0, 75.0, vd);
+                    vacc = vacc + clamp(vh * sstep(0.15, 0.45, hsv.y)
+                        * sstep(0.05, 0.25, hsv.z), 0.0, 1.0) * sw;
                     wsum = wsum + sw;
                 }
             }
             packed = packed | (u32(acc / wsum * 65535.0) << (16u * k));
+            pveg = pveg | (u32(vacc / wsum * 65535.0) << (16u * k));
         }
     }
     skybuf[2u + i] = packed;
+    skybuf[2u + npw + i] = pveg;
 }
 
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
+// soft-ellipse eval shared by the AI-gated kinds (part/veg/nsky):
+// [cx,cy,rx,ry,rot,soft] with the 50% radius at w2.w when set.
+fn ellm(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32) -> f32 {
+    let rot = w1.x * 0.0174533;
+    let dd = vec2<f32>(nx, ny) - w0.xy;
+    let rr = max(w0.zw, vec2<f32>(0.005));
+    let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
+    let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
+    let d = length(vec2<f32>(ux, uy));
+    let soft = clamp(w1.y, 0.0, 0.95);
+    let rmid = select(1.0 - soft * 0.5, clamp(w2.w, 0.01, 0.99), w2.w > 0.001);
+    let r0 = max(rmid - soft * 0.5, 0.0);
+    let r1 = min(rmid + soft * 0.5, 1.0);
+    return 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
+}
+
 // shared power-window mask eval (used by local_ops and the stage key).
 fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
     let mid_in = w2.w;
@@ -1672,18 +1724,14 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
     } else if ((kb & 64u) != 0u) {
         // LR person-part mask (MaskSubType=3): subject matte gated by a
         // soft ellipse prior positioned at the named body region.
-        let rot = w1.x * 0.0174533;
-        let dd = vec2<f32>(nx, ny) - w0.xy;
-        let rr = max(w0.zw, vec2<f32>(0.005));
-        let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
-        let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
-        let d = length(vec2<f32>(ux, uy));
-        let soft = clamp(w1.y, 0.0, 0.95);
-        let rmid = select(1.0 - soft * 0.5, clamp(mid_in, 0.01, 0.99), mid_in > 0.001);
-        let r0 = max(rmid - soft * 0.5, 0.0);
-        let r1 = min(rmid + soft * 0.5, 1.0);
-        let ell = 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
-        mask = ell * select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+        mask = ellm(w0, w1, w2, nx, ny) * select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 128u) != 0u) {
+        // LR landscape "Vegetation": heuristic veg matte × region prior
+        mask = ellm(w0, w1, w2, nx, ny) * select(0.0, veg_bil(nx, ny), skybuf[0] > 0u);
+    } else if ((kb & 256u) != 0u) {
+        // LR landscape semantic class (MaskSubType=0, non-sky):
+        // (1 - sky matte) gated by a region prior for the named class
+        mask = ellm(w0, w1, w2, nx, ny) * (1.0 - select(0.0, sky_bil(nx, ny), skybuf[0] > 0u));
     } else if ((kb & 32u) != 0u) {
         mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
     } else if ((kb & 4u) != 0u) {
@@ -2609,7 +2657,8 @@ impl Gpu {
         // header stays [0,0] unless skymat_main fills it.
         let sky_b = mk_buf(
             "skybuf",
-            &vec![0u8; (2 + (384 * 384 + 1) / 2) * 4],
+            // two packed mattes: sky at [2..2+npw], veg at [2+npw..]
+            &vec![0u8; (2 + (384 * 384 + 1) / 2 * 2) * 4],
             storage_in,
         );
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
@@ -2872,17 +2921,17 @@ impl Gpu {
             run(&mut enc, &self.sharpen, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
-        // heuristic sky matte for LR "sky" AI-mask windows
+        // heuristic sky/veg mattes for LR AI-mask windows
         let needs_sky = p
             .wins
             .iter()
             .take(p.n_wins as usize)
-            .any(|w| (w[0] as i32) & 32 != 0)
+            .any(|w| (w[0] as i32) & (32 | 128 | 256) != 0)
             || p.stages.iter().any(|(sp, _, _)| {
                 sp.wins
                     .iter()
                     .take(sp.n_wins as usize)
-                    .any(|w| (w[0] as i32) & 32 != 0)
+                    .any(|w| (w[0] as i32) & (32 | 128 | 256) != 0)
             });
         if needs_sky {
             let mw = vw.min(384);

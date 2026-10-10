@@ -773,6 +773,19 @@ fn part_prior(name: &str) -> (f32, f32, f32, f32) {
     }
 }
 
+/// LR landscape semantic mask names (MaskSubType=0, non-sky/non-veg) →
+/// soft-ellipse region prior over a typical landscape composition.
+/// Combined with (1 - sky matte) as the gate.
+fn land_prior(name: &str) -> (f32, f32, f32, f32) {
+    match name {
+        "Natural Ground" | "Artificial Ground" => (0.5, 0.78, 0.65, 0.30),
+        "Water" => (0.5, 0.72, 0.60, 0.30),
+        "Mountains" => (0.5, 0.40, 0.65, 0.35),
+        "Architecture" => (0.5, 0.55, 0.70, 0.45),
+        _ => (0.5, 0.60, 0.70, 0.40),
+    }
+}
+
 /// LR local corrections (graduated filter, radial filter, adjustment
 /// brush) → our power windows and brush layers. Handles both the legacy
 /// per-kind lists and the unified LR11+ MaskGroupBasedCorrections.
@@ -830,6 +843,16 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             let bl = loc(&["crs:LocalBlacks2012", "crs:LocalBlacks"]);
             // legacy PV2003 "Brightness" ≈ gamma-lift — approximate as exposure
             let ev = (ev + loc(&["crs:LocalBrightness"]) * 0.5).clamp(-4.0, 4.0);
+            // local color toning (hue/sat wheel) → temp/tint decomposition:
+            // blue-yellow axis at 60°/240°, green-magenta at 120°/300°
+            let ton = loc(&["crs:LocalToningSaturation"]) * 0.5;
+            let th = field(&item, "crs:LocalToningHue")
+                .unwrap_or(0.0)
+                .to_radians();
+            let temp = (temp + ton * (th - 1.0472).cos()).clamp(-1.0, 1.0);
+            let tin = (tin + ton * (th - 5.236).cos()).clamp(-1.0, 1.0);
+            // local saturation refine curve → modest saturation boost
+            let sat = (sat + loc(&["crs:LocalCurveRefineSaturation"]) * 0.25).clamp(-1.0, 1.0);
             let feather_of =
                 |mb: &str| (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0);
             // LR midpoint (0..100): 0 = at the zero-effect boundary.
@@ -912,6 +935,23 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     let (cx, cy, rx, ry) = part_prior(&name);
                     r.windows
                         .push(win("part", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
+                } else if sub == 0 {
+                    // LR11+ landscape semantic masks: Sky reuses the sky
+                    // matte, Vegetation the veg matte, the rest are
+                    // (1 - sky) gated by a class region prior.
+                    let name = field_str(&mb, "crs:MaskName").unwrap_or_default();
+                    match name.as_str() {
+                        "Sky" => r.windows.push(win("sky", [0.0; 6], 0.0, false)),
+                        "Vegetation" => {
+                            r.windows
+                                .push(win("veg", [0.5, 0.5, 1.5, 1.5, 0.0, 0.4], 0.0, false))
+                        }
+                        _ => {
+                            let (cx, cy, rx, ry) = land_prior(&name);
+                            r.windows
+                                .push(win("nsky", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
+                        }
+                    }
                 }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
@@ -1293,6 +1333,32 @@ mod tests {
         assert!((part.sat - 0.07325).abs() < 1e-5);
         // sharpness folds into positive clarity
         assert!(part.clarity > 0.05);
+    }
+
+    #[test]
+    fn landscape_semantic_masks_subtype0() {
+        let body = r##"<x:xmpmeta><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="">
+ <crs:MaskGroupBasedCorrections>
+  <rdf:Seq>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:LocalSaturation="0.3">
+    <crs:CorrectionMasks><rdf:Seq>
+      <rdf:li crs:What="Mask/Image" crs:MaskName="Vegetation" crs:MaskSubType="0"/>
+    </rdf:Seq></crs:CorrectionMasks>
+   </rdf:li>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:LocalExposure="-0.5">
+    <crs:CorrectionMasks><rdf:Seq>
+      <rdf:li crs:What="Mask/Image" crs:MaskName="Natural Ground" crs:MaskSubType="0"/>
+    </rdf:Seq></crs:CorrectionMasks>
+   </rdf:li>
+  </rdf:Seq>
+ </crs:MaskGroupBasedCorrections>
+</rdf:Description></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(body);
+        assert_eq!(r.windows.len(), 2);
+        assert_eq!(r.windows[0].kind, "veg");
+        assert_eq!(r.windows[1].kind, "nsky");
+        // ground prior: lower half of frame
+        assert!(r.windows[1].p[1] > 0.6);
     }
 
     #[test]

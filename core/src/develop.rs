@@ -927,6 +927,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         let subj = w.kind == "subject";
         let skyw = w.kind == "sky";
         let part = w.kind == "part";
+        let vegw = w.kind == "veg";
+        let nsky = w.kind == "nsky";
         wins[i] = [
             (if grad { 1.0 } else { 0.0 })
                 + (if w.invert { 2.0 } else { 0.0 })
@@ -934,7 +936,9 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 + (if w.link_q { 8.0 } else { 0.0 })
                 + (if subj { 16.0 } else { 0.0 })
                 + (if skyw { 32.0 } else { 0.0 })
-                + (if part { 64.0 } else { 0.0 }),
+                + (if part { 64.0 } else { 0.0 })
+                + (if vegw { 128.0 } else { 0.0 })
+                + (if nsky { 256.0 } else { 0.0 }),
             if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
             if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
             if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
@@ -3082,15 +3086,33 @@ fn finish_linear(
         .wins
         .iter()
         .take(p.n_wins as usize)
-        .any(|w| (w[0] as i32) & 32 != 0)
+        .any(|w| (w[0] as i32) & (32 | 256) != 0)
         || p.stages.iter().any(|(sp, _, _)| {
             sp.wins
                 .iter()
                 .take(sp.n_wins as usize)
-                .any(|w| (w[0] as i32) & 32 != 0)
+                .any(|w| (w[0] as i32) & (32 | 256) != 0)
         }) {
         sky_mat = sky_matte(&lin, w, h);
         Some(&sky_mat)
+    } else {
+        None
+    };
+    // heuristic vegetation matte for LR landscape "Vegetation" masks
+    let veg_mat;
+    let veg: Option<&Matte> = if p
+        .wins
+        .iter()
+        .take(p.n_wins as usize)
+        .any(|w| (w[0] as i32) & 128 != 0)
+        || p.stages.iter().any(|(sp, _, _)| {
+            sp.wins
+                .iter()
+                .take(sp.n_wins as usize)
+                .any(|w| (w[0] as i32) & 128 != 0)
+        }) {
+        veg_mat = veg_matte(&lin, w, h);
+        Some(&veg_mat)
     } else {
         None
     };
@@ -3120,7 +3142,7 @@ fn finish_linear(
             };
             let mut adj = adjust(col, p);
             let aspect = dw as f32 / dh as f32;
-            local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky);
+            local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
             // serial correction stages (DaVinci serial nodes): full adjust +
             // local ops on the sampled colour, blended by the stage key.
             for (sp, sop, sinv) in p.stages.iter() {
@@ -3131,7 +3153,7 @@ fn finish_linear(
                 if sp.n_wins > 0 {
                     let mut wu = 0.0f32;
                     for win in sp.wins.iter().take(sp.n_wins as usize) {
-                        let mut m2 = window_mask(win, nx, ny, col, subj, sky) * win[10];
+                        let mut m2 = window_mask(win, nx, ny, col, subj, sky, veg) * win[10];
                         if (win[0] as i32) & 8 != 0 {
                             m2 *= qual_mask(col, sp);
                         }
@@ -3147,7 +3169,7 @@ fn finish_linear(
                     continue;
                 }
                 let mut a2 = adjust(col, sp);
-                local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky);
+                local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky, veg);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;
                 }
@@ -3367,6 +3389,7 @@ fn local_ops(
     aspect: f32,
     subj: Option<&Matte>,
     sky: Option<&Matte>,
+    veg: Option<&Matte>,
 ) {
     // dodge/burn radial lights (dst-normalized coords)
     for l in p.lights.iter().take(p.n_lights as usize) {
@@ -3378,7 +3401,7 @@ fn local_ops(
     }
     // power windows: local ev/sat/temp inside the mask
     for win in p.wins.iter().take(p.n_wins as usize) {
-        let mut mask = window_mask(win, nx, ny, col, subj, sky) * win[10];
+        let mut mask = window_mask(win, nx, ny, col, subj, sky, veg) * win[10];
         // link_q: gate the window by the HSL qualifier matte
         if (win[0] as i32) & 8 != 0 {
             mask *= qual_mask(col, p);
@@ -3532,6 +3555,28 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
 /// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q + 16=subject + 32=sky,
 /// a,b,c,d, rot, soft, ev, sat, temp, strength]
 /// `col` = the sampled pre-adjust colour (lum range + qualifier gating need it)
+/// soft-ellipse mask value for the AI-gated window kinds (part/veg/nsky):
+/// [cx,cy,rx,ry,rot,soft] with the 50% radius at w[11] when set.
+fn ell_mask(w: &[f32], nx: f32, ny: f32) -> f32 {
+    let rot = w[5].to_radians();
+    let dx = nx - w[1];
+    let dy = ny - w[2];
+    let rx = w[3].max(0.005);
+    let ry = w[4].max(0.005);
+    let ux = (dx * rot.cos() + dy * rot.sin()) / rx;
+    let uy = (-dx * rot.sin() + dy * rot.cos()) / ry;
+    let d = (ux * ux + uy * uy).sqrt();
+    let soft = w[6].clamp(0.0, 0.95);
+    let mid = if w[11] > 0.001 {
+        w[11].clamp(0.01, 0.99)
+    } else {
+        1.0 - soft * 0.5
+    };
+    let r0 = (mid - soft * 0.5).max(0.0);
+    let r1 = (mid + soft * 0.5).min(1.0);
+    1.0 - sstep(r0, r1.max(r0 + 0.01), d)
+}
+
 fn window_mask(
     w: &[f32],
     nx: f32,
@@ -3539,6 +3584,7 @@ fn window_mask(
     col: [f32; 3],
     subj: Option<&Matte>,
     sky: Option<&Matte>,
+    veg: Option<&Matte>,
 ) -> f32 {
     let base = w[0] as i32;
     let kind = base % 2;
@@ -3551,24 +3597,14 @@ fn window_mask(
         // LR person-part mask (MaskSubType=3): subject matte gated by a
         // soft ellipse prior positioned at the named body region
         // (approximation — we have no per-part segmentation model).
-        let rot = w[5].to_radians();
-        let dx = nx - w[1];
-        let dy = ny - w[2];
-        let rx = w[3].max(0.005);
-        let ry = w[4].max(0.005);
-        let ux = (dx * rot.cos() + dy * rot.sin()) / rx;
-        let uy = (-dx * rot.sin() + dy * rot.cos()) / ry;
-        let d = (ux * ux + uy * uy).sqrt();
-        let soft = w[6].clamp(0.0, 0.95);
-        let mid = if w[11] > 0.001 {
-            w[11].clamp(0.01, 0.99)
-        } else {
-            1.0 - soft * 0.5
-        };
-        let r0 = (mid - soft * 0.5).max(0.0);
-        let r1 = (mid + soft * 0.5).min(1.0);
-        let ell = 1.0 - sstep(r0, r1.max(r0 + 0.01), d);
-        ell * subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+        ell_mask(w, nx, ny) * subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if base & 128 != 0 {
+        // LR landscape "Vegetation" mask: heuristic veg matte × region prior
+        ell_mask(w, nx, ny) * veg.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if base & 256 != 0 {
+        // LR landscape semantic mask (MaskSubType=0, non-sky classes):
+        // (1 - sky matte) gated by a region prior for the named class
+        ell_mask(w, nx, ny) * (1.0 - sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0))
     } else if base & 32 != 0 {
         // heuristic sky matte (LR sky AI masks)
         sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
@@ -3646,6 +3682,57 @@ fn sky_matte(lin: &[[f32; 3]], w: usize, h: usize) -> Matte {
         }
     }
     // two light box-blur passes so the matte isn't blocky
+    for _ in 0..2 {
+        let mut b = vec![0.0f32; mw * mh];
+        for y in 0..mh {
+            for x in 0..mw {
+                let mut s = 0.0;
+                let mut n = 0.0;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && ny >= 0 && nx < mw as i32 && ny < mh as i32 {
+                            s += d[ny as usize * mw + nx as usize];
+                            n += 1.0;
+                        }
+                    }
+                }
+                b[y * mw + x] = s / n;
+            }
+        }
+        d = b;
+    }
+    Matte {
+        w: mw,
+        h: mh,
+        data: d.iter().map(|&v| (v * 65535.0) as u16).collect(),
+    }
+}
+
+/// heuristic vegetation matte for LR landscape "Vegetation" masks
+/// (MaskSubType=0): green-dominant hue band × saturation × brightness,
+/// no vertical prior (vegetation appears anywhere in frame).
+fn veg_matte(lin: &[[f32; 3]], w: usize, h: usize) -> Matte {
+    let mw = w.min(384).max(2);
+    let mh = h.min(384).max(2);
+    let mut d = vec![0.0f32; mw * mh];
+    for my in 0..mh {
+        for mx in 0..mw {
+            let sx = (((mx as f32 + 0.5) / mw as f32) * w as f32) as usize % w;
+            let sy = (((my as f32 + 0.5) / mh as f32) * h as f32) as usize % h;
+            let (hh, s, v) = rgb_to_hsv(lin[sy * w + sx]);
+            let deg = hh * 360.0;
+            let mut dh = (deg - 120.0).abs();
+            if dh > 180.0 {
+                dh = 360.0 - dh;
+            }
+            let hg = 1.0 - sstep(45.0, 75.0, dh);
+            let sg = sstep(0.15, 0.45, s);
+            let lg = sstep(0.05, 0.25, v);
+            d[my * mw + mx] = (hg * sg * lg).clamp(0.0, 1.0);
+        }
+    }
     for _ in 0..2 {
         let mut b = vec![0.0f32; mw * mh];
         for y in 0..mh {
@@ -4087,10 +4174,10 @@ mod tests {
         w[6] = 0.4;
         w[10] = 1.0;
         // centre of the prior → mask ≈ 1
-        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None) > 0.9);
+        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None, None) > 0.9);
         // far outside the ellipse → ≈ 0
-        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None) < 0.05);
+        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None, None) < 0.05);
         // no subject matte → no mask at all
-        assert_eq!(window_mask(&w, 0.5, 0.3, [0.5; 3], None, None), 0.0);
+        assert_eq!(window_mask(&w, 0.5, 0.3, [0.5; 3], None, None, None), 0.0);
     }
 }
