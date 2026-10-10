@@ -37,6 +37,7 @@ pub struct Params {
     pub saturation: f32,
     pub vibrance: f32,
     pub sharpen: f32,
+    pub sharp_mask: f32,
     pub noise_luma: f32,
     pub rotation_deg: f32,
     pub clarity: f32,
@@ -1057,6 +1058,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         saturation: r.saturation,
         vibrance: r.vibrance,
         sharpen: r.sharpen,
+        sharp_mask: r.sharp_mask.clamp(0.0, 1.0),
         noise_luma: r.noise_luma,
         rotation_deg: r.rotation_deg.clamp(-45.0, 45.0),
         clarity: r.clarity.clamp(-1.0, 1.0),
@@ -2942,7 +2944,7 @@ fn finish_linear(
         lin = glow_lin(&lin, w, h, pc.glow);
     }
     if pc.sharpen > 0.0 || pc.clarity != 0.0 {
-        lin = sharpen_clarity(&lin, w, h, pc.sharpen, pc.clarity);
+        lin = sharpen_clarity(&lin, w, h, pc.sharpen, pc.clarity, pc.sharp_mask);
     }
     let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, pc.crop, max_px);
     let cx = cl + ew * 0.5 - 0.5;
@@ -3635,6 +3637,7 @@ fn sharpen_clarity(
     h: usize,
     sharpen: f32,
     clarity: f32,
+    sharp_mask: f32,
 ) -> Vec<[f32; 3]> {
     let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
     let boxn = |chan: &[f32], x: usize, y: usize, rad: i32| {
@@ -3659,10 +3662,23 @@ fn sharpen_clarity(
             let lum =
                 (0.2126 * lin[i][0] + 0.7152 * lin[i][1] + 0.0722 * lin[i][2]).clamp(0.0, 1.0);
             let mid = 4.0 * lum * (1.0 - lum);
+            // LR "Masking": the unsharp delta itself is the edge signal —
+            // scale it down where the luma delta is flat.
+            let sd = if sharpen != 0.0 {
+                let mut d = [0.0f32; 3];
+                for c in 0..3 {
+                    d[c] = lin[i][c] - boxn(&chans[c], x, y, 1);
+                }
+                let edge = (0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]).abs();
+                let mscale = 1.0 - sharp_mask * (1.0 - sstep(0.006, 0.05, edge));
+                d.map(|v| v * mscale)
+            } else {
+                [0.0; 3]
+            };
             for c in 0..3 {
                 let mut v = lin[i][c];
                 if sharpen != 0.0 {
-                    v += sharpen * 0.8 * (v - boxn(&chans[c], x, y, 1));
+                    v += sharpen * 0.8 * sd[c];
                 }
                 if clarity != 0.0 {
                     v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));

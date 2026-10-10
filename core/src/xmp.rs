@@ -110,11 +110,19 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         lr(r.saturation, 100.0)
     ));
     a.push_str(&format!(
-        "   crs:Sharpness=\"{}\" crs:LuminanceSmoothing=\"{}\" crs:ColorNoiseReduction=\"{}\"\n",
+        "   crs:Sharpness=\"{}\" crs:SharpenEdgeMasking=\"{}\" crs:LuminanceSmoothing=\"{}\" crs:ColorNoiseReduction=\"{}\"\n",
         lr(r.sharpen, 150.0),
+        lr(r.sharp_mask, 100.0),
         lr(r.noise_luma, 100.0),
         lr(r.noise_chroma, 100.0)
     ));
+    if r.key_v != 0.0 || r.key_h != 0.0 {
+        a.push_str(&format!(
+            "   crs:PerspectiveVertical=\"{:.0}\" crs:PerspectiveHorizontal=\"{:.0}\"\n",
+            r.key_v * 250.0,
+            r.key_h * 250.0
+        ));
+    }
     if r.crop != [0.0, 0.0, 0.0, 0.0] {
         a.push_str(&format!(
             "   crs:HasCrop=\"true\" crs:CropTop=\"{:.6}\" crs:CropLeft=\"{:.6}\" crs:CropBottom=\"{:.6}\" crs:CropRight=\"{:.6}\" crs:CropAngle=\"{:.2}\"\n",
@@ -192,6 +200,20 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             ));
         }
         a.push_str("   </rdf:Seq></crs:CircularGradientBasedCorrections>\n");
+    }
+    if !r.clones.is_empty() {
+        a.push_str("   <crs:RetouchAreas><rdf:Seq>\n");
+        for c in r.clones.iter().take(8) {
+            a.push_str(&format!(
+                "    <rdf:li crs:What=\"Retouch\" crs:Method=\"clone\" crs:SpotX=\"{:.6}\" crs:SpotY=\"{:.6}\" crs:SpotDiam=\"{:.6}\" crs:SourceX=\"{:.6}\" crs:SourceY=\"{:.6}\" crs:MidValue=\"0.5\" crs:FeatherValue=\"0.5\" crs:AspectValue=\"0\" crs:OffsetX=\"0\" crs:OffsetY=\"0\"/>\n",
+                c[2],
+                c[3],
+                c[4] * 2.0,
+                c[0],
+                c[1]
+            ));
+        }
+        a.push_str("   </rdf:Seq></crs:RetouchAreas>\n");
     }
     // full-fidelity recipe for our own round-trip
     if let Ok(js) = serde_json::to_string(&sc.recipe) {
@@ -369,6 +391,30 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr(&body, "crs:Sharpness") {
             r.sharpen = (v / 150.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:SharpenEdgeMasking") {
+            r.sharp_mask = (v / 100.0).clamp(0.0, 1.0);
+        }
+        // transform panel: keystone sliders
+        if let Some(v) = attr(&body, "crs:PerspectiveVertical") {
+            r.key_v = (v / 100.0 * 0.4).clamp(-0.4, 0.4);
+        }
+        if let Some(v) = attr(&body, "crs:PerspectiveHorizontal") {
+            r.key_h = (v / 100.0 * 0.4).clamp(-0.4, 0.4);
+        }
+        // spot removal -> clone stamps
+        for item in seq_items(&body, "crs:RetouchAreas") {
+            let what = field_str(&item, "crs:What").unwrap_or_default();
+            if !what.contains("Retouch") {
+                continue;
+            }
+            let sx = field(&item, "crs:SourceX").unwrap_or(0.5);
+            let sy = field(&item, "crs:SourceY").unwrap_or(0.5);
+            let dx = field(&item, "crs:SpotX").unwrap_or(0.5);
+            let dy = field(&item, "crs:SpotY").unwrap_or(0.5);
+            let diam = field(&item, "crs:SpotDiam").unwrap_or(0.1);
+            r.clones
+                .push([sx, sy, dx, dy, (diam * 0.5).clamp(0.002, 0.5), 0.0]);
         }
         if let Some(v) = attr(&body, "crs:LuminanceSmoothing") {
             r.noise_luma = (v / 100.0).clamp(0.0, 1.0);
@@ -948,6 +994,23 @@ mod tests {
         assert_eq!(st.pts.len(), 3);
         assert!((st.pts[0][0] - 0.4).abs() < 1e-6 && (st.radius - 0.08).abs() < 1e-6);
         assert!((r.brushes[0].ev - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn retouch_areas_map_to_clones() {
+        let body = r##"<x:xmpmeta><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="">
+ <crs:RetouchAreas>
+  <rdf:Seq>
+   <rdf:li crs:What="Retouch" crs:Method="clone" crs:SpotX="0.4" crs:SpotY="0.5" crs:SpotDiam="0.08" crs:SourceX="0.6" crs:SourceY="0.5"/>
+  </rdf:Seq>
+ </crs:RetouchAreas>
+</rdf:Description></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(body);
+        assert_eq!(r.clones.len(), 1);
+        let c = r.clones[0];
+        assert!((c[0] - 0.6).abs() < 1e-6 && (c[1] - 0.5).abs() < 1e-6);
+        assert!((c[2] - 0.4).abs() < 1e-6 && (c[3] - 0.5).abs() < 1e-6);
+        assert!((c[4] - 0.04).abs() < 1e-6);
     }
 
     #[test]

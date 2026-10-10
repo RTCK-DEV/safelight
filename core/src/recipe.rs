@@ -44,6 +44,10 @@ pub struct Recipe {
     pub curve: Vec<[f32; 2]>,
     /// unsharp mask amount 0..1
     pub sharpen: f32,
+    /// sharpen edge masking 0..1 (LR "Masking"): attenuates the unsharp
+    /// delta on flat areas, leaving edges fully sharpened
+    #[serde(default)]
+    pub sharp_mask: f32,
     /// luminance noise reduction 0..1
     pub noise_luma: f32,
     /// straighten angle in degrees, -10..10
@@ -382,6 +386,7 @@ impl Default for Recipe {
             wb_mode: WbMode::AsShot,
             curve: Vec::new(),
             sharpen: 0.0,
+            sharp_mask: 0.0,
             noise_luma: 0.0,
             rotation_deg: 0.0,
             clarity: 0.0,

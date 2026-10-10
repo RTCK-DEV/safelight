@@ -1143,7 +1143,11 @@ fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     let src = io_a[i].xyz;
     var out = src;
     if (pg.a3.x != 0.0) {
-        out = src + pg.a3.x * 0.8 * (src - box_at(i % w, i / w, 1));
+        let d = src - box_at(i % w, i / w, 1);
+        // LR "Masking": suppress the unsharp delta on flat areas.
+        let edge = abs(dot(d, vec3<f32>(0.2126, 0.7152, 0.0722)));
+        let ms = 1.0 - pg.csn.z * (1.0 - sstep(0.006, 0.05, edge));
+        out = src + pg.a3.x * 0.8 * d * ms;
     }
     if (pg.a3.z != 0.0) {
         let lum = clamp(luma(src), 0.0, 1.0);
@@ -2305,7 +2309,7 @@ impl Gpu {
             csn: [
                 p.warper.len().min(8) as f32,
                 if p.has_cs { 1.0 } else { 0.0 },
-                0.0,
+                p.sharp_mask,
                 0.0,
             ],
         };
