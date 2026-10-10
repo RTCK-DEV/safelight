@@ -145,6 +145,30 @@ fn typ_sz(t: u16) -> usize {
     }
 }
 
+/// raw bytes of an arbitrary TIFF tag across the IFD chain/SubIFDs.
+/// (tag 0x2BC = embedded XMP packet; used for DNG develop settings)
+pub fn tag_bytes(path: &Path, want: u16) -> Option<Vec<u8>> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 16 {
+        return None;
+    }
+    let le = match &data[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let r = Rd { d: &data, le };
+    for ifd in r.ifds() {
+        if let Some((_, cnt, off)) = r.tag(ifd, want) {
+            let end = (off + cnt as usize).min(data.len());
+            if off < end {
+                return Some(data[off..end].to_vec());
+            }
+        }
+    }
+    None
+}
+
 /// SAFELIGHT_DNG=no_warp|no_gain disables one op class (A/B debugging)
 pub fn env_filter(ops: &mut Option<DngOps>) {
     let off = std::env::var("SAFELIGHT_DNG").unwrap_or_default();

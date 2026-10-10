@@ -39,7 +39,12 @@ fn main() -> Result<()> {
                             .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
                     }
                 }
-                None => Recipe::default(),
+                // no recipe arg: adopt any saved sidecar (.safelight.json,
+                // Lightroom .xmp, or embedded XMP in the file itself)
+                None => eng
+                    .read_sidecar(path)
+                    .map(|sc| sc.recipe)
+                    .unwrap_or_default(),
             };
             let max_px: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
             let t = std::time::Instant::now();

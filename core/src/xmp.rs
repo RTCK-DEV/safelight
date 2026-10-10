@@ -174,8 +174,45 @@ fn attr_str(body: &str, name: &str) -> Option<String> {
 /// Parse an XMP sidecar (attribute or element form). Prefers the embedded
 /// `<ara:Recipe>` JSON when present (our own files round-trip losslessly);
 /// otherwise maps the crs:/xmp: fields it finds into a partial recipe.
-pub fn read_xmp(asset: &Path) -> Option<Sidecar> {
-    let body = std::fs::read_to_string(find_xmp(asset)?).ok()?;
+/// XMP packet embedded in the asset itself: DNG/TIFF tag 0x2BC, or a
+/// JPEG APP1 `http://ns.adobe.com/xap/1.0/` segment. Lightroom stores
+/// develop settings there when it can't (or doesn't) write a sidecar.
+fn embedded_xmp(asset: &Path) -> Option<String> {
+    let bytes = std::fs::read(asset).ok()?;
+    // TIFF/DNG: XMLPacket tag in any IFD
+    if bytes.starts_with(b"II") || bytes.starts_with(b"MM") {
+        if let Some(pkt) = crate::dngops::tag_bytes(asset, 0x2BC) {
+            if let Ok(s) = String::from_utf8(pkt) {
+                if s.contains("xmpmeta") || s.contains("crs:") {
+                    return Some(s);
+                }
+            }
+        }
+        return None;
+    }
+    // JPEG: walk APP1 segments for the XMP namespace header
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut p = 2usize;
+    while p + 4 <= bytes.len() && bytes[p] == 0xFF {
+        let (marker, len) = (bytes[p + 1], u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize);
+        let seg_end = (p + 2 + len).min(bytes.len());
+        if marker == 0xE1 {
+            let seg = &bytes[p + 4..seg_end];
+            if seg.starts_with(b"http://ns.adobe.com/xap/1.0/\0") {
+                return String::from_utf8(seg[29..].to_vec()).ok();
+            }
+        }
+        if len < 2 || marker == 0xDA {
+            break;
+        }
+        p += 2 + len;
+    }
+    None
+}
+
+fn parse_xmp_body(body: &str) -> Sidecar {
     let mut sc = Sidecar::default();
     // lossless path: our own embedded recipe
     if let (Some(i), Some(j)) = (body.find("<ara:Recipe>"), body.find("</ara:Recipe>")) {
@@ -184,15 +221,25 @@ pub fn read_xmp(asset: &Path) -> Option<Sidecar> {
             sc.recipe = r;
         }
     } else {
-        sc.recipe = crs_to_recipe(&body);
+        sc.recipe = crs_to_recipe(body);
     }
-    if let Some(v) = attr(&body, "xmp:Rating") {
+    if let Some(v) = attr(body, "xmp:Rating") {
         sc.rating = v.round() as i32;
     }
-    if let Some(l) = attr_str(&body, "xmp:Label") {
+    if let Some(l) = attr_str(body, "xmp:Label") {
         sc.label = l;
     }
-    Some(sc)
+    sc
+}
+
+pub fn read_xmp(asset: &Path) -> Option<Sidecar> {
+    if let Some(p) = find_xmp(asset) {
+        return std::fs::read_to_string(p)
+            .ok()
+            .map(|b| parse_xmp_body(&b));
+    }
+    // no sidecar: Lightroom may have written into the file itself
+    embedded_xmp(asset).map(|b| parse_xmp_body(&b))
 }
 
 /// map crs:* (Camera Raw Settings) fields in an XMP document — Lightroom
