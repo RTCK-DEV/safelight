@@ -188,6 +188,13 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         a.push_str(&format!("   xmp:Label=\"{}\"\n", esc(&sc.label)));
     }
     a.push_str("   ara:Format=\"1\">\n");
+    // Lens Blur (LR12+): child element, not an attribute
+    if r.lens_blur > 0.001 {
+        a.push_str(&format!(
+            "   <crs:LensBlur crs:Version=\"1\" crs:Active=\"true\" crs:FocalRange=\"0 0 100 100\" crs:BlurAmount=\"{:.0}\" crs:BokehShape=\"0\" crs:BokehShapeDetail=\"0\" crs:HighlightsThreshold=\"50\" crs:HighlightsBoost=\"50\" crs:CatEyeAmount=\"0\" crs:CatEyeScale=\"100\" crs:BokehAspect=\"0\" crs:BokehRotation=\"0\" crs:SphericalAberration=\"80\"/>\n",
+            r.lens_blur * 100.0
+        ));
+    }
     // LR-readable local corrections: gradient/circle windows -> the legacy
     // correction lists LR still reads on import.
     let local_attrs = |w: &crate::recipe::PowerWindow| {
@@ -586,6 +593,15 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr(&body, "crs:AutoLateralCA") {
             r.ca_fix = if v >= 0.5 { 0.3 } else { 0.0 };
+        }
+        // Lens Blur (LR12+): <crs:LensBlur crs:Active=.. crs:BlurAmount=..>
+        // depth-based defocus — we blend by (1 - subject matte) instead.
+        if let Some(ls) = body.find("<crs:LensBlur") {
+            let le = body[ls..].find('>').unwrap_or(0);
+            let lb = &body[ls..ls + le];
+            if attr_str(lb, "crs:Active").as_deref() != Some("false") {
+                r.lens_blur = (attr(lb, "crs:BlurAmount").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0);
+            }
         }
         // legacy split toning + PV2012 color grading share our
         // shadow/mid/highlight hue-sat fields

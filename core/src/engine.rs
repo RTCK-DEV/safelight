@@ -95,10 +95,11 @@ impl Engine {
             None
         };
         // AI subject matte (U-2-Net): only needed by 'subject' power windows.
-        let subj = if recipe
-            .windows
-            .iter()
-            .any(|w| (w.kind == "subject" || w.kind == "part") && w.enabled)
+        let subj = if recipe.lens_blur > 0.001
+            || recipe
+                .windows
+                .iter()
+                .any(|w| (w.kind == "subject" || w.kind == "part") && w.enabled)
         {
             load_subject_cache(path)
         } else {

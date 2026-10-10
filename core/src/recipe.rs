@@ -168,6 +168,10 @@ pub struct Recipe {
     /// 3x3 chroma-rotation matrix + shadow green/magenta shift.
     #[serde(default)]
     pub calib: [f32; 7],
+    /// LR Lens Blur amount 0..1 (depth-of-field defocus; blended by
+    /// 1-subject matte as the focus proxy)
+    #[serde(default)]
+    pub lens_blur: f32,
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -547,6 +551,7 @@ impl Default for Recipe {
             defringe_pu: [0.0, 246.0, 294.0],
             defringe_gr: [0.0, 108.0, 132.0],
             calib: [0.0; 7],
+            lens_blur: 0.0,
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),

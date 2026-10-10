@@ -173,6 +173,8 @@ pub struct Params {
     /// LR camera calibration: 3x3 chroma-rotation matrix (row-major 9)
     /// + shadow green/magenta tint [9..12]
     pub calib: [f32; 12],
+    /// LR Lens Blur amount 0..1 — defocus blend gated by (1-subject matte)
+    pub lens_blur: f32,
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -1279,6 +1281,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         profile_look,
         profile_tone_lut,
         calib: calib_matrix(&r.calib),
+        lens_blur: r.lens_blur.clamp(0.0, 1.0),
     };
     // heuristic look adjustments are skipped when the named look was
     // upgraded to a real .dcp (the profile IS the look now)
@@ -3170,6 +3173,14 @@ fn finish_linear(
     } else {
         None
     };
+    // lens blur: matte-res defocused copy of the linear image, blended by
+    // (1 - subject matte) — the matte is the focus proxy (LR uses a depth
+    // map; "keep the subject sharp, blur the rest" approximates it)
+    let lbl = if p.lens_blur > 0.001 {
+        Some(lens_blur_img(&lin, w, h, p.lens_blur))
+    } else {
+        None
+    };
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
@@ -3180,7 +3191,7 @@ fn finish_linear(
                 nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
             );
             // chromatic-aberration fix: radial per-channel sample offsets
-            let col = if p.ca_fix != 0.0 {
+            let mut col = if p.ca_fix != 0.0 {
                 let wcx = w as f32 * 0.5;
                 let wcy = h as f32 * 0.5;
                 let rn = ((sx - wcx).hypot(sy - wcy) / w.max(h) as f32) * 2.0;
@@ -3194,6 +3205,16 @@ fn finish_linear(
             } else {
                 bilinear(&lin, w, h, sx, sy)
             };
+            if let Some((b, bw, bh)) = &lbl {
+                let bm = (1.0 - subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)) * p.lens_blur;
+                if bm > 0.001 {
+                    let bx = (sx / w as f32) * (*bw as f32) - 0.5;
+                    let by = (sy / h as f32) * (*bh as f32) - 0.5;
+                    for c in 0..3 {
+                        col[c] += (bilinear3(b, *bw, *bh, bx, by, c) - col[c]) * bm;
+                    }
+                }
+            }
             let mut adj = adjust(col, p);
             let aspect = dw as f32 / dh as f32;
             local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
@@ -3813,6 +3834,48 @@ fn veg_matte(lin: &[[f32; 3]], w: usize, h: usize) -> Matte {
         h: mh,
         data: d.iter().map(|&v| (v * 65535.0) as u16).collect(),
     }
+}
+
+/// lens blur source: a matte-res (<=192) gaussian-disc blurred copy of the
+/// linear image. Radius scales with amount — mirrors gpu.rs lbl_main.
+fn lens_blur_img(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> (Vec<[f32; 3]>, usize, usize) {
+    let mw = w.min(192).max(2);
+    let mh = h.min(192).max(2);
+    let r = (amt * 10.0).max(2.0);
+    let r2 = r * r;
+    let ri = r.ceil() as i32;
+    let mut out = vec![[0.0f32; 3]; mw * mh];
+    for my in 0..mh {
+        for mx in 0..mw {
+            let mut acc = [0.0f32; 3];
+            let mut wsum = 0.0;
+            for dy in -ri..=ri {
+                for dx in -ri..=ri {
+                    let d2 = (dx * dx + dy * dy) as f32;
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let nx2 = mx as i32 + dx;
+                    let ny2 = my as i32 + dy;
+                    if nx2 < 0 || ny2 < 0 || nx2 >= mw as i32 || ny2 >= mh as i32 {
+                        continue;
+                    }
+                    let wg = (-d2 / (0.45 * r2)).exp();
+                    let sx = (((nx2 as f32 + 0.5) / mw as f32) * w as f32) as usize % w;
+                    let sy = (((ny2 as f32 + 0.5) / mh as f32) * h as f32) as usize % h;
+                    let c = lin[sy * w + sx];
+                    for k in 0..3 {
+                        acc[k] += c[k] * wg;
+                    }
+                    wsum += wg;
+                }
+            }
+            for k in 0..3 {
+                out[my * mw + mx][k] = acc[k] / wsum.max(1e-6);
+            }
+        }
+    }
+    (out, mw, mh)
 }
 
 /// bilinear sample of the AI subject matte at normalized coords; 0 when empty

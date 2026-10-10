@@ -215,7 +215,8 @@ struct Uni {
     sop0: vec4<f32>,
     sinv0: vec4<f32>,
     misc3: vec4<f32>,
-    // ColorSlice wedges + ColorWarper points; csn = [n_warp, has_cs, 0, 0]
+    // ColorSlice wedges + ColorWarper points;
+    // csn = [n_warp, has_cs, sharp_mask, lens_blur]
     cs: array<vec4<f32>, 7>,
     warp: array<vec4<f32>, 16>,
     csn: vec4<f32>,
@@ -243,6 +244,9 @@ struct Uni {
 @group(0) @binding(11) var<storage, read> denbuf: array<u32>;
 @group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
 @group(0) @binding(16) var<storage, read_write> skybuf: array<u32>;
+// lens blur: matte-res defocused copy of the linear image,
+// [0].xy = (mw,mh), data at [1..]
+@group(0) @binding(17) var<storage, read_write> lbl: array<vec4<f32>>;
 @group(0) @binding(13) var<storage, read> suni: array<Uni>;
 // edge-aware brush seeds: [r,g,b,tol] per stroke, 64 slots per param block
 // (base + one per serial stage), written by seed_main.
@@ -1720,6 +1724,64 @@ fn skymat_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     skybuf[2u + npw + i] = pveg;
 }
 
+// lens blur: disc-blurred matte-res copy of the linear image (io_a).
+// Radius scales with BlurAmount — LR blurs by depth; we blend by
+// (1 - subject matte) in finish instead, so this only defocuses.
+@compute @workgroup_size(256)
+fn lbl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
+    let i = flat_index(gid, num);
+    let w = pg.g2.x;
+    let h = pg.g2.y;
+    let mw = min(w, 192u);
+    let mh = min(h, 192u);
+    if (i >= mw * mh) { return; }
+    if (i == 0u) { lbl[0] = vec4<f32>(f32(mw), f32(mh), 0.0, 0.0); }
+    let mx = i % mw;
+    let my = i / mw;
+    let r = max(2.0, pg.csn.w * 10.0);
+    let r2 = r * r;
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    let ri = i32(ceil(r));
+    for (var dy = -ri; dy <= ri; dy = dy + 1) {
+        for (var dx = -ri; dx <= ri; dx = dx + 1) {
+            let d2 = f32(dx * dx + dy * dy);
+            if (d2 > r2) { continue; }
+            let nx2 = i32(mx) + dx;
+            let ny2 = i32(my) + dy;
+            if (nx2 < 0 || ny2 < 0 || nx2 >= i32(mw) || ny2 >= i32(mh)) {
+                continue;
+            }
+            let wg = exp(-d2 / (0.45 * r2));
+            let sx = min(u32((f32(nx2) + 0.5) / f32(mw) * f32(w)), w - 1u);
+            let sy = min(u32((f32(ny2) + 0.5) / f32(mh) * f32(h)), h - 1u);
+            acc = acc + io_a[sy * w + sx].xyz * wg;
+            wsum = wsum + wg;
+        }
+    }
+    lbl[1u + i] = vec4<f32>(acc / max(wsum, 1e-6), 1.0);
+}
+
+fn lbl_at(x: i32, y: i32) -> vec3<f32> {
+    let w = i32(lbl[0].x);
+    let h = i32(lbl[0].y);
+    let cx = clamp(x, 0, w - 1);
+    let cy = clamp(y, 0, h - 1);
+    return lbl[1u + u32(cy * w + cx)].xyz;
+}
+
+fn lbl_bil(nx: f32, ny: f32) -> vec3<f32> {
+    let fx = nx * lbl[0].x - 0.5;
+    let fy = ny * lbl[0].y - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    return mix(mix(lbl_at(x0, y0), lbl_at(x0 + 1, y0), tx),
+               mix(lbl_at(x0, y0 + 1), lbl_at(x0 + 1, y0 + 1), tx), ty);
+}
+
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
 // soft-ellipse eval shared by the AI-gated kinds (part/veg/nsky):
 // [cx,cy,rx,ry,rot,soft] with the 50% radius at w2.w when set.
@@ -2004,6 +2066,13 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
             col = io_a[u32(y0) * sw + u32(x0)].xyz;
         }
     }
+    // lens blur: defocus blend by (1 - subject matte) — subject matte is
+    // the focus proxy (LR uses a depth map; this approximates "keep the
+    // subject sharp, blur the rest")
+    if (pg.csn.w > 0.001 && lbl[0].x > 0.5) {
+        let bm = (1.0 - select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u)) * pg.csn.w;
+        col = mix(col, lbl_bil(sx / f32(sw), sy / f32(sh)), bm);
+    }
     var adj = adjust(col);
     let aspect = f32(dw) / f32(dh);
     adj = local_ops(adj, col, nx, ny, aspect);
@@ -2103,6 +2172,7 @@ pub struct Gpu {
     glow: Pipe,
     sharpen: Pipe,
     skymat: Pipe,
+    lbl: Pipe,
     finish: Pipe,
     seed: Pipe,
 }
@@ -2162,14 +2232,14 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..17)
+                entries: &(0..18)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: match i {
                                 0 => wgpu::BufferBindingType::Uniform,
-                                3 | 4 | 5 | 7 | 14 | 16 => {
+                                3 | 4 | 5 | 7 | 14 | 16 | 17 => {
                                     wgpu::BufferBindingType::Storage { read_only: false }
                                 }
                                 _ => wgpu::BufferBindingType::Storage { read_only: true },
@@ -2210,6 +2280,7 @@ impl Gpu {
             glow: mk("glow_main"),
             sharpen: mk("sharpen_main"),
             skymat: mk("skymat_main"),
+            lbl: mk("lbl_main"),
             finish: mk("finish_main"),
             seed: mk("seed_main"),
             device,
@@ -2621,7 +2692,7 @@ impl Gpu {
                 p.warper.len().min(8) as f32,
                 if p.has_cs { 1.0 } else { 0.0 },
                 p.sharp_mask,
-                0.0,
+                p.lens_blur,
             ],
             extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
             extra1: [p.grain_size, p.grain_rough, p.sharp_radius, p.sharp_detail],
@@ -2689,10 +2760,12 @@ impl Gpu {
             storage_in,
         );
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
+        // lens blur: matte-res defocused copy (header vec4 + 192² pixels)
+        let lbl_b = mk_buf("lblbuf", &vec![0u8; (1 + 192 * 192) * 16], storage_in);
 
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> =
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
                     .iter()
                     .map(|&i| wgpu::BindGroupEntry {
                         binding: i,
@@ -2713,7 +2786,8 @@ impl Gpu {
                             13 => suni_b.as_entire_binding(),
                             14 => seeds_b.as_entire_binding(),
                             15 => dng_b.as_entire_binding(),
-                            _ => sky_b.as_entire_binding(),
+                            16 => sky_b.as_entire_binding(),
+                            _ => lbl_b.as_entire_binding(),
                         },
                     })
                     .collect();
@@ -2964,6 +3038,12 @@ impl Gpu {
             let mw = vw.min(384);
             let mh = vh.min(384);
             run(&mut enc, &self.skymat, ((mw * mh + 1) / 2) as u64);
+        }
+        // lens blur: defocused matte-res copy of the linear image
+        if p.lens_blur > 0.001 {
+            let mw = vw.min(192);
+            let mh = vh.min(192);
+            run(&mut enc, &self.lbl, (mw * mh) as u64);
         }
         // edge-aware brush seeds: sample the finished linear image at each
         // flagged stroke's first dab before the per-pixel finish pass
