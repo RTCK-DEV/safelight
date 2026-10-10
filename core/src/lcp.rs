@@ -311,6 +311,11 @@ impl LcpDb {
                     if let (Some(a), Some(b)) = (stem.find('('), stem.rfind(')')) {
                         names.push(stem[a + 1..b].trim().to_string());
                     }
+                    // maker = text before '(' (camera brand the profile was
+                    // calibrated against) — kept as a synthetic "make:" name
+                    if let Some(a) = stem.find('(') {
+                        names.push(format!("make:{}", stem[..a].trim()));
+                    }
                     let base = stem.split('-').next().unwrap_or(stem).trim();
                     names.push(base.to_string());
                     names.retain(|n| !n.is_empty());
@@ -361,6 +366,9 @@ impl LcpDb {
     fn score(&self, names: &[String], q: &str, qsig: &[&String]) -> usize {
         let mut best = 0usize;
         for n in names {
+            if n.starts_with("make:") {
+                continue;
+            }
             let nn = norm(n);
             if nn.is_empty() {
                 continue;
@@ -391,8 +399,9 @@ impl LcpDb {
     }
 
     /// best-matching lens: filename index narrows to a few candidates that
-    /// get fully parsed on demand
-    fn find(&self, exif_lens: &str) -> Option<std::sync::Arc<LcpLens>> {
+    /// get fully parsed on demand. `exif_make` gates the camera brand so a
+    /// "45mm F2.8" Nikon-mount profile can't claim a Sony file.
+    fn find(&self, exif_lens: &str, exif_make: &str) -> Option<std::sync::Arc<LcpLens>> {
         let q = norm(exif_lens);
         if q.len() < 3 {
             return None;
@@ -402,10 +411,20 @@ impl LcpDb {
             .iter()
             .filter(|t| t.len() >= 3 || t.chars().any(|c| c.is_ascii_digit()))
             .collect();
+        let make_q = norm(exif_make);
         // phase 1: score filename names — collect files at the top score
         let mut top = 0usize;
         let mut cand: Vec<&PathBuf> = Vec::new();
         for (p, names) in &self.files {
+            // camera-make gate from the "make:" synthetic name
+            if !make_q.is_empty() {
+                if let Some(mk) = names.iter().find(|n| n.starts_with("make:")) {
+                    let fm = norm(&mk[5..]);
+                    if !fm.is_empty() && fm != make_q && !fm.contains(&make_q) && !make_q.contains(&fm) {
+                        continue;
+                    }
+                }
+            }
             let s = self.score(names, &q, &qsig);
             if s == 0 {
                 continue;
@@ -445,11 +464,12 @@ impl LcpDb {
     pub fn correction(
         &self,
         exif_lens: &str,
+        exif_make: &str,
         cam_crop: f32,
         focal: f32,
         aperture: f32,
     ) -> Option<Correction> {
-        let lens = self.find(exif_lens)?;
+        let lens = self.find(exif_lens, exif_make)?;
         // nearest calibration by focal (entries of a prime share focal;
         // aperture only refines the vignette pick below)
         let mut by_focal: Vec<&Cal> = lens.cals.iter().collect();
@@ -608,4 +628,68 @@ pub fn db() -> Option<&'static LcpDb> {
         }
     })
     .as_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"<?xml version="1.0"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:stCamera="http://ns.adobe.com/camera-raw-saved-lens-preset/1.0/">
+   <photoshop:CameraProfiles>
+    <rdf:Seq>
+     <rdf:li>
+      <rdf:Description
+       stCamera:Author="Adobe" stCamera:Make="SONY"
+       stCamera:Lens="E 20mm F2.8" stCamera:LensPrettyName="Sony E 20mm F2.8"
+       stCamera:SensorFormatFactor="1.5" stCamera:FocalLength="20"
+       stCamera:FocusDistance="3" stCamera:ApertureValue="4">
+      <stCamera:AlternateLensNames><rdf:Seq>
+        <rdf:li>Sony SEL20F28</rdf:li>
+      </rdf:Seq></stCamera:AlternateLensNames>
+      <stCamera:PerspectiveModel>
+       <rdf:Description
+        stCamera:Version="2" stCamera:ScaleFactor="1.019"
+        stCamera:RadialDistortParam1="-0.143" stCamera:RadialDistortParam2="0.115"
+        stCamera:RadialDistortParam3="0.02" stCamera:FocalLengthX="0.857"
+        stCamera:ImageXCenter="0.5">
+       <stCamera:ChromaticRedGreenModel
+        stCamera:ScaleFactor="1.0002" stCamera:RadialDistortParam1="0.001"/>
+       <stCamera:VignetteModel
+        stCamera:VignetteModelParam1="-1.33" stCamera:VignetteModelParam2="0.97"
+        stCamera:VignetteModelParam3="-0.45" stCamera:FocalLengthX="0.857"/>
+       </rdf:Description>
+      </stCamera:PerspectiveModel>
+      </rdf:Description>
+     </rdf:li>
+    </rdf:Seq>
+   </photoshop:CameraProfiles>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    #[test]
+    fn parses_calibration_entry() {
+        let l = parse_lcp(SAMPLE).expect("sample parses");
+        assert!(l.names.iter().any(|n| n.contains("20mm")));
+        assert!((l.sensor_factor - 1.5).abs() < 1e-4);
+        assert_eq!(l.cals.len(), 1);
+        let c = &l.cals[0];
+        let k = c.dist.unwrap();
+        assert!((k[0] + 0.143).abs() < 1e-4);
+        assert!((k[1] - 0.115).abs() < 1e-4);
+        assert!(c.vig_a.is_some());
+        assert!(c.chr.is_some());
+    }
+
+    #[test]
+    fn nested_li_names_and_no_false_split() {
+        // the alias <rdf:li> inside must not split the block in two
+        let l = parse_lcp(SAMPLE).unwrap();
+        assert_eq!(l.cals.len(), 1);
+        assert!(l.names.iter().any(|n| n.contains("SEL20F28")));
+    }
 }
