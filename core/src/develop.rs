@@ -94,7 +94,7 @@ pub struct Params {
     pub q_show: bool,
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
-    pub wins: [[f32; 12]; 4],
+    pub wins: [[f32; 16]; 4],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -102,6 +102,7 @@ pub struct Params {
     /// [seg_start, seg_count, 0, 0],
     /// [xmin, ymin, xmax, ymax] aspect-space bbox (padded by radius).
     /// Layer params (ev,sat,temp,strength) in brush_layers;
+    /// (contrast,clarity,dehaze,tint) in brush_layers2.
     /// brush_misc = [n_strokes, dst_aspect, link_q_bits, 0].
     /// brush_seeds = per-stroke edge-aware seed colour [r,g,b,tol],
     /// parallel to strokes (tol>0 = enabled; rgb filled at render time
@@ -109,6 +110,7 @@ pub struct Params {
     pub brush_segs: Vec<[f32; 4]>,
     pub brush_strokes: Vec<[f32; 4]>,
     pub brush_layers: [[f32; 4]; 4],
+    pub brush_layers2: [[f32; 4]; 4],
     pub brush_misc: [f32; 4],
     pub brush_seeds: Vec<[f32; 4]>,
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
@@ -898,7 +900,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // window_mask runs in dst-normalized post-crop space, so translate here.
     let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
-    let mut wins = [[0.0; 12]; 4];
+    let mut wins = [[0.0; 16]; 4];
     for (i, w) in r.windows.iter().take(4).enumerate() {
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
@@ -941,6 +943,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 0.0
             },
             w.mid,
+            w.contrast.clamp(-1.0, 1.0),
+            w.clarity.clamp(-1.0, 1.0),
+            w.dehaze.clamp(-1.0, 1.0),
+            w.tint.clamp(-1.0, 1.0),
         ];
     }
 
@@ -955,6 +961,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut brush_strokes: Vec<[f32; 4]> = Vec::new();
     let mut brush_seeds: Vec<[f32; 4]> = Vec::new();
     let mut brush_layers = [[0.0f32; 4]; 4];
+    let mut brush_layers2 = [[0.0f32; 4]; 4];
     let mut link_bits = 0.0f32;
     for (li, b) in r.brushes.iter().take(4).enumerate() {
         brush_layers[li] = [
@@ -966,6 +973,12 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             } else {
                 0.0
             },
+        ];
+        brush_layers2[li] = [
+            b.contrast.clamp(-1.0, 1.0),
+            b.clarity.clamp(-1.0, 1.0),
+            b.dehaze.clamp(-1.0, 1.0),
+            b.tint.clamp(-1.0, 1.0),
         ];
         if b.link_q {
             link_bits += (1u32 << li) as f32;
@@ -1170,6 +1183,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         brush_segs,
         brush_strokes,
         brush_layers,
+        brush_layers2,
         brush_misc,
         brush_seeds,
         // show-key mode works even with no adjustment applied
@@ -3314,6 +3328,7 @@ fn local_ops(
         }
         adj[0] += win[9] * mask * 0.08;
         adj[2] -= win[9] * mask * 0.08;
+        local_extra(adj, mask, win[12], win[13], win[14], win[15]);
     }
     // adjustment brushes: same local ev/sat/temp inside stroke masks
     let n_str = p.brush_misc[0] as usize;
@@ -3383,6 +3398,32 @@ fn local_ops(
         }
         adj[0] += lp[2] * mask * 0.08;
         adj[2] -= lp[2] * mask * 0.08;
+        let ex = p.brush_layers2[li];
+        local_extra(adj, mask, ex[0], ex[1], ex[2], ex[3]);
+    }
+}
+
+/// extended LR local adjustments inside a window/brush mask:
+/// contrast (luma-pivot), clarity (midtone-weighted contrast),
+/// dehaze (shadow density + gain) and tint (green/magenta axis).
+fn local_extra(adj: &mut [f32; 3], mask: f32, con: f32, cla: f32, deh: f32, tin: f32) {
+    if tin != 0.0 {
+        adj[1] -= tin * mask * 0.06;
+    }
+    if con != 0.0 || cla != 0.0 || deh != 0.0 {
+        let l = (0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2]).clamp(0.0, 1.0);
+        let mid = 4.0 * l * (1.0 - l);
+        let k = (con + cla * mid * 0.8 + deh * 0.2) * mask * 0.9;
+        for c in adj.iter_mut() {
+            *c = l + (*c - l) * (1.0 + k);
+        }
+        if deh != 0.0 {
+            let f = deh * mask;
+            for c in adj.iter_mut() {
+                *c *= 1.0 + 0.08 * f;
+                *c -= 0.015 * f * (1.0 - l);
+            }
+        }
     }
 }
 

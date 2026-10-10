@@ -325,6 +325,16 @@ pub struct BrushLayer {
     pub edge_aware: bool,
     /// similarity tolerance 0.05..1.0 — larger admits more pixels
     pub edge_tol: f32,
+    /// extended local adjustments (LR Local* fields), -1..1 each
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub clarity: f32,
+    #[serde(default)]
+    pub dehaze: f32,
+    /// green(-)/magenta(+) axis -1..1
+    #[serde(default)]
+    pub tint: f32,
     pub strokes: Vec<BrushStroke>,
 }
 
@@ -339,6 +349,10 @@ impl Default for BrushLayer {
             link_q: false,
             edge_aware: false,
             edge_tol: 0.5,
+            contrast: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            tint: 0.0,
             strokes: Vec::new(),
         }
     }
@@ -370,6 +384,16 @@ pub struct PowerWindow {
     /// normalized radius. 0 = legacy default (0.5 / 1-soft/2).
     #[serde(default)]
     pub mid: f32,
+    /// extended local adjustments (LR Local* fields), -1..1 each
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub clarity: f32,
+    #[serde(default)]
+    pub dehaze: f32,
+    /// green(-)/magenta(+) axis -1..1
+    #[serde(default)]
+    pub tint: f32,
 }
 
 fn default_true() -> bool {
@@ -398,6 +422,10 @@ impl Default for PowerWindow {
             enabled: true,
             opacity: 1.0,
             mid: 0.0,
+            contrast: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            tint: 0.0,
         }
     }
 }

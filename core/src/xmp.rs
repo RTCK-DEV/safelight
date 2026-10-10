@@ -168,12 +168,25 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     // LR-readable local corrections: gradient/circle windows -> the legacy
     // correction lists LR still reads on import.
     let local_attrs = |w: &crate::recipe::PowerWindow| {
-        format!(
+        let mut s = format!(
             "crs:LocalExposure2012=\"{:+.2}\" crs:LocalSaturation=\"{:.2}\" crs:LocalTemperature=\"{:.0}\"",
             w.ev,
             w.sat * 100.0,
             w.temp * 100.0
-        )
+        );
+        if w.contrast != 0.0 {
+            s += &format!(" crs:LocalContrast2012=\"{:.0}\"", w.contrast * 100.0);
+        }
+        if w.clarity != 0.0 {
+            s += &format!(" crs:LocalClarity2012=\"{:.0}\"", w.clarity * 100.0);
+        }
+        if w.dehaze != 0.0 {
+            s += &format!(" crs:LocalDehaze=\"{:.0}\"", w.dehaze * 100.0);
+        }
+        if w.tint != 0.0 {
+            s += &format!(" crs:LocalTint=\"{:.0}\"", w.tint * 100.0);
+        }
+        s
     };
     let grads: Vec<_> = r
         .windows
@@ -736,6 +749,13 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             let sat = sat.clamp(-1.0, 1.0);
             let temp =
                 (field(&item, "crs:LocalTemperature").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
+            // extended LR local adjustments (contrast/clarity/dehaze/tint)
+            let loc =
+                |names: &[&str]| (field_any(&item, names).unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
+            let con = loc(&["crs:LocalContrast2012", "crs:LocalContrast"]);
+            let cla = loc(&["crs:LocalClarity2012", "crs:LocalClarity"]);
+            let deh = loc(&["crs:LocalDehaze"]);
+            let tin = loc(&["crs:LocalTint"]);
             let feather_of =
                 |mb: &str| (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0);
             // LR midpoint (0..100): 0 = at the zero-effect boundary.
@@ -753,6 +773,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 opacity: amount,
                 link_q: false,
                 mid,
+                contrast: con,
+                clarity: cla,
+                dehaze: deh,
+                tint: tin,
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -840,6 +864,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     link_q: false,
                     edge_aware: false,
                     edge_tol: 0.5,
+                    contrast: con,
+                    clarity: cla,
+                    dehaze: deh,
+                    tint: tin,
                     strokes,
                 });
             }
@@ -1001,6 +1029,10 @@ mod tests {
             opacity: 1.0,
             link_q: false,
             mid: 0.0,
+            contrast: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            tint: 0.0,
         }];
         sc.rating = 4;
         sc.label = "Red".into();
