@@ -38,12 +38,20 @@ pub struct Params {
     pub vibrance: f32,
     pub sharpen: f32,
     pub sharp_mask: f32,
+    /// box-blur radius for the unsharp base 1..3 (interp between boxes)
+    pub sharp_radius: f32,
+    /// 0 = coarse-band sharpening, 1 = fine-band (LR Detail/100)
+    pub sharp_detail: f32,
     pub noise_luma: f32,
     pub rotation_deg: f32,
     pub clarity: f32,
     pub vignette: f32,
     /// post-crop vignette shape [mid, round, feather]; mid<0 = legacy ramp
     pub vig_shape: [f32; 3],
+    /// grain cell size in px (1 = per-pixel white noise)
+    pub grain_size: f32,
+    /// 0 = pure white noise, 1 = heavy low-frequency clumping
+    pub grain_rough: f32,
     pub grain: f32,
     // grading
     pub lift: [f32; 3],
@@ -560,13 +568,11 @@ fn apply_look(p: &mut Params, look: &str) {
 /// `recipe.profile` is either an absolute/relative .dcp path, or a profile
 /// name ("Adobe Standard", "Camera Standard", ...) matched against
 /// `m.info.make`/`model` via crate::dcp::find_profile.
-fn load_dcp_profile(
-    r: &Recipe,
-    m: &Mosaic,
-) -> Option<std::sync::Arc<crate::dcp::DcpProfile>> {
+fn load_dcp_profile(r: &Recipe, m: &Mosaic) -> Option<std::sync::Arc<crate::dcp::DcpProfile>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<crate::dcp::DcpProfile>>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<String, Option<Arc<crate::dcp::DcpProfile>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 
     let name = r.profile.trim();
@@ -613,7 +619,9 @@ fn resolve_dcp(
             crate::dcp::find_profile(&m.info.make, &m.info.model, name)
         }
     };
-    let prof = path.and_then(|p| crate::dcp::DcpProfile::load(&p)).map(Arc::new);
+    let prof = path
+        .and_then(|p| crate::dcp::DcpProfile::load(&p))
+        .map(Arc::new);
     if std::env::var_os("SL_DEBUG").is_some() {
         match &prof {
             Some(pr) => eprintln!(
@@ -716,7 +724,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         xy[1] += r.tint_abs.clamp(-150.0, 150.0) * -0.0004;
         let xyz = crate::dcp::xy_to_xyz(xy);
         let cam_neutral = if let Some(pr) = &prof {
-            pr.color_matrix_at(t_k).map(|cm| crate::dcp::mat_mul_vec(cm, xyz))
+            pr.color_matrix_at(t_k)
+                .map(|cm| crate::dcp::mat_mul_vec(cm, xyz))
         } else {
             None
         };
@@ -770,7 +779,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut profile_tone_lut: Vec<f32> = Vec::new();
     let mut profile_baseline_ev = 0.0f32;
     {
-        let wb_neutral = [1.0 / wb[0].max(1e-4), 1.0 / wb[1].max(1e-4), 1.0 / wb[2].max(1e-4)];
+        let wb_neutral = [
+            1.0 / wb[0].max(1e-4),
+            1.0 / wb[1].max(1e-4),
+            1.0 / wb[2].max(1e-4),
+        ];
         if let Some(prof) = &prof {
             if let Some(mtx) = prof.cam_to_xyz_d50(wb_neutral) {
                 cam2srgb = crate::dcp::mat_mul(crate::dcp::xyz_d50_to_srgb(), mtx);
@@ -1061,6 +1074,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         vibrance: r.vibrance,
         sharpen: r.sharpen,
         sharp_mask: r.sharp_mask.clamp(0.0, 1.0),
+        sharp_radius: r.sharp_radius.clamp(1.0, 3.0),
+        sharp_detail: r.sharp_detail.clamp(0.0, 1.0),
         noise_luma: r.noise_luma,
         rotation_deg: r.rotation_deg.clamp(-45.0, 45.0),
         clarity: r.clarity.clamp(-1.0, 1.0),
@@ -1087,6 +1102,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             ]
         },
         grain: r.grain.clamp(0.0, 1.0),
+        grain_size: 1.0 + r.grain_size.clamp(0.0, 1.0) * 4.0,
+        grain_rough: r.grain_rough.clamp(0.0, 1.0),
         lift: [
             r.lift[0].clamp(-0.5, 0.5),
             r.lift[1].clamp(-0.5, 0.5),
@@ -2027,7 +2044,9 @@ fn correct_plane_adobe(
                 let xdv = (sxd - vx0) / vfx;
                 let ydv = (syd - vy0) / vfy;
                 let rv2 = xdv * xdv + ydv * ydv;
-                let att = (1.0 + a.vig_a[0] * rv2 + a.vig_a[1] * rv2 * rv2
+                let att = (1.0
+                    + a.vig_a[0] * rv2
+                    + a.vig_a[1] * rv2 * rv2
                     + a.vig_a[2] * rv2 * rv2 * rv2)
                     .max(0.05);
                 let g = 1.0 + (1.0 / att - 1.0) * amount;
@@ -2096,7 +2115,12 @@ pub fn correct_plane(
     // focal-unit scale for Adobe ACM: halfd_px/(foc·Dmax)
     let dmax = w.max(h) as f32;
     let lens_s = halfd
-        / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
+        / (c.adobe
+            .as_ref()
+            .map(|a| a.foc[0])
+            .unwrap_or(c.vig_foc)
+            .max(1e-3)
+            * dmax);
     let warp = c.dng.as_ref().and_then(|o| o.warp.as_ref());
     let gain = c.dng.as_ref().and_then(|o| o.gain.as_ref());
     let mut out = vec![[0.0f32; 3]; w * h];
@@ -2142,10 +2166,8 @@ pub fn correct_plane(
                     let oy = (sy - wy) / halfd;
                     let r2 = ox * ox + oy * oy;
                     let k = &wr.kr[ch.min(2)];
-                    let f = k[0]
-                        + r2 * (k[1]
-                            + r2 * (k[2]
-                                + r2 * (k[3] + r2 * (k[4] + r2 * k[5]))));
+                    let f =
+                        k[0] + r2 * (k[1] + r2 * (k[2] + r2 * (k[3] + r2 * (k[4] + r2 * k[5]))));
                     let f = 1.0 + (f - 1.0) * amount;
                     sx = wx + ox * f * halfd;
                     sy = wy + oy * f * halfd;
@@ -2163,8 +2185,8 @@ pub fn correct_plane(
                 // lensfun PA uses the corrected (display) radius.
                 let rv = if c.vig_adobe { rd } else { ru };
                 let r2 = rv * rv;
-                let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2)
-                    .max(0.05);
+                let att =
+                    (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
                 let g = 1.0 + (1.0 / att - 1.0) * amount;
                 for ch in px.iter_mut() {
                     *ch *= g;
@@ -2199,7 +2221,12 @@ pub fn lens_map(
         let ru = rn * c.scale;
         let dmax = w.max(h) as f32;
         let lens_s = halfd
-            / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
+            / (c.adobe
+                .as_ref()
+                .map(|a| a.foc[0])
+                .unwrap_or(c.vig_foc)
+                .max(1e-3)
+                * dmax);
         let rd = inv_dist(c.model, c.abc, ru, lens_s) / c.scale;
         let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
         g = if c.vig != [0.0; 3] {
@@ -2211,7 +2238,8 @@ pub fn lens_map(
                 ru
             };
             let r2 = rv * rv;
-            let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
+            let att =
+                (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
             1.0 + (1.0 / att - 1.0) * amount
         } else {
             1.0
@@ -2531,8 +2559,7 @@ pub fn colorize_plane(
                 Some(pl) => pl[vy * vw + vx],
                 None => match corr {
                     Some(c) => {
-                        let (sx, sy, g) =
-                            lens_map(c, vx, vy, vw, vh, p.lens_corr_amt, stride);
+                        let (sx, sy, g) = lens_map(c, vx, vy, vw, vh, p.lens_corr_amt, stride);
                         let mut cc = demosaic_pixel(
                             m,
                             (sx.round() as usize).min(vw - 1),
@@ -2967,7 +2994,16 @@ fn finish_linear(
         lin = glow_lin(&lin, w, h, pc.glow);
     }
     if pc.sharpen > 0.0 || pc.clarity != 0.0 {
-        lin = sharpen_clarity(&lin, w, h, pc.sharpen, pc.clarity, pc.sharp_mask);
+        lin = sharpen_clarity(
+            &lin,
+            w,
+            h,
+            pc.sharpen,
+            pc.clarity,
+            pc.sharp_mask,
+            pc.sharp_radius,
+            pc.sharp_detail,
+        );
     }
     let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, pc.crop, max_px);
     let cx = cl + ew * 0.5 - 0.5;
@@ -2977,9 +3013,7 @@ fn finish_linear(
     // edge-aware brush seeds: sample the linear image at each flagged
     // stroke's first dab (dst-normalized → src-px via the same map the
     // pixel loop uses). Stages share the base mapping (crop unified).
-    fill_brush_seeds(
-        &mut pc, &lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos,
-    );
+    fill_brush_seeds(&mut pc, &lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos);
     let p = &pc;
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
@@ -3058,8 +3092,28 @@ fn finish_linear(
                 }
             }
             if p.grain > 0.0 {
+                // LR grain: Size = cell blockiness, Roughness = mix of
+                // low-frequency clumps into the white noise.
+                let cell = p.grain_size.max(1.0);
                 for (c, seed) in adj.iter_mut().zip([0.0f32, 17.0, 43.0]) {
-                    *c += (hash_px(dx, dy, seed) - 0.5) * p.grain * 0.12;
+                    let hf = hash_px(dx, dy, seed);
+                    let lf = if cell > 1.5 {
+                        let fx = dx as f32 / cell;
+                        let fy = dy as f32 / cell;
+                        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+                        let (tx, ty) = (fx.fract(), fy.fract());
+                        let n00 = hash_px(x0, y0, seed);
+                        let n10 = hash_px(x0 + 1, y0, seed);
+                        let n01 = hash_px(x0, y0 + 1, seed);
+                        let n11 = hash_px(x0 + 1, y0 + 1, seed);
+                        let top = n00 + (n10 - n00) * tx;
+                        let bot = n01 + (n11 - n01) * tx;
+                        top + (bot - top) * ty
+                    } else {
+                        hf
+                    };
+                    let n = hf * (1.0 - p.grain_rough * 0.6) + lf * (p.grain_rough * 0.6);
+                    *c += (n - 0.5) * p.grain * 0.12;
                 }
             }
             if p.vignette != 0.0 {
@@ -3104,10 +3158,21 @@ fn finish_linear(
 /// unflip. Shared by the finish_linear pixel loop and brush-seed sampling.
 #[allow(clippy::too_many_arguments)]
 fn dst_to_src(
-    nx: f32, ny: f32,
-    cl: f32, ct: f32, ew: f32, eh: f32,
-    cx: f32, cy: f32, sin: f32, cos: f32,
-    key_v: f32, key_h: f32, flip: i32, w: usize, h: usize,
+    nx: f32,
+    ny: f32,
+    cl: f32,
+    ct: f32,
+    ew: f32,
+    eh: f32,
+    cx: f32,
+    cy: f32,
+    sin: f32,
+    cos: f32,
+    key_v: f32,
+    key_h: f32,
+    flip: i32,
+    w: usize,
+    h: usize,
 ) -> (f32, f32) {
     let mut fx = cl + nx * ew - 0.5;
     let mut fy = ct + ny * eh - 0.5;
@@ -3134,17 +3199,34 @@ fn dst_to_src(
 fn fill_brush_seeds(
     pc: &mut Params,
     lin: &[[f32; 3]],
-    w: usize, h: usize, flip: i32,
-    cl: f32, ct: f32, ew: f32, eh: f32,
-    cx: f32, cy: f32, sin: f32, cos: f32,
+    w: usize,
+    h: usize,
+    flip: i32,
+    cl: f32,
+    ct: f32,
+    ew: f32,
+    eh: f32,
+    cx: f32,
+    cy: f32,
+    sin: f32,
+    cos: f32,
 ) {
     fn fill_one(
         sp: &mut Params,
         lin: &[[f32; 3]],
-        w: usize, h: usize, flip: i32,
-        cl: f32, ct: f32, ew: f32, eh: f32,
-        cx: f32, cy: f32, sin: f32, cos: f32,
-        key_v: f32, key_h: f32,
+        w: usize,
+        h: usize,
+        flip: i32,
+        cl: f32,
+        ct: f32,
+        ew: f32,
+        eh: f32,
+        cx: f32,
+        cy: f32,
+        sin: f32,
+        cos: f32,
+        key_v: f32,
+        key_h: f32,
     ) {
         let n = sp.brush_misc[0] as usize;
         for s in 0..n {
@@ -3152,10 +3234,11 @@ fn fill_brush_seeds(
                 continue;
             }
             let s0 = sp.brush_strokes.get(s * 3 + 1).map_or(0.0, |e| e[0]) as usize;
-            let Some(seg) = sp.brush_segs.get(s0) else { continue };
+            let Some(seg) = sp.brush_segs.get(s0) else {
+                continue;
+            };
             let (sx, sy) = dst_to_src(
-                seg[0], seg[1], cl, ct, ew, eh, cx, cy, sin, cos,
-                key_v, key_h, flip, w, h,
+                seg[0], seg[1], cl, ct, ew, eh, cx, cy, sin, cos, key_v, key_h, flip, w, h,
             );
             let c = bilinear(lin, w, h, sx, sy);
             if let Some(sd) = sp.brush_seeds.get_mut(s) {
@@ -3166,9 +3249,13 @@ fn fill_brush_seeds(
         }
     }
     let (kv, kh) = (pc.key_v, pc.key_h);
-    fill_one(pc, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh);
+    fill_one(
+        pc, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh,
+    );
     for (sp, _, _) in pc.stages.iter_mut() {
-        fill_one(sp, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh);
+        fill_one(
+            sp, lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos, kv, kh,
+        );
     }
 }
 
@@ -3676,6 +3763,8 @@ fn sharpen_clarity(
     sharpen: f32,
     clarity: f32,
     sharp_mask: f32,
+    sharp_radius: f32,
+    sharp_detail: f32,
 ) -> Vec<[f32; 3]> {
     let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
     let boxn = |chan: &[f32], x: usize, y: usize, rad: i32| {
@@ -3703,9 +3792,23 @@ fn sharpen_clarity(
             // LR "Masking": the unsharp delta itself is the edge signal —
             // scale it down where the luma delta is flat.
             let sd = if sharpen != 0.0 {
+                // radius: interpolate between the integer box radii
+                let rf = sharp_radius.clamp(1.0, 3.0);
+                let ra = rf.floor() as i32;
+                let rb = (ra + 1).min(3);
+                let rt = rf - ra as f32;
                 let mut d = [0.0f32; 3];
                 for c in 0..3 {
-                    d[c] = lin[i][c] - boxn(&chans[c], x, y, 1);
+                    let da = lin[i][c] - boxn(&chans[c], x, y, ra);
+                    let db = lin[i][c] - boxn(&chans[c], x, y, rb);
+                    let dcoarse = da + (db - da) * rt;
+                    // detail: blend the coarse-band and fine 3x3 deltas
+                    d[c] = if sharp_detail > 0.0 {
+                        let dfine = lin[i][c] - boxn(&chans[c], x, y, 1);
+                        dcoarse * (1.0 - sharp_detail) + dfine * sharp_detail
+                    } else {
+                        dcoarse
+                    };
                 }
                 let edge = (0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]).abs();
                 let mscale = 1.0 - sharp_mask * (1.0 - sstep(0.006, 0.05, edge));

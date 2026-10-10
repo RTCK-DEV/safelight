@@ -50,9 +50,7 @@ struct LcpLens {
 pub struct LcpDb {
     /// (path, names derived from the filename)
     files: Vec<(PathBuf, Vec<String>)>,
-    parsed: std::sync::Mutex<
-        std::collections::HashMap<PathBuf, Option<std::sync::Arc<LcpLens>>>,
-    >,
+    parsed: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<LcpLens>>>>,
 }
 
 // ---- scoped attribute scanner ----------------------------------------------
@@ -308,7 +306,9 @@ impl LcpDb {
         let mut files = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -362,7 +362,10 @@ impl LcpDb {
                 }
                 std::sync::Arc::new(l)
             });
-        self.parsed.lock().unwrap().insert(p.to_path_buf(), lens.clone());
+        self.parsed
+            .lock()
+            .unwrap()
+            .insert(p.to_path_buf(), lens.clone());
         lens
     }
 
@@ -413,11 +416,7 @@ impl LcpDb {
     /// (DJI drones/action cams, compacts). Match the profile's embedded
     /// UniqueCameraModel / pretty names against the EXIF camera model —
     /// bounded to same-make files so it can't grab an unrelated profile.
-    fn find_by_camera(
-        &self,
-        exif_make: &str,
-        exif_model: &str,
-    ) -> Option<std::sync::Arc<LcpLens>> {
+    fn find_by_camera(&self, exif_make: &str, exif_model: &str) -> Option<std::sync::Arc<LcpLens>> {
         let mq = norm(exif_model);
         if mq.len() < 3 {
             return None;
@@ -488,7 +487,11 @@ impl LcpDb {
             if !make_q.is_empty() {
                 if let Some(mk) = names.iter().find(|n| n.starts_with("make:")) {
                     let fm = norm(&mk[5..]);
-                    if !fm.is_empty() && fm != make_q && !fm.contains(&make_q) && !make_q.contains(&fm) {
+                    if !fm.is_empty()
+                        && fm != make_q
+                        && !fm.contains(&make_q)
+                        && !make_q.contains(&fm)
+                    {
                         continue;
                     }
                 }
@@ -542,11 +545,7 @@ impl LcpDb {
         // nearest calibration by focal (entries of a prime share focal;
         // aperture only refines the vignette pick below)
         let mut by_focal: Vec<&Cal> = lens.cals.iter().collect();
-        by_focal.sort_by(|a, b| {
-            (a.focal - focal)
-                .abs()
-                .total_cmp(&(b.focal - focal).abs())
-        });
+        by_focal.sort_by(|a, b| (a.focal - focal).abs().total_cmp(&(b.focal - focal).abs()));
         let base = *by_focal.first()?;
 
         // vignette: nearest focal then nearest aperture
@@ -614,7 +613,8 @@ impl LcpDb {
             for i in 1..=5 {
                 let r = i as f64 * 0.14; // focal-unit radii ≈ [0.14..0.7]
                 let r2 = r * r;
-                let w = sf as f64 * (1.0 + k1 as f64 * r2 + k2 as f64 * r2 * r2 + k3 as f64 * r2 * r2 * r2);
+                let w = sf as f64
+                    * (1.0 + k1 as f64 * r2 + k2 as f64 * r2 * r2 + k3 as f64 * r2 * r2 * r2);
                 a11 += 1.0;
                 a12 += r2;
                 a22 += r2 * r2;

@@ -97,8 +97,19 @@ fn main() -> Result<()> {
                 args[4..].iter().map(std::path::PathBuf::from).collect();
             let t = std::time::Instant::now();
             let img = eng.merge(&paths, mode)?;
-            eprintln!("merge {mode} {}x{} in {:?}", img.width, img.height, t.elapsed());
-            image::save_buffer(out, &img.data, img.width, img.height, image::ColorType::Rgba8)?;
+            eprintln!(
+                "merge {mode} {}x{} in {:?}",
+                img.width,
+                img.height,
+                t.elapsed()
+            );
+            image::save_buffer(
+                out,
+                &img.data,
+                img.width,
+                img.height,
+                image::ColorType::Rgba8,
+            )?;
         }
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;

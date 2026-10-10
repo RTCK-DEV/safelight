@@ -48,6 +48,13 @@ pub struct Recipe {
     /// delta on flat areas, leaving edges fully sharpened
     #[serde(default)]
     pub sharp_mask: f32,
+    /// sharpen radius in 3x3-box units 0.5..3.0 (LR 0.5..3.0, default 1.0)
+    #[serde(default = "default_one")]
+    pub sharp_radius: f32,
+    /// sharpen detail 0..1: blends the sharpening band between the
+    /// coarse-radius delta (0) and the fine 3x3 delta (1). LR default 25
+    #[serde(default)]
+    pub sharp_detail: f32,
     /// luminance noise reduction 0..1
     pub noise_luma: f32,
     /// straighten angle in degrees, -10..10
@@ -70,6 +77,13 @@ pub struct Recipe {
     pub vig_feather: f32,
     /// film grain 0..1
     pub grain: f32,
+    /// grain particle size 0..1 → 1..5 px cells (LR GrainSize 0..100)
+    #[serde(default)]
+    pub grain_size: f32,
+    /// grain roughness 0..1: blends low-frequency clumpy noise into the
+    /// white noise (LR GrainRoughness 0..100)
+    #[serde(default)]
+    pub grain_rough: f32,
     // ---- grading (DaVinci-style lift/gamma/gain + split tone + look) ----
     /// per-channel shadow offset, typically -0.25..0.25
     pub lift: [f32; 3],
@@ -405,6 +419,8 @@ impl Default for Recipe {
             curve: Vec::new(),
             sharpen: 0.0,
             sharp_mask: 0.0,
+            sharp_radius: 1.0,
+            sharp_detail: 0.25,
             noise_luma: 0.0,
             rotation_deg: 0.0,
             clarity: 0.0,
@@ -413,6 +429,8 @@ impl Default for Recipe {
             vig_round: -2.0,
             vig_feather: -1.0,
             grain: 0.0,
+            grain_size: 0.25,
+            grain_rough: 0.5,
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
@@ -565,10 +583,7 @@ pub fn sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::Pat
 /// The same sidecar under the pre-rename `<stem>.araware.json` naming.
 /// Reads fall back to this so existing libraries keep their edits; new
 /// writes always go to the .safelight name.
-pub fn legacy_sidecar_path_for_v(
-    asset: &std::path::Path,
-    vslot: u32,
-) -> std::path::PathBuf {
+pub fn legacy_sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
     let mut p = asset.to_path_buf();
     let stem = asset
         .file_stem()
@@ -587,10 +602,7 @@ pub fn legacy_sidecar_path_for_v(
 /// Path a reader should use: the .safelight sidecar if present, else the
 /// araware-era one if present, else the .safelight path (nonexistent) so
 /// callers' exists()/default handling still works.
-pub fn read_sidecar_path_for_v(
-    asset: &std::path::Path,
-    vslot: u32,
-) -> std::path::PathBuf {
+pub fn read_sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
     let p = sidecar_path_for_v(asset, vslot);
     if p.exists() {
         return p;

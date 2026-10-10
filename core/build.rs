@@ -86,7 +86,9 @@ fn main() {
     let gpr_root = std::path::PathBuf::from("../third_party/gpr");
     if gpr_root.is_dir() {
         fn walk(dir: &Path, c: &mut Vec<String>, cpp: &mut Vec<String>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -201,7 +203,9 @@ fn compile_libraw_from_source(root: &str) {
     let src_dir = root_path.join("src");
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -240,6 +244,9 @@ fn compile_libraw_from_source(root: &str) {
             .define("_CRT_SECURE_NO_WARNINGS", None)
             .define("_WINSOCK_DEPRECATED_NO_WARNINGS", None);
     }
-    println!("cargo:warning=compiling {} LibRaw sources from {root}", files.len());
+    println!(
+        "cargo:warning=compiling {} LibRaw sources from {root}",
+        files.len()
+    );
     b.compile("raw");
 }

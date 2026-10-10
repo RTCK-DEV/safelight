@@ -116,6 +116,13 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         lr(r.noise_luma, 100.0),
         lr(r.noise_chroma, 100.0)
     ));
+    if r.sharp_radius != 1.0 || r.sharp_detail > 0.0 {
+        a.push_str(&format!(
+            "   crs:SharpenRadius=\"{:.1}\" crs:SharpenDetail=\"{:.0}\"\n",
+            r.sharp_radius,
+            r.sharp_detail * 100.0
+        ));
+    }
     if r.key_v != 0.0 || r.key_h != 0.0 {
         a.push_str(&format!(
             "   crs:PerspectiveVertical=\"{:.0}\" crs:PerspectiveHorizontal=\"{:.0}\"\n",
@@ -136,6 +143,13 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         lr(r.vignette, 100.0),
         lr(r.grain, 100.0)
     ));
+    if r.grain_size != 0.5 || r.grain_rough != 0.5 {
+        a.push_str(&format!(
+            "   crs:GrainSize=\"{:.0}\" crs:GrainRoughness=\"{:.0}\"\n",
+            r.grain_size * 100.0,
+            r.grain_rough * 100.0
+        ));
+    }
     if r.vig_mid >= 0.0 || r.vig_round > -2.0 || r.vig_feather >= 0.0 {
         a.push_str(&format!(
             "   crs:PostCropVignetteMidpoint=\"{:.0}\" crs:PostCropVignetteRoundness=\"{:.0}\" crs:PostCropVignetteFeather=\"{:.0}\"\n",
@@ -284,7 +298,10 @@ fn embedded_xmp(asset: &Path) -> Option<String> {
     }
     let mut p = 2usize;
     while p + 4 <= bytes.len() && bytes[p] == 0xFF {
-        let (marker, len) = (bytes[p + 1], u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize);
+        let (marker, len) = (
+            bytes[p + 1],
+            u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize,
+        );
         let seg_end = (p + 2 + len).min(bytes.len());
         if marker == 0xE1 {
             let seg = &bytes[p + 4..seg_end];
@@ -322,9 +339,7 @@ fn parse_xmp_body(body: &str) -> Sidecar {
 
 pub fn read_xmp(asset: &Path) -> Option<Sidecar> {
     if let Some(p) = find_xmp(asset) {
-        return std::fs::read_to_string(p)
-            .ok()
-            .map(|b| parse_xmp_body(&b));
+        return std::fs::read_to_string(p).ok().map(|b| parse_xmp_body(&b));
     }
     // no sidecar: Lightroom may have written into the file itself
     embedded_xmp(asset).map(|b| parse_xmp_body(&b))
@@ -403,6 +418,32 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(v) = attr(&body, "crs:SharpenEdgeMasking") {
             r.sharp_mask = (v / 100.0).clamp(0.0, 1.0);
         }
+        if let Some(v) = attr(&body, "crs:SharpenRadius") {
+            r.sharp_radius = v.clamp(1.0, 3.0);
+        }
+        if let Some(v) = attr(&body, "crs:SharpenDetail") {
+            r.sharp_detail = (v / 100.0).clamp(0.0, 1.0);
+        }
+        // PV2012 color grading luminance + global wheel -> HDR zone wheels
+        if let Some(v) = attr(&body, "crs:ColorGradeShadowLum") {
+            r.z_dark[2] += v / 100.0 * 0.5;
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeMidtoneLum") {
+            r.z_shadow[2] += v / 400.0;
+            r.z_light[2] += v / 400.0;
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeHighlightLum") {
+            r.z_light[2] += v / 100.0 * 0.5;
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeGlobalLum") {
+            r.z_global[2] += v / 100.0 * 0.5;
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeGlobalHue") {
+            r.z_global[0] = (v / 360.0).rem_euclid(1.0);
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeGlobalSat") {
+            r.z_global[1] += (v / 100.0 * 0.5).clamp(0.0, 1.0);
+        }
         // transform panel: keystone sliders
         if let Some(v) = attr(&body, "crs:PerspectiveVertical") {
             r.key_v = (v / 100.0 * 0.4).clamp(-0.4, 0.4);
@@ -444,6 +485,12 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr(&body, "crs:GrainAmount") {
             r.grain = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:GrainSize") {
+            r.grain_size = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr_any(&body, &["crs:GrainRoughness", "crs:GrainFrequency"]) {
+            r.grain_rough = (v / 100.0).clamp(0.0, 1.0);
         }
         if let Some(v) = attr(&body, "crs:CropAngle") {
             r.rotation_deg = v;
@@ -497,6 +544,36 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         // explicit point curves (rdf:Seq of "x, y" strings)
         if let Some(pts) = curve_seq(&body, "crs:ToneCurvePV2012") {
             r.curve = pts;
+        }
+        // named tone curve when no custom points were given ("Linear"
+        // must defeat our default medium-contrast base curve)
+        if r.curve.is_empty() {
+            if let Some(name) = attr_str(&body, "crs:ToneCurveName2012")
+                .or_else(|| attr_str(&body, "crs:ToneCurveName"))
+            {
+                r.curve = match name.as_str() {
+                    "Linear" => vec![[0.0, 0.0], [1.0, 1.0]],
+                    "Medium Contrast" => vec![
+                        [0.0, 0.0],
+                        [0.125, 0.086],
+                        [0.25, 0.22],
+                        [0.5, 0.5],
+                        [0.75, 0.78],
+                        [0.878, 0.902],
+                        [1.0, 1.0],
+                    ],
+                    "Strong Contrast" => vec![
+                        [0.0, 0.0],
+                        [0.125, 0.05],
+                        [0.25, 0.15],
+                        [0.5, 0.5],
+                        [0.75, 0.85],
+                        [0.875, 0.945],
+                        [1.0, 1.0],
+                    ],
+                    _ => Vec::new(),
+                };
+            }
         }
         if let Some(pts) = curve_seq(&body, "crs:ToneCurvePV2012Red") {
             r.curve_r = pts;
@@ -657,15 +734,13 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 sat /= 100.0;
             }
             let sat = sat.clamp(-1.0, 1.0);
-            let temp = (field(&item, "crs:LocalTemperature").unwrap_or(0.0) / 100.0)
-                .clamp(-1.0, 1.0);
-            let feather_of = |mb: &str| {
-                (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0)
-            };
+            let temp =
+                (field(&item, "crs:LocalTemperature").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
+            let feather_of =
+                |mb: &str| (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0);
             // LR midpoint (0..100): 0 = at the zero-effect boundary.
             let mid_of = |mb: &str| {
-                (1.0 - field(mb, "crs:Midpoint").unwrap_or(50.0) / 100.0)
-                    .clamp(0.01, 0.99)
+                (1.0 - field(mb, "crs:Midpoint").unwrap_or(50.0) / 100.0).clamp(0.01, 0.99)
             };
             let win = |kind: &str, p: [f32; 6], mid: f32, invert: bool| PowerWindow {
                 kind: kind.into(),
@@ -726,8 +801,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             for mb in mask_blocks(&item, "Image") {
                 let sub = field(&mb, "crs:MaskSubType").unwrap_or(0.0) as i32;
                 if sub == 1 {
-                    r.windows
-                        .push(win("subject", [0.0; 6], 0.0, false));
+                    r.windows.push(win("subject", [0.0; 6], 0.0, false));
                 }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
@@ -814,8 +888,10 @@ fn parametric_curve(body: &str) -> Option<Vec<[f32; 2]>> {
         return None;
     }
     let s1 = (attr(body, "crs:ParametricShadowSplit").unwrap_or(64.0) / 255.0).clamp(0.02, 0.96);
-    let s2 = (attr(body, "crs:ParametricMidtoneSplit").unwrap_or(128.0) / 255.0).clamp(s1 + 0.02, 0.98);
-    let s3 = (attr(body, "crs:ParametricHighlightSplit").unwrap_or(191.0) / 255.0).clamp(s2 + 0.01, 0.99);
+    let s2 =
+        (attr(body, "crs:ParametricMidtoneSplit").unwrap_or(128.0) / 255.0).clamp(s1 + 0.02, 0.98);
+    let s3 = (attr(body, "crs:ParametricHighlightSplit").unwrap_or(191.0) / 255.0)
+        .clamp(s2 + 0.01, 0.99);
     let g = [sh / 100.0, dk / 100.0, lt / 100.0, hi / 100.0];
     let edges = [0.0f32, s1, s2, s3, 1.0];
     // y(x) = x + sum_i g_i * sstep(t_i(x)) * zone_width * strength,
@@ -860,21 +936,33 @@ fn hsl_adjustments(body: &str, r: &mut crate::recipe::Recipe) {
         if let Some(v) = attr(body, &hue_tag) {
             if v != 0.0 {
                 // anchor neighbours so untouched hues aren't dragged along
-                for (x, dy) in [(center - 0.07, 0.0), (center, v / 100.0 * 0.15), (center + 0.07, 0.0)] {
+                for (x, dy) in [
+                    (center - 0.07, 0.0),
+                    (center, v / 100.0 * 0.15),
+                    (center + 0.07, 0.0),
+                ] {
                     r.hue_hue.push([x - x.floor(), x - x.floor() + dy]);
                 }
             }
         }
         if let Some(v) = attr(body, &sat_tag) {
             if v != 0.0 {
-                for (x, g) in [(center - 0.07, 1.0), (center, 1.0 + v / 100.0), (center + 0.07, 1.0)] {
+                for (x, g) in [
+                    (center - 0.07, 1.0),
+                    (center, 1.0 + v / 100.0),
+                    (center + 0.07, 1.0),
+                ] {
                     r.hue_sat.push([x - x.floor(), g.max(0.0)]);
                 }
             }
         }
         if let Some(v) = attr(body, &lum_tag) {
             if v != 0.0 {
-                for (x, g) in [(center - 0.07, 1.0), (center, 1.0 + v / 150.0), (center + 0.07, 1.0)] {
+                for (x, g) in [
+                    (center - 0.07, 1.0),
+                    (center, 1.0 + v / 150.0),
+                    (center + 0.07, 1.0),
+                ] {
                     r.hue_lum.push([x - x.floor(), g.max(0.0)]);
                 }
             }

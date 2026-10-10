@@ -60,10 +60,8 @@ impl GainMap {
         }
         let v = (y + 0.5) / img_h.max(1) as f64;
         let u = (x + 0.5) / img_w.max(1) as f64;
-        let gy = ((v - self.origin[0]) / self.spacing[0].max(1e-9))
-            .clamp(0.0, (rows - 1) as f64);
-        let gx = ((u - self.origin[1]) / self.spacing[1].max(1e-9))
-            .clamp(0.0, (cols - 1) as f64);
+        let gy = ((v - self.origin[0]) / self.spacing[0].max(1e-9)).clamp(0.0, (rows - 1) as f64);
+        let gx = ((u - self.origin[1]) / self.spacing[1].max(1e-9)).clamp(0.0, (cols - 1) as f64);
         let (y0, x0) = (gy.floor() as usize, gx.floor() as usize);
         let (y1, x1) = ((y0 + 1).min(rows - 1), (x0 + 1).min(cols - 1));
         let (ty, tx) = ((gy - y0 as f64) as f32, (gx - x0 as f64) as f32);
@@ -106,7 +104,11 @@ impl<'a> Rd<'a> {
             if self.u16(o) == want {
                 let (typ, cnt) = (self.u16(o + 2), self.u32(o + 4));
                 let sz = typ_sz(typ) * cnt as usize;
-                let voff = if sz <= 4 { o + 8 } else { self.u32(o + 8) as usize };
+                let voff = if sz <= 4 {
+                    o + 8
+                } else {
+                    self.u32(o + 8) as usize
+                };
                 return Some((typ, cnt, voff));
             }
         }
@@ -193,14 +195,10 @@ impl<'a> Be<'a> {
         u32::from_be_bytes(self.0[o..o + 4].try_into().unwrap())
     }
     fn f64(&self, o: usize) -> f64 {
-        f64::from_bits(u64::from_be_bytes(
-            self.0[o..o + 8].try_into().unwrap(),
-        ))
+        f64::from_bits(u64::from_be_bytes(self.0[o..o + 8].try_into().unwrap()))
     }
     fn f32(&self, o: usize) -> f32 {
-        f32::from_bits(u32::from_be_bytes(
-            self.0[o..o + 4].try_into().unwrap(),
-        ))
+        f32::from_bits(u32::from_be_bytes(self.0[o..o + 4].try_into().unwrap()))
     }
 }
 

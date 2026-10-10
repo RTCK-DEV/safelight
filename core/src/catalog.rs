@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::decode;
-use crate::recipe::{
-    read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Sidecar,
-};
+use crate::recipe::{read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Sidecar};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetEntry {

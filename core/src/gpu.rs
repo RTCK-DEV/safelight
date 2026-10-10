@@ -129,6 +129,8 @@ struct Uni {
     csn: [f32; 4],
     /// post-crop vignette shape [mid, round, feather, 0] (mid<0 = legacy)
     extra0: [f32; 4],
+    /// [grain_size px, grain_rough, sharp_radius, sharp_detail]
+    extra1: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -204,6 +206,8 @@ struct Uni {
     csn: vec4<f32>,
     // post-crop vignette shape [mid, round, feather, 0]
     extra0: vec4<f32>,
+    // [grain cell size, roughness, sharpen radius, sharpen detail]
+    extra1: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1147,7 +1151,19 @@ fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     let src = io_a[i].xyz;
     var out = src;
     if (pg.a3.x != 0.0) {
-        let d = src - box_at(i % w, i / w, 1);
+        // radius: interpolate between integer box radii; detail blends
+        // the coarse-band and fine 3x3 deltas.
+        let rf = clamp(pg.extra1.z, 1.0, 3.0);
+        let ra = i32(floor(rf));
+        let rb = min(ra + 1, 3);
+        let rt = rf - f32(ra);
+        let da = src - box_at(i % w, i / w, ra);
+        let db = src - box_at(i % w, i / w, rb);
+        var d = da + (db - da) * rt;
+        if (pg.extra1.w > 0.0) {
+            let dfine = src - box_at(i % w, i / w, 1);
+            d = d * (1.0 - pg.extra1.w) + dfine * pg.extra1.w;
+        }
         // LR "Masking": suppress the unsharp delta on flat areas.
         let edge = abs(dot(d, vec3<f32>(0.2126, 0.7152, 0.0722)));
         let ms = 1.0 - pg.csn.z * (1.0 - sstep(0.006, 0.05, edge));
@@ -1450,6 +1466,22 @@ fn bil_ch(sx: f32, sy: f32, ch: u32) -> f32 {
     let a = mix(io_a[i00][ch], io_a[i00 + 1u][ch], tx);
     let b = mix(io_a[i00 + sw][ch], io_a[i00 + sw + 1u][ch], tx);
     return mix(a, b, ty);
+}
+
+// bilinear cell noise for the grain low-frequency component; cell ids
+// feed the same integer hash so CPU/GPU grain fields match.
+fn cell_noise(p: vec2<f32>, cell: f32, seed: f32) -> f32 {
+    let fx = p.x / cell;
+    let fy = p.y / cell;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let n00 = hash(vec2<f32>(x0, y0), seed);
+    let n10 = hash(vec2<f32>(x0 + 1.0, y0), seed);
+    let n01 = hash(vec2<f32>(x0, y0 + 1.0), seed);
+    let n11 = hash(vec2<f32>(x0 + 1.0, y0 + 1.0), seed);
+    return mix(mix(n00, n10, tx), mix(n01, n11, tx), ty);
 }
 
 fn hash(p: vec2<f32>, seed: f32) -> f32 {
@@ -1767,13 +1799,17 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let ghost = exp(-gd * gd / 0.0008);
         adj = adj + hue_to_rgb(pg.flare.w) * (pg.flare.z * (0.5 * core + 0.7 * streak + 0.35 * ghost));
     }
-    // film grain (pre-gamma, linear domain)
+    // film grain (pre-gamma, linear domain) — cell size + low-freq
+    // roughness mix matching the CPU finish pass.
     if (pg.a4.x > 0.0) {
         let p = vec2<f32>(f32(dx), f32(dy));
+        let cell = max(pg.extra1.x, 1.0);
+        let rough = pg.extra1.y * 0.6;
+        let has_lf = cell > 1.5;
         adj = adj + vec3<f32>(
-            hash(p, 0.0) - 0.5,
-            hash(p, 17.0) - 0.5,
-            hash(p, 43.0) - 0.5,
+            mix(hash(p, 0.0), select(hash(p, 0.0), cell_noise(p, cell, 0.0), has_lf), rough) - 0.5,
+            mix(hash(p, 17.0), select(hash(p, 17.0), cell_noise(p, cell, 17.0), has_lf), rough) - 0.5,
+            mix(hash(p, 43.0), select(hash(p, 43.0), cell_noise(p, cell, 43.0), has_lf), rough) - 0.5,
         ) * pg.a4.x * 0.12;
     }
     // vignette (post-adjust, pre-gamma; positive darkens corners)
@@ -2045,7 +2081,9 @@ impl Gpu {
             })
             .map(|dl| 8 + dl)
             .collect();
-        let lut_len = LUT_N + 8 + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
+        let lut_len = LUT_N
+            + 8
+            + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
             + n_stg * LUT_N
             + stg_l3.iter().sum::<u64>();
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -2291,7 +2329,9 @@ impl Gpu {
                 .map(|c| [c.vig[0], c.vig[1], c.vig[2], c.scale])
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
             lens3: [
-                corr.as_ref().map(|c| c.vig_adobe as i32 as f32).unwrap_or(0.0),
+                corr.as_ref()
+                    .map(|c| c.vig_adobe as i32 as f32)
+                    .unwrap_or(0.0),
                 corr.as_ref().map(|c| c.vig_foc).unwrap_or(0.0),
                 corr.as_ref()
                     .and_then(|c| c.adobe.as_ref().map(|a| a.foc[0]))
@@ -2327,6 +2367,7 @@ impl Gpu {
                 0.0,
             ],
             extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
+            extra1: [p.grain_size, p.grain_rough, p.sharp_radius, p.sharp_detail],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
@@ -2384,29 +2425,29 @@ impl Gpu {
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> =
                 [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-                .iter()
-                .map(|&i| wgpu::BindGroupEntry {
-                    binding: i,
-                    resource: match i {
-                        0 => uni_b.as_entire_binding(),
-                        1 => raw_b.as_entire_binding(),
-                        2 => cfa_b.as_entire_binding(),
-                        3 => io_a.as_entire_binding(),
-                        4 => io_b.as_entire_binding(),
-                        5 => out_b.as_entire_binding(),
-                        6 => lut_b.as_entire_binding(),
-                        7 => stats_b.as_entire_binding(),
-                        8 => idx_b.as_entire_binding(),
-                        9 => tap_b.as_entire_binding(),
-                        10 => brush_b.as_entire_binding(),
-                        11 => den_b.as_entire_binding(),
-                        12 => subj_b.as_entire_binding(),
-                        13 => suni_b.as_entire_binding(),
-                        14 => seeds_b.as_entire_binding(),
-                        _ => dng_b.as_entire_binding(),
-                    },
-                })
-                .collect();
+                    .iter()
+                    .map(|&i| wgpu::BindGroupEntry {
+                        binding: i,
+                        resource: match i {
+                            0 => uni_b.as_entire_binding(),
+                            1 => raw_b.as_entire_binding(),
+                            2 => cfa_b.as_entire_binding(),
+                            3 => io_a.as_entire_binding(),
+                            4 => io_b.as_entire_binding(),
+                            5 => out_b.as_entire_binding(),
+                            6 => lut_b.as_entire_binding(),
+                            7 => stats_b.as_entire_binding(),
+                            8 => idx_b.as_entire_binding(),
+                            9 => tap_b.as_entire_binding(),
+                            10 => brush_b.as_entire_binding(),
+                            11 => den_b.as_entire_binding(),
+                            12 => subj_b.as_entire_binding(),
+                            13 => suni_b.as_entire_binding(),
+                            14 => seeds_b.as_entire_binding(),
+                            _ => dng_b.as_entire_binding(),
+                        },
+                    })
+                    .collect();
             dev.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipe.layout,

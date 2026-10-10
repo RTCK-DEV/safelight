@@ -4,8 +4,8 @@
 //! These operate on display-referred RGBA8 output of `Engine::export`, so
 //! each source photo's own sidecar recipe is applied before merging.
 
-use anyhow::{anyhow, Result};
 use crate::RgbaImage;
+use anyhow::{anyhow, Result};
 
 fn luma(p: &[u8]) -> f32 {
     0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
@@ -66,7 +66,8 @@ fn align_translate(ra: &RgbaImage, rb: &RgbaImage) -> (i32, i32) {
                     if bx < 0 || by < 0 || bx >= gw as i32 || by >= gh as i32 {
                         continue;
                     }
-                    s += (a[(y * gw as i32 + x) as usize] - b[(by * gw as i32 + bx) as usize]).abs();
+                    s +=
+                        (a[(y * gw as i32 + x) as usize] - b[(by * gw as i32 + bx) as usize]).abs();
                     n += 1;
                 }
             }
@@ -173,7 +174,9 @@ pub fn focus_stack(imgs: &[RgbaImage]) -> Result<RgbaImage> {
         for y in 1..h - 1 {
             for x in 1..w - 1 {
                 let c = l[y * w + x];
-                let lap = 4.0 * c - l[y * w + x - 1] - l[y * w + x + 1]
+                let lap = 4.0 * c
+                    - l[y * w + x - 1]
+                    - l[y * w + x + 1]
                     - l[(y - 1) * w + x]
                     - l[(y + 1) * w + x];
                 e[y * w + x] = lap.abs();
@@ -181,7 +184,11 @@ pub fn focus_stack(imgs: &[RgbaImage]) -> Result<RgbaImage> {
         }
         weights.push(box_blur(&e, w, h, 6));
     }
-    let mut out = RgbaImage { width: w as u32, height: h as u32, data: vec![0u8; w * h * 4] };
+    let mut out = RgbaImage {
+        width: w as u32,
+        height: h as u32,
+        data: vec![0u8; w * h * 4],
+    };
     let od = &mut out.data;
     for i in 0..w * h {
         let mut sum = 0.0f32;
@@ -314,7 +321,9 @@ pub fn exposure_fuse(imgs: &[RgbaImage]) -> Result<RgbaImage> {
             wm[i] /= s;
         }
     }
-    let levels = (((w.min(h)) as f32).log2() as usize).saturating_sub(2).clamp(3, 9);
+    let levels = (((w.min(h)) as f32).log2() as usize)
+        .saturating_sub(2)
+        .clamp(3, 9);
     // per-channel fused laplacian pyramid
     let mut acc: Vec<Vec<f32>> = Vec::new();
     let mut acc_dims: Vec<(usize, usize)> = Vec::new();
@@ -351,10 +360,7 @@ pub fn exposure_fuse(imgs: &[RgbaImage]) -> Result<RgbaImage> {
                     d
                 })
                 .collect();
-            level_w = wmaps
-                .iter()
-                .map(|wm| gaussian_down(wm, lw, lh).0)
-                .collect();
+            level_w = wmaps.iter().map(|wm| gaussian_down(wm, lw, lh).0).collect();
             // renormalize weights at coarser level
             for i in 0..dw2 * dh2 {
                 let mut s = 0.0f32;
@@ -394,7 +400,11 @@ pub fn exposure_fuse(imgs: &[RgbaImage]) -> Result<RgbaImage> {
         acc.push(cur);
         acc_dims.push((cw, ch));
     }
-    let mut out = RgbaImage { width: w as u32, height: h as u32, data: vec![0u8; w * h * 4] };
+    let mut out = RgbaImage {
+        width: w as u32,
+        height: h as u32,
+        data: vec![0u8; w * h * 4],
+    };
     let od = &mut out.data;
     for i in 0..npx {
         for c in 0..3 {
@@ -416,7 +426,9 @@ pub fn merge(imgs: &[RgbaImage], mode: &str) -> Result<RgbaImage> {
     aligned.push(base.clone());
     for im in &imgs[1..] {
         if im.width != base.width || im.height != base.height {
-            return Err(anyhow!("merge: source sizes differ — same-camera bursts only"));
+            return Err(anyhow!(
+                "merge: source sizes differ — same-camera bursts only"
+            ));
         }
         let (dx, dy) = align_translate(base, im);
         aligned.push(shift(im, dx, dy));

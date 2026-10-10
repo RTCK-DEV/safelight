@@ -13,9 +13,7 @@ pub const RAW_EXTS: &[&str] = &[
 ];
 // .insp = Insta360 still: a plain JPEG holding both lenses in one 2:1
 // frame — readable as a normal raster for browsing/equirect export.
-pub const RASTER_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "tif", "tiff", "webp", "insp",
-];
+pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp", "insp"];
 
 pub fn is_raw(path: &Path) -> bool {
     path.extension()
@@ -366,7 +364,11 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
     path.hash(&mut hasher);
     meta.len().hash(&mut hasher);
     meta.modified()
-        .map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())
+        .map(|m| {
+            m.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        })
         .unwrap_or(0)
         .hash(&mut hasher);
     let dir = std::env::temp_dir().join("safelight-gpr");
@@ -558,8 +560,8 @@ fn decode_raster(path: &Path) -> Result<Decoded> {
     // sniff content, not extension: .insp stills are dual-lens JPEGs and
     // image::open's format guess rejects unknown extensions outright
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let img = image::load_from_memory(&bytes)
-        .with_context(|| format!("decode {}", path.display()))?;
+    let img =
+        image::load_from_memory(&bytes).with_context(|| format!("decode {}", path.display()))?;
     // keep 16-bit sources at full depth (to_rgba16 expands 8-bit inputs
     // identically to the old (v<<8)|v path)
     let rgba16 = img.to_rgba16();

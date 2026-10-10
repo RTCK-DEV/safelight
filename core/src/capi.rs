@@ -29,8 +29,7 @@ pub struct SlHistogram {
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
 fn set_err(e: &anyhow::Error) {
-    *LAST_ERROR.lock().unwrap() =
-        Some(CString::new(e.to_string()).unwrap_or_default());
+    *LAST_ERROR.lock().unwrap() = Some(CString::new(e.to_string()).unwrap_or_default());
 }
 
 fn cstr(p: *const c_char) -> String {
@@ -120,7 +119,10 @@ pub unsafe extern "C" fn safelight_free_image(img: SlImage) {
 
 /// returns JSON array of assets
 #[no_mangle]
-pub unsafe extern "C" fn safelight_scan_folder(e: *mut c_void, folder: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_scan_folder(
+    e: *mut c_void,
+    folder: *const c_char,
+) -> *mut c_char {
     let Some(eng) = engine(e) else {
         return std::ptr::null_mut();
     };
@@ -298,8 +300,7 @@ pub unsafe extern "C" fn safelight_merge(
             height: 0,
         };
     };
-    let paths: Vec<String> =
-        serde_json::from_str(&cstr(paths_json)).unwrap_or_default();
+    let paths: Vec<String> = serde_json::from_str(&cstr(paths_json)).unwrap_or_default();
     let pvec: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
     match eng.merge(&pvec, &cstr(mode)) {
         Ok(img) => into_raw_image(img),
@@ -473,7 +474,10 @@ pub unsafe extern "C" fn safelight_library(e: *mut c_void, cmd_json: *const c_ch
 
 /// Auto-correction analysis -> JSON with suggested recipe values.
 #[no_mangle]
-pub unsafe extern "C" fn safelight_auto_analyze(e: *mut c_void, path: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn safelight_auto_analyze(
+    e: *mut c_void,
+    path: *const c_char,
+) -> *mut c_char {
     let eng = &*(e as *const Engine);
     match eng.auto_analyze(Path::new(&cstr(path))) {
         Ok(r) => match serde_json::to_string(&r) {

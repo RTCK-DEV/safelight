@@ -65,7 +65,11 @@ impl HsMap {
 
     /// trilinear sample: (hue 0..1 cyclic, sat 0..1, val 0..1) -> [dH(deg), sS, vS]
     fn lookup(&self, h: f32, s: f32, v: f32) -> [f32; 3] {
-        let (hd, sd, vd) = (self.dims[0] as usize, self.dims[1] as usize, self.dims[2] as usize);
+        let (hd, sd, vd) = (
+            self.dims[0] as usize,
+            self.dims[1] as usize,
+            self.dims[2] as usize,
+        );
         if self.data.is_empty() || hd == 0 || sd == 0 || vd == 0 {
             return [0.0, 1.0, 1.0];
         }
@@ -82,9 +86,7 @@ impl HsMap {
         let v0 = vf.floor() as usize;
         let v1 = (v0 + 1).min(vd - 1);
         let vt = vf - v0 as f32;
-        let at = |h: usize, s: usize, v: usize| -> [f32; 3] {
-            self.data[(h * sd + s) * vd + v]
-        };
+        let at = |h: usize, s: usize, v: usize| -> [f32; 3] { self.data[(h * sd + s) * vd + v] };
         let mut out = [0.0f32; 3];
         for c in 0..3 {
             // hue shift interpolates with wraparound-aware shortest path
@@ -312,11 +314,7 @@ fn mat3(v: Option<Vec<f32>>) -> Option<Mat3> {
     if v.len() < 9 {
         return None;
     }
-    Some([
-        [v[0], v[1], v[2]],
-        [v[3], v[4], v[5]],
-        [v[6], v[7], v[8]],
-    ])
+    Some([[v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]]])
 }
 
 // DNG tag ids — two numberings exist: modern DNG 1.4 and the older
@@ -365,8 +363,14 @@ impl DcpProfile {
         p.cam_calib1 = mat3(t.num_list(T_CALIB1));
         p.cam_calib2 = mat3(t.num_list(T_CALIB2));
         p.analog_balance = mat3(t.num_list(T_ANALOG));
-        p.illuminant1 = t.u32_tag(T_ILLUM1).and_then(|v| v.first().copied()).unwrap_or(0) as u16;
-        p.illuminant2 = t.u32_tag(T_ILLUM2).and_then(|v| v.first().copied()).unwrap_or(0) as u16;
+        p.illuminant1 = t
+            .u32_tag(T_ILLUM1)
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0) as u16;
+        p.illuminant2 = t
+            .u32_tag(T_ILLUM2)
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0) as u16;
         p.baseline_exposure = t
             .num_list(T_BASEEXP)
             .and_then(|v| v.first().copied())
@@ -423,7 +427,11 @@ impl DcpProfile {
         }
         // ProfileToneCurve (0xC6FE): only when it's numeric — old files use
         // that slot for copyright ASCII. FLOAT pairs or rational pairs.
-        if t.tags.get(&0xC6FE).map(|(ty, _, _)| *ty != 2).unwrap_or(false) {
+        if t.tags
+            .get(&0xC6FE)
+            .map(|(ty, _, _)| *ty != 2)
+            .unwrap_or(false)
+        {
             if let Some(vals) = t.num_list(0xC6FE) {
                 for c in vals.chunks_exact(2) {
                     p.tone_curve.push((c[0], c[1]));
@@ -444,8 +452,12 @@ impl DcpProfile {
         if self.color_matrix2.is_none() || self.illuminant1 == self.illuminant2 {
             return 0.0;
         }
-        let Some(cm1) = self.color_matrix1 else { return 0.0 };
-        let Some(cm2) = self.color_matrix2 else { return 0.0 };
+        let Some(cm1) = self.color_matrix1 else {
+            return 0.0;
+        };
+        let Some(cm2) = self.color_matrix2 else {
+            return 0.0;
+        };
         // estimate CCT: map cam neutral -> XYZ via inverse of the interpolated
         // ColorMatrix (XYZ->cam), iterate the weight twice to converge.
         let t1 = illum_cct(self.illuminant1);
@@ -493,7 +505,11 @@ impl DcpProfile {
                     _ => return None,
                 };
                 let inv = invert(cm)?;
-                let illum = if w > 0.5 { self.illuminant2 } else { self.illuminant1 };
+                let illum = if w > 0.5 {
+                    self.illuminant2
+                } else {
+                    self.illuminant1
+                };
                 let src = illum_xy(illum).unwrap_or(D65_XY);
                 let adapt = bradford(src, D50_XY);
                 Some(mat_mul(adapt, inv))
@@ -632,26 +648,26 @@ pub const XYZ_TO_SRGB: Mat3 = [
 /// DNG calibration illuminant -> approximate CCT (kelvin)
 fn illum_cct(code: u16) -> f32 {
     match code {
-        1 => 5500.0,   // daylight (old spec)
-        3 => 3200.0,   // tungsten
-        4 => 3400.0,   // warm fluorescent? -> flash per DNG: 4 = flash 5500
-        9 => 5500.0,   // fine weather
-        10 => 6500.0,  // flash? DNG: 10=cloudy 6500
-        11 => 7500.0,  // shade
-        12 => 5000.0,  // D50? daylight fluorescent
-        14 => 3000.0,  // cool white fluorescent ~4100 actually; approx
-        15 => 6500.0,  // white fluorescent? approx
-        16 => 3200.0,  // warm white fluorescent ~3000
-        17 => 2856.0,  // standard light A
-        18 => 2856.0,  // standard light B (rare)
-        19 => 2856.0,  // standard light C (rare) ~6774 actually; seldom used
-        20 => 5500.0,  // D55
-        21 => 6504.0,  // D65
-        22 => 7500.0,  // D75
-        23 => 5003.0,  // D50
-        24 => 5700.0,  // ISO studio tungsten -> actually 3200
-        26 => 5500.0,  // ISO speedlight
-        30 => 4000.0,  // LED-ish approximations
+        1 => 5500.0,  // daylight (old spec)
+        3 => 3200.0,  // tungsten
+        4 => 3400.0,  // warm fluorescent? -> flash per DNG: 4 = flash 5500
+        9 => 5500.0,  // fine weather
+        10 => 6500.0, // flash? DNG: 10=cloudy 6500
+        11 => 7500.0, // shade
+        12 => 5000.0, // D50? daylight fluorescent
+        14 => 3000.0, // cool white fluorescent ~4100 actually; approx
+        15 => 6500.0, // white fluorescent? approx
+        16 => 3200.0, // warm white fluorescent ~3000
+        17 => 2856.0, // standard light A
+        18 => 2856.0, // standard light B (rare)
+        19 => 2856.0, // standard light C (rare) ~6774 actually; seldom used
+        20 => 5500.0, // D55
+        21 => 6504.0, // D65
+        22 => 7500.0, // D75
+        23 => 5003.0, // D50
+        24 => 5700.0, // ISO studio tungsten -> actually 3200
+        26 => 5500.0, // ISO speedlight
+        30 => 4000.0, // LED-ish approximations
         _ => 5500.0,
     }
 }
@@ -662,9 +678,9 @@ fn illum_xy(code: u16) -> Option<[f32; 2]> {
         17 | 18 => [0.44757, 0.40745], // A
         21 => D65_XY,
         23 => D50_XY,
-        20 => [0.33242, 0.34743],      // D55
-        22 => [0.29902, 0.31485],      // D75
-        3 => [0.423, 0.399],           // tungsten ~3200K
+        20 => [0.33242, 0.34743], // D55
+        22 => [0.29902, 0.31485], // D75
+        3 => [0.423, 0.399],      // tungsten ~3200K
         _ => return None,
     })
 }
