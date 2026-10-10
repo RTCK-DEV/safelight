@@ -234,6 +234,7 @@ struct Uni {
 // AI-denoised base cache: [0]=w, [1]=h, then 2 u32 per px (r|g<<16, b), sRGB16
 @group(0) @binding(11) var<storage, read> denbuf: array<u32>;
 @group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
+@group(0) @binding(16) var<storage, read_write> skybuf: array<u32>;
 @group(0) @binding(13) var<storage, read> suni: array<Uni>;
 // edge-aware brush seeds: [r,g,b,tol] per stroke, 64 slots per param block
 // (base + one per serial stage), written by seed_main.
@@ -849,6 +850,31 @@ fn subj_at(ix: i32, iy: i32) -> f32 {
     let word = subjbuf[2u + idx / 2u];
     let v = select(word & 0xffffu, word >> 16u, (idx & 1u) != 0u);
     return f32(v) / 65535.0;
+}
+
+// heuristic sky matte (LR sky AI masks) — same packed u16 layout as
+// subjbuf, written by skymat_main at frame resolution.
+fn sky_at(ix: i32, iy: i32) -> f32 {
+    let w = i32(skybuf[0]);
+    let h = i32(skybuf[1]);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = skybuf[2u + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn sky_bil(nx: f32, ny: f32) -> f32 {
+    let fx = nx * f32(skybuf[0]) - 0.5;
+    let fy = ny * f32(skybuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(sky_at(x0, y0), sky_at(x0 + 1, y0), tx);
+    let b = mix(sky_at(x0, y0 + 1), sky_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
 }
 
 // bilinear sample of the subject matte at a normalized position
@@ -1582,6 +1608,58 @@ fn seed_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     seedsb[k * 64u + si] = vec4<f32>(c, e1.w);
 }
 
+// heuristic sky matte (LR sky AI masks): one thread writes one packed
+// u32 (two matte texels). The matte is capped at 384px and blurred —
+// two 3x3 box passes = one 5x5 triangular filter, evaluated directly
+// so CPU and GPU mattes match. Mirrors sky_matte() in develop.rs.
+@compute @workgroup_size(256)
+fn skymat_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
+    let i = flat_index(gid, num);
+    let w = pg.g2.x;
+    let h = pg.g2.y;
+    let mw = min(w, 384u);
+    let mh = min(h, 384u);
+    let np = mw * mh;
+    if (i * 2u >= np) { return; }
+    if (i == 0u) { skybuf[0] = mw; skybuf[1] = mh; }
+    var packed = 0u;
+    for (var k = 0u; k < 2u; k = k + 1u) {
+        let px = i * 2u + k;
+        if (px < np) {
+            let mx = i32(px % mw);
+            let my = i32(px / mw);
+            var acc = 0.0;
+            var wsum = 0.0;
+            for (var dy = -2; dy <= 2; dy = dy + 1) {
+                for (var dx = -2; dx <= 2; dx = dx + 1) {
+                    let nx2 = mx + dx;
+                    let ny2 = my + dy;
+                    if (nx2 < 0 || ny2 < 0 || nx2 >= i32(mw) || ny2 >= i32(mh)) {
+                        continue;
+                    }
+                    let sw = f32((3 - abs(dx)) * (3 - abs(dy)));
+                    let sx = min(u32((f32(nx2) + 0.5) / f32(mw) * f32(w)), w - 1u);
+                    let sy = min(u32((f32(ny2) + 0.5) / f32(mh) * f32(h)), h - 1u);
+                    let c = io_a[sy * w + sx].xyz;
+                    let hsv = rgb_to_hsv(c);
+                    var dh = abs(hsv.x * 360.0 - 217.5);
+                    if (dh > 180.0) { dh = 360.0 - dh; }
+                    let hg = 1.0 - sstep(37.5, 60.0, dh);
+                    let sg = max(sstep(0.08, 0.30, hsv.y),
+                                 sstep(0.55, 0.8, hsv.z) * (1.0 - sstep(0.06, 0.18, hsv.y)) * 0.6);
+                    let lg = sstep(0.12, 0.45, hsv.z);
+                    let vert = 0.35 + 0.65 * (1.0 - f32(ny2) / f32(mh));
+                    acc = acc + clamp(hg * sg * lg * vert, 0.0, 1.0) * sw;
+                    wsum = wsum + sw;
+                }
+            }
+            packed = packed | (u32(acc / wsum * 65535.0) << (16u * k));
+        }
+    }
+    skybuf[2u + i] = packed;
+}
+
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
 // shared power-window mask eval (used by local_ops and the stage key).
 fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
@@ -1591,6 +1669,8 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
     var mask = 0.0;
     if ((kb & 16u) != 0u) {
         mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 32u) != 0u) {
+        mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
     } else if ((kb & 4u) != 0u) {
         let l = luma(col);
         let lf = max(w0.z, 0.005);
@@ -1935,6 +2015,7 @@ pub struct Gpu {
     soft: Pipe,
     glow: Pipe,
     sharpen: Pipe,
+    skymat: Pipe,
     finish: Pipe,
     seed: Pipe,
 }
@@ -1994,14 +2075,14 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..16)
+                entries: &(0..17)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: match i {
                                 0 => wgpu::BufferBindingType::Uniform,
-                                3 | 4 | 5 | 7 | 14 => {
+                                3 | 4 | 5 | 7 | 14 | 16 => {
                                     wgpu::BufferBindingType::Storage { read_only: false }
                                 }
                                 _ => wgpu::BufferBindingType::Storage { read_only: true },
@@ -2041,6 +2122,7 @@ impl Gpu {
             soft: mk("soft_main"),
             glow: mk("glow_main"),
             sharpen: mk("sharpen_main"),
+            skymat: mk("skymat_main"),
             finish: mk("finish_main"),
             seed: mk("seed_main"),
             device,
@@ -2508,11 +2590,18 @@ impl Gpu {
             _ => vec![0u32, 0u32],
         };
         let subj_b = mk_buf("subjbuf", bytemuck::cast_slice(&subj32), storage_in);
+        // heuristic sky matte buffer ([mw,mh] header + packed u16 pairs);
+        // header stays [0,0] unless skymat_main fills it.
+        let sky_b = mk_buf(
+            "skybuf",
+            &vec![0u8; (2 + (384 * 384 + 1) / 2) * 4],
+            storage_in,
+        );
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
 
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> =
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
                     .iter()
                     .map(|&i| wgpu::BindGroupEntry {
                         binding: i,
@@ -2532,7 +2621,8 @@ impl Gpu {
                             12 => subj_b.as_entire_binding(),
                             13 => suni_b.as_entire_binding(),
                             14 => seeds_b.as_entire_binding(),
-                            _ => dng_b.as_entire_binding(),
+                            15 => dng_b.as_entire_binding(),
+                            _ => sky_b.as_entire_binding(),
                         },
                     })
                     .collect();
@@ -2766,6 +2856,23 @@ impl Gpu {
         if p.sharpen > 0.0 || p.clarity != 0.0 {
             run(&mut enc, &self.sharpen, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
+        // heuristic sky matte for LR "sky" AI-mask windows
+        let needs_sky = p
+            .wins
+            .iter()
+            .take(p.n_wins as usize)
+            .any(|w| (w[0] as i32) & 32 != 0)
+            || p.stages.iter().any(|(sp, _, _)| {
+                sp.wins
+                    .iter()
+                    .take(sp.n_wins as usize)
+                    .any(|w| (w[0] as i32) & 32 != 0)
+            });
+        if needs_sky {
+            let mw = vw.min(384);
+            let mh = vh.min(384);
+            run(&mut enc, &self.skymat, ((mw * mh + 1) / 2) as u64);
         }
         // edge-aware brush seeds: sample the finished linear image at each
         // flagged stroke's first dab before the per-pixel finish pass

@@ -925,12 +925,14 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         };
         let lum = w.kind == "lum";
         let subj = w.kind == "subject";
+        let skyw = w.kind == "sky";
         wins[i] = [
             (if grad { 1.0 } else { 0.0 })
                 + (if w.invert { 2.0 } else { 0.0 })
                 + (if lum { 4.0 } else { 0.0 })
                 + (if w.link_q { 8.0 } else { 0.0 })
-                + (if subj { 16.0 } else { 0.0 }),
+                + (if subj { 16.0 } else { 0.0 })
+                + (if skyw { 32.0 } else { 0.0 }),
             if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
             if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
             if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
@@ -3071,6 +3073,25 @@ fn finish_linear(
     // pixel loop uses). Stages share the base mapping (crop unified).
     fill_brush_seeds(&mut pc, &lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos);
     let p = &pc;
+    // heuristic sky matte for LR "sky" AI masks (MaskSubType=2):
+    // computed once on the filtered linear image.
+    let sky_mat;
+    let sky: Option<&Matte> = if p
+        .wins
+        .iter()
+        .take(p.n_wins as usize)
+        .any(|w| (w[0] as i32) & 32 != 0)
+        || p.stages.iter().any(|(sp, _, _)| {
+            sp.wins
+                .iter()
+                .take(sp.n_wins as usize)
+                .any(|w| (w[0] as i32) & 32 != 0)
+        }) {
+        sky_mat = sky_matte(&lin, w, h);
+        Some(&sky_mat)
+    } else {
+        None
+    };
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
@@ -3097,7 +3118,7 @@ fn finish_linear(
             };
             let mut adj = adjust(col, p);
             let aspect = dw as f32 / dh as f32;
-            local_ops(&mut adj, col, p, nx, ny, aspect, subj);
+            local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky);
             // serial correction stages (DaVinci serial nodes): full adjust +
             // local ops on the sampled colour, blended by the stage key.
             for (sp, sop, sinv) in p.stages.iter() {
@@ -3108,7 +3129,7 @@ fn finish_linear(
                 if sp.n_wins > 0 {
                     let mut wu = 0.0f32;
                     for win in sp.wins.iter().take(sp.n_wins as usize) {
-                        let mut m2 = window_mask(win, nx, ny, col, subj) * win[10];
+                        let mut m2 = window_mask(win, nx, ny, col, subj, sky) * win[10];
                         if (win[0] as i32) & 8 != 0 {
                             m2 *= qual_mask(col, sp);
                         }
@@ -3124,7 +3145,7 @@ fn finish_linear(
                     continue;
                 }
                 let mut a2 = adjust(col, sp);
-                local_ops(&mut a2, col, sp, nx, ny, aspect, subj);
+                local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;
                 }
@@ -3343,6 +3364,7 @@ fn local_ops(
     ny: f32,
     aspect: f32,
     subj: Option<&Matte>,
+    sky: Option<&Matte>,
 ) {
     // dodge/burn radial lights (dst-normalized coords)
     for l in p.lights.iter().take(p.n_lights as usize) {
@@ -3354,7 +3376,7 @@ fn local_ops(
     }
     // power windows: local ev/sat/temp inside the mask
     for win in p.wins.iter().take(p.n_wins as usize) {
-        let mut mask = window_mask(win, nx, ny, col, subj) * win[10];
+        let mut mask = window_mask(win, nx, ny, col, subj, sky) * win[10];
         // link_q: gate the window by the HSL qualifier matte
         if (win[0] as i32) & 8 != 0 {
             mask *= qual_mask(col, p);
@@ -3505,9 +3527,17 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
 }
 
 /// power-window mask value at dst-normalized (nx,ny)
-/// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q + 16=subject, a,b,c,d, rot, soft, ev, sat, temp, strength]
+/// packed [kind(0/1) + 2=invert + 4=lum + 8=link_q + 16=subject + 32=sky,
+/// a,b,c,d, rot, soft, ev, sat, temp, strength]
 /// `col` = the sampled pre-adjust colour (lum range + qualifier gating need it)
-fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>) -> f32 {
+fn window_mask(
+    w: &[f32],
+    nx: f32,
+    ny: f32,
+    col: [f32; 3],
+    subj: Option<&Matte>,
+    sky: Option<&Matte>,
+) -> f32 {
     let base = w[0] as i32;
     let kind = base % 2;
     let inv = base & 2 != 0;
@@ -3515,6 +3545,9 @@ fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>)
     let mask = if base & 16 != 0 {
         // AI subject matte: bilinear sample in normalized dst coords
         subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if base & 32 != 0 {
+        // heuristic sky matte (LR sky AI masks)
+        sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
     } else if lum {
         // luminance range: p=[lo,hi,lo_feather,hi_feather] over display luma
         let l = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
@@ -3557,6 +3590,63 @@ fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>)
         1.0 - mask
     } else {
         mask
+    }
+}
+
+/// heuristic sky matte for LR "sky" AI masks (MaskSubType=2): a product
+/// of the blue-cyan hue gate, saturation, brightness and an upward
+/// vertical prior, sampled at reduced resolution then box-blurred.
+/// Without it, sky-masked corrections would silently apply to nothing.
+fn sky_matte(lin: &[[f32; 3]], w: usize, h: usize) -> Matte {
+    let mw = w.min(384).max(2);
+    let mh = h.min(384).max(2);
+    let mut d = vec![0.0f32; mw * mh];
+    for my in 0..mh {
+        for mx in 0..mw {
+            let sx = (((mx as f32 + 0.5) / mw as f32) * w as f32) as usize % w;
+            let sy = (((my as f32 + 0.5) / mh as f32) * h as f32) as usize % h;
+            let c = lin[sy * w + sx];
+            let (hh, s, v) = rgb_to_hsv(c);
+            let deg = hh * 360.0;
+            let mut dh = (deg - 217.5).abs();
+            if dh > 180.0 {
+                dh = 360.0 - dh;
+            }
+            let hg = 1.0 - sstep(37.5, 60.0, dh);
+            // chromatic blue OR bright near-neutral (overcast sky)
+            let sg =
+                sstep(0.08, 0.30, s).max(sstep(0.55, 0.8, v) * (1.0 - sstep(0.06, 0.18, s)) * 0.6);
+            let lg = sstep(0.12, 0.45, v);
+            let vert = 0.35 + 0.65 * (1.0 - my as f32 / mh as f32);
+            d[my * mw + mx] = (hg * sg * lg * vert).clamp(0.0, 1.0);
+        }
+    }
+    // two light box-blur passes so the matte isn't blocky
+    for _ in 0..2 {
+        let mut b = vec![0.0f32; mw * mh];
+        for y in 0..mh {
+            for x in 0..mw {
+                let mut s = 0.0;
+                let mut n = 0.0;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && ny >= 0 && nx < mw as i32 && ny < mh as i32 {
+                            s += d[ny as usize * mw + nx as usize];
+                            n += 1.0;
+                        }
+                    }
+                }
+                b[y * mw + x] = s / n;
+            }
+        }
+        d = b;
+    }
+    Matte {
+        w: mw,
+        h: mh,
+        data: d.iter().map(|&v| (v * 65535.0) as u16).collect(),
     }
 }
 

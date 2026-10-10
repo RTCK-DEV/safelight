@@ -870,11 +870,13 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 ));
             }
             // AI masks (MaskGroupBasedCorrections): MaskSubType 1 = AI
-            // subject → our subject matte window. (2 = sky: no matte.)
+            // subject matte, 2 = sky (heuristic matte)
             for mb in mask_blocks(&item, "Image") {
                 let sub = field(&mb, "crs:MaskSubType").unwrap_or(0.0) as i32;
                 if sub == 1 {
                     r.windows.push(win("subject", [0.0; 6], 0.0, false));
+                } else if sub == 2 {
+                    r.windows.push(win("sky", [0.0; 6], 0.0, false));
                 }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
