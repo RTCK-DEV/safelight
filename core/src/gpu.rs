@@ -93,7 +93,7 @@ struct Uni {
     /// defringe green band: amount, lo_deg, hi_deg, 0
     defr_gr: [f32; 4],
     /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
-    wins: [[f32; 4]; 20],
+    wins: [[f32; 4]; 24],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
@@ -116,7 +116,7 @@ struct Uni {
     /// each (params / seg range / normalized-space bbox)
     blayers: [[f32; 4]; 4],
     /// brush layer extras (contrast,clarity,dehaze,tint,hi,sh,wh,bl)
-    blayers2: [[f32; 4]; 8],
+    blayers2: [[f32; 4]; 12],
     bmisc: [f32; 4],
     bstr: [[f32; 4]; 192],
     /// serial stages: [n_stages, 0, 0, 0]
@@ -141,6 +141,8 @@ struct Uni {
     cal0: [f32; 4],
     cal1: [f32; 4],
     cal2: [f32; 4],
+    /// LR Texture (global): fine-scale midtone contrast, -1..1
+    tex0: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -192,7 +194,7 @@ struct Uni {
     // defringe bands: amount, lo_deg, hi_deg, unused
     defr_pu: vec4<f32>,
     defr_gr: vec4<f32>,
-    wins: array<vec4<f32>, 20>,
+    wins: array<vec4<f32>, 24>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
     ze0: vec4<f32>,
@@ -206,7 +208,7 @@ struct Uni {
     lens3: vec4<f32>,
     blayers: array<vec4<f32>, 4>,
     // brush layer extras (contrast,clarity,dehaze,tint,hi,sh,wh,bl)
-    blayers2: array<vec4<f32>, 8>,
+    blayers2: array<vec4<f32>, 12>,
     bmisc: vec4<f32>,
     bstr: array<vec4<f32>, 192>,
     // stg0 = [n_stages,0,0,0]; sop0 = per-stage opacity; sinv0 = key invert
@@ -228,6 +230,8 @@ struct Uni {
     cal0: vec4<f32>,
     cal1: vec4<f32>,
     cal2: vec4<f32>,
+    // LR Texture (global): fine-scale midtone contrast at tex0.x
+    tex0: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1252,10 +1256,12 @@ fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
         let ms = 1.0 - pg.csn.z * (1.0 - sstep(0.006, 0.05, edge));
         out = src + pg.a3.x * 0.8 * d * ms;
     }
-    if (pg.a3.z != 0.0) {
+    if (pg.a3.z != 0.0 || pg.tex0.x != 0.0) {
         let lum = clamp(luma(src), 0.0, 1.0);
         let mid = 4.0 * lum * (1.0 - lum);
         out = out + pg.a3.z * 0.6 * mid * (src - box_at(i % w, i / w, 2));
+        // LR Texture: finer (3x3) scale, lower gain — mirrors develop.rs
+        out = out + pg.tex0.x * 0.45 * mid * (src - box_at(i % w, i / w, 1));
     }
     io_b[i] = vec4<f32>(out, 0.0);
 }
@@ -1874,18 +1880,19 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
     }
     let nw = u32(pg.misc2.x);
     for (var wi = 0u; wi < nw; wi = wi + 1u) {
-        let w1 = pg.wins[wi * 5u + 1u];
-        let w2 = pg.wins[wi * 5u + 2u];
-        let mask = win_mask(pg.wins[wi * 5u], w1, w2, nx, ny, col);
+        let w1 = pg.wins[wi * 6u + 1u];
+        let w2 = pg.wins[wi * 6u + 2u];
+        let mask = win_mask(pg.wins[wi * 6u], w1, w2, nx, ny, col);
         if (mask > 0.001) {
             let evg = pow(2.0, w1.z * mask);
             let l = luma(adj);
             adj = adj * evg;
             adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + w1.w * mask);
             adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
-            let ex = pg.wins[wi * 5u + 3u];
-            let ex2 = pg.wins[wi * 5u + 4u];
-            adj = local_extra(adj, mask, ex, ex2);
+            let ex = pg.wins[wi * 6u + 3u];
+            let ex2 = pg.wins[wi * 6u + 4u];
+            let ex3 = pg.wins[wi * 6u + 5u];
+            adj = local_extra(adj, mask, ex, ex2, ex3.x);
         }
     }
     let n_str = u32(pg.bmisc.x);
@@ -1945,9 +1952,10 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             adj = adj * evg;
             adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + lp.y * bmask);
             adj = adj + vec3<f32>(lp.z * bmask * 0.08, 0.0, -lp.z * bmask * 0.08);
-            let ex = pg.blayers2[li * 2u];
-            let ex2 = pg.blayers2[li * 2u + 1u];
-            adj = local_extra(adj, bmask, ex, ex2);
+            let ex = pg.blayers2[li * 3u];
+            let ex2 = pg.blayers2[li * 3u + 1u];
+            let ex3 = pg.blayers2[li * 3u + 2u];
+            adj = local_extra(adj, bmask, ex, ex2, ex3.x);
         }
     }
     return adj;
@@ -1956,15 +1964,15 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
 // extended LR local adjustments inside a window/brush mask —
 // mirrors local_extra() in develop.rs. ex = contrast/clarity/dehaze/
 // tint, ex2 = highlights/shadows/whites/blacks tone-band offsets.
-fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>) -> vec3<f32> {
+fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex: f32) -> vec3<f32> {
     var adj = adj_in;
     if (ex.w != 0.0) {
         adj = adj + vec3<f32>(0.0, -ex.w * mask * 0.06, 0.0);
     }
-    if (ex.x != 0.0 || ex.y != 0.0 || ex.z != 0.0 || ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0) {
+    if (ex.x != 0.0 || ex.y != 0.0 || ex.z != 0.0 || ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0 || tex != 0.0) {
         let l = clamp(luma(adj), 0.0, 1.0);
         let mid = 4.0 * l * (1.0 - l);
-        let k = (ex.x + ex.y * mid * 0.8 + ex.z * 0.2) * mask * 0.9;
+        let k = (ex.x + ex.y * mid * 0.8 + tex * mid * 0.6 + ex.z * 0.2) * mask * 0.9;
         adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + k);
         if (ex.z != 0.0) {
             let f = ex.z * mask;
@@ -2089,7 +2097,7 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         if (snw > 0u) {
             var wu = 0.0;
             for (var wi = 0u; wi < snw; wi = wi + 1u) {
-                wu = max(wu, win_mask(pg.wins[wi * 5u], pg.wins[wi * 5u + 1u], pg.wins[wi * 5u + 2u], nx, ny, col));
+                wu = max(wu, win_mask(pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny, col));
             }
             key = key * wu;
         }
@@ -2590,13 +2598,14 @@ impl Gpu {
             ],
             flare: p.flare,
             wins: {
-                let mut a = [[0.0f32; 4]; 20];
+                let mut a = [[0.0f32; 4]; 24];
                 for (i, w) in p.wins.iter().take(4).enumerate() {
-                    a[i * 5] = [w[1], w[2], w[3], w[4]];
-                    a[i * 5 + 1] = [w[5], w[6], w[7], w[8]];
-                    a[i * 5 + 2] = [w[9], w[0], w[10], w[11]];
-                    a[i * 5 + 3] = [w[12], w[13], w[14], w[15]];
-                    a[i * 5 + 4] = [w[16], w[17], w[18], w[19]];
+                    a[i * 6] = [w[1], w[2], w[3], w[4]];
+                    a[i * 6 + 1] = [w[5], w[6], w[7], w[8]];
+                    a[i * 6 + 2] = [w[9], w[0], w[10], w[11]];
+                    a[i * 6 + 3] = [w[12], w[13], w[14], w[15]];
+                    a[i * 6 + 4] = [w[16], w[17], w[18], w[19]];
+                    a[i * 6 + 5] = [w[20], 0.0, 0.0, 0.0];
                 }
                 a
             },
@@ -2660,10 +2669,11 @@ impl Gpu {
             ],
             blayers: p.brush_layers,
             blayers2: {
-                let mut a = [[0.0f32; 4]; 8];
+                let mut a = [[0.0f32; 4]; 12];
                 for (i, e) in p.brush_layers2.iter().take(4).enumerate() {
-                    a[i * 2] = [e[0], e[1], e[2], e[3]];
-                    a[i * 2 + 1] = [e[4], e[5], e[6], e[7]];
+                    a[i * 3] = [e[0], e[1], e[2], e[3]];
+                    a[i * 3 + 1] = [e[4], e[5], e[6], e[7]];
+                    a[i * 3 + 2] = [e[8], 0.0, 0.0, 0.0];
                 }
                 a
             },
@@ -2699,6 +2709,7 @@ impl Gpu {
             cal0: [p.calib[0], p.calib[1], p.calib[2], p.calib[9]],
             cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
             cal2: [p.calib[6], p.calib[7], p.calib[8], 0.0],
+            tex0: [p.texture, 0.0, 0.0, 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
@@ -3018,7 +3029,7 @@ impl Gpu {
             run(&mut enc, &self.glow, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
-        if p.sharpen > 0.0 || p.clarity != 0.0 {
+        if p.sharpen > 0.0 || p.clarity != 0.0 || p.texture != 0.0 {
             run(&mut enc, &self.sharpen, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }

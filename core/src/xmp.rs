@@ -100,9 +100,10 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         lr(r.blacks, 100.0)
     ));
     a.push_str(&format!(
-        "   crs:Clarity2012=\"{}\" crs:Dehaze=\"{}\" crs:Texture=\"0\"\n",
+        "   crs:Clarity2012=\"{}\" crs:Dehaze=\"{}\" crs:Texture=\"{}\"\n",
         lr(r.clarity, 100.0),
-        lr(r.dehaze, 100.0)
+        lr(r.dehaze, 100.0),
+        lr(r.texture, 100.0)
     ));
     a.push_str(&format!(
         "   crs:Vibrance=\"{}\" crs:Saturation=\"{}\"\n",
@@ -221,6 +222,7 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             (w.sh, "crs:LocalShadows2012"),
             (w.wh, "crs:LocalWhites2012"),
             (w.bl, "crs:LocalBlacks2012"),
+            (w.texture, "crs:LocalTexture2012"),
         ] {
             if v != 0.0 {
                 s += &format!(" {name}=\"{:.0}\"", v * 100.0);
@@ -452,9 +454,7 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
             r.clarity = v / 100.0;
         }
         if let Some(v) = attr(&body, "crs:Texture") {
-            // LR texture ~ clarity at a finer scale; contribute a fraction
-            // of it to clarity so LR-authored files still read sensibly.
-            r.clarity = (r.clarity + v / 100.0 * 0.5).clamp(-1.0, 1.0);
+            r.texture = v / 100.0;
         }
         if let Some(v) = attr(&body, "crs:Dehaze") {
             r.dehaze = v / 100.0;
@@ -868,13 +868,14 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             let temp = loc(&["crs:LocalTemperature"]);
             // extended LR local adjustments (contrast/clarity/dehaze/tint)
             let con = loc(&["crs:LocalContrast2012", "crs:LocalContrast"]);
-            // texture/sharpness/noise have no dedicated channel: fold them
-            // into the midtone-contrast channel (clarity) as an approximation
+            // sharpness/noise have no dedicated channel: fold them into the
+            // midtone-contrast channel (clarity) as an approximation; texture
+            // maps to its own channel
             let cla = (loc(&["crs:LocalClarity2012", "crs:LocalClarity"])
-                + loc(&["crs:LocalTexture"]) * 0.6
                 + loc(&["crs:LocalSharpness"]) * 0.5
                 - loc(&["crs:LocalLuminanceNoise"]) * 0.6)
                 .clamp(-1.0, 1.0);
+            let tex = loc(&["crs:LocalTexture2012", "crs:LocalTexture"]);
             let deh = loc(&["crs:LocalDehaze"]);
             let tin = loc(&["crs:LocalTint"]);
             let hi = loc(&["crs:LocalHighlights2012", "crs:LocalHighlights"]);
@@ -918,6 +919,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 sh,
                 wh,
                 bl,
+                texture: tex,
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -1038,6 +1040,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     sh,
                     wh,
                     bl,
+                    texture: tex,
                     strokes,
                 });
             }
@@ -1207,6 +1210,7 @@ mod tests {
             sh: 0.0,
             wh: 0.0,
             bl: 0.0,
+            texture: 0.0,
         }];
         sc.rating = 4;
         sc.label = "Red".into();

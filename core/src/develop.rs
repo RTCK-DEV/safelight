@@ -45,6 +45,8 @@ pub struct Params {
     pub noise_luma: f32,
     pub rotation_deg: f32,
     pub clarity: f32,
+    /// LR Texture: fine-scale midtone detail contrast, -1..1
+    pub texture: f32,
     pub vignette: f32,
     /// post-crop vignette shape [mid, round, feather]; mid<0 = legacy ramp
     pub vig_shape: [f32; 3],
@@ -94,7 +96,7 @@ pub struct Params {
     pub q_show: bool,
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
-    pub wins: [[f32; 20]; 4],
+    pub wins: [[f32; 24]; 4],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -102,7 +104,7 @@ pub struct Params {
     /// [seg_start, seg_count, 0, 0],
     /// [xmin, ymin, xmax, ymax] aspect-space bbox (padded by radius).
     /// Layer params (ev,sat,temp,strength) in brush_layers;
-    /// (contrast,clarity,dehaze,tint,hi,sh,wh,bl) in brush_layers2.
+    /// (contrast,clarity,dehaze,tint,hi,sh,wh,bl,texture) in brush_layers2.
     /// brush_misc = [n_strokes, dst_aspect, link_q_bits, 0].
     /// brush_seeds = per-stroke edge-aware seed colour [r,g,b,tol],
     /// parallel to strokes (tol>0 = enabled; rgb filled at render time
@@ -110,7 +112,7 @@ pub struct Params {
     pub brush_segs: Vec<[f32; 4]>,
     pub brush_strokes: Vec<[f32; 4]>,
     pub brush_layers: [[f32; 4]; 4],
-    pub brush_layers2: [[f32; 8]; 4],
+    pub brush_layers2: [[f32; 12]; 4],
     pub brush_misc: [f32; 4],
     pub brush_seeds: Vec<[f32; 4]>,
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
@@ -908,7 +910,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // window_mask runs in dst-normalized post-crop space, so translate here.
     let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
-    let mut wins = [[0.0; 20]; 4];
+    let mut wins = [[0.0; 24]; 4];
     for (i, w) in r.windows.iter().take(4).enumerate() {
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
@@ -967,6 +969,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             w.sh.clamp(-1.0, 1.0),
             w.wh.clamp(-1.0, 1.0),
             w.bl.clamp(-1.0, 1.0),
+            w.texture.clamp(-1.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
         ];
     }
 
@@ -981,7 +987,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut brush_strokes: Vec<[f32; 4]> = Vec::new();
     let mut brush_seeds: Vec<[f32; 4]> = Vec::new();
     let mut brush_layers = [[0.0f32; 4]; 4];
-    let mut brush_layers2 = [[0.0f32; 8]; 4];
+    let mut brush_layers2 = [[0.0f32; 12]; 4];
     let mut link_bits = 0.0f32;
     for (li, b) in r.brushes.iter().take(4).enumerate() {
         brush_layers[li] = [
@@ -1003,6 +1009,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             b.sh.clamp(-1.0, 1.0),
             b.wh.clamp(-1.0, 1.0),
             b.bl.clamp(-1.0, 1.0),
+            b.texture.clamp(-1.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
         ];
         if b.link_q {
             link_bits += (1u32 << li) as f32;
@@ -1116,6 +1126,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         noise_luma: r.noise_luma,
         rotation_deg: r.rotation_deg.clamp(-45.0, 45.0),
         clarity: r.clarity.clamp(-1.0, 1.0),
+        texture: r.texture.clamp(-1.0, 1.0),
         vignette: r.vignette.clamp(-1.0, 1.0),
         vig_shape: if r.vig_mid < 0.0 && r.vig_round <= -2.0 && r.vig_feather < 0.0 {
             [-1.0, 0.0, 0.0]
@@ -3114,7 +3125,7 @@ fn finish_linear(
     if pc.glow > 0.0 {
         lin = glow_lin(&lin, w, h, pc.glow);
     }
-    if pc.sharpen > 0.0 || pc.clarity != 0.0 {
+    if pc.sharpen > 0.0 || pc.clarity != 0.0 || pc.texture != 0.0 {
         lin = sharpen_clarity(
             &lin,
             w,
@@ -3124,6 +3135,7 @@ fn finish_linear(
             pc.sharp_mask,
             pc.sharp_radius,
             pc.sharp_detail,
+            pc.texture,
         );
     }
     let (_fw, _fh, cl, ct, ew, eh, dw, dh) = frame_geometry(w, h, flip, pc.crop, max_px);
@@ -3492,7 +3504,7 @@ fn local_ops(
         }
         adj[0] += win[9] * mask * 0.08;
         adj[2] -= win[9] * mask * 0.08;
-        local_extra(adj, mask, &win[12..20]);
+        local_extra(adj, mask, &win[12..21]);
     }
     // adjustment brushes: same local ev/sat/temp inside stroke masks
     let n_str = p.brush_misc[0] as usize;
@@ -3575,13 +3587,22 @@ fn local_ops(
 fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
     let (con, cla, deh, tin) = (ex[0], ex[1], ex[2], ex[3]);
     let (hi, sh, wh, bl) = (ex[4], ex[5], ex[6], ex[7]);
+    let tex = ex.get(8).copied().unwrap_or(0.0);
     if tin != 0.0 {
         adj[1] -= tin * mask * 0.06;
     }
-    if con != 0.0 || cla != 0.0 || deh != 0.0 || hi != 0.0 || sh != 0.0 || wh != 0.0 || bl != 0.0 {
+    if con != 0.0
+        || cla != 0.0
+        || deh != 0.0
+        || hi != 0.0
+        || sh != 0.0
+        || wh != 0.0
+        || bl != 0.0
+        || tex != 0.0
+    {
         let l = (0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2]).clamp(0.0, 1.0);
         let mid = 4.0 * l * (1.0 - l);
-        let k = (con + cla * mid * 0.8 + deh * 0.2) * mask * 0.9;
+        let k = (con + cla * mid * 0.8 + tex * mid * 0.6 + deh * 0.2) * mask * 0.9;
         for c in adj.iter_mut() {
             *c = l + (*c - l) * (1.0 + k);
         }
@@ -4201,6 +4222,7 @@ fn sharpen_clarity(
     sharp_mask: f32,
     sharp_radius: f32,
     sharp_detail: f32,
+    texture: f32,
 ) -> Vec<[f32; 3]> {
     let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
     let boxn = |chan: &[f32], x: usize, y: usize, rad: i32| {
@@ -4259,6 +4281,11 @@ fn sharpen_clarity(
                 }
                 if clarity != 0.0 {
                     v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));
+                }
+                // LR Texture: same midtone-weighted local contrast as clarity
+                // but at a finer (3x3) scale and lower gain
+                if texture != 0.0 {
+                    v += texture * 0.45 * mid * (lin[i][c] - boxn(&chans[c], x, y, 1));
                 }
                 out[i][c] = v;
             }
