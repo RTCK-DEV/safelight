@@ -83,6 +83,8 @@ pub struct Mosaic {
     pub pre_mul: [f32; 4],
     pub cfa: CfaPattern,
     pub info: CameraInfo,
+    /// DNG embedded lens-correction opcodes (GainMap / WarpRectilinear)
+    pub dng_ops: Option<crate::dngops::DngOps>,
 }
 
 #[derive(Debug)]
@@ -171,6 +173,18 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         // fall through: let libraw report whatever it can.
     }
     let (h, mut info) = open_raw(path)?;
+    if std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+        eprintln!(
+            "[decode] cfa_kind={} cfa={}x{} {}x{} make={} model={}",
+            info.cfa_kind,
+            info.cfa_w,
+            info.cfa_h,
+            info.raw_width,
+            info.raw_height,
+            ffi::cstr_field(&info.make),
+            ffi::cstr_field(&info.model)
+        );
+    }
     if info.cfa_kind == 0 {
         // not a mosaic raw (linear dng / rgb) - use libraw's own pipeline,
         // falling back to system codecs / embedded preview on failure
@@ -194,7 +208,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         // before the OS codec and the embedded preview.
         if std::env::var_os("SAFELIGHT_NO_HE").is_none() {
             if let Ok((bayer, bw, bh)) = crate::nef_he::decode_nef_he(path) {
-                return mosaic_decoded(&info, bayer, bw, bh);
+                return mosaic_decoded(&info, bayer, bw, bh, crate::dngops::parse(path));
             }
         }
         // other sensor compression libraw can't decode: try macOS ImageIO
@@ -222,6 +236,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         data,
         info.raw_width as usize,
         info.raw_height as usize,
+        crate::dngops::parse(path),
     )
 }
 
@@ -233,6 +248,7 @@ fn mosaic_decoded(
     data: Vec<u16>,
     raw_w: usize,
     raw_h: usize,
+    dng_ops: Option<crate::dngops::DngOps>,
 ) -> Result<Decoded> {
     let (w, hgt) = if info.width > 0 && info.height > 0 {
         (info.width as usize, info.height as usize)
@@ -275,6 +291,7 @@ fn mosaic_decoded(
         pre_mul: info.pre_mul,
         cfa,
         info: info_of(info),
+        dng_ops,
     }))
 }
 

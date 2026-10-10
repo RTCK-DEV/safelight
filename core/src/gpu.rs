@@ -219,6 +219,8 @@ struct Uni {
 // edge-aware brush seeds: [r,g,b,tol] per stroke, 64 slots per param block
 // (base + one per serial stage), written by seed_main.
 @group(0) @binding(14) var<storage, read_write> seedsb: array<vec4<f32>>;
+// DNG embedded lens-correction ops (header 32 f32, then gainmap data)
+@group(0) @binding(15) var<storage, read> dngb: array<f32>;
 // working copy of the uniform: every kernel seeds it with `pg = u`, and the
 // stage loop in finish_main swaps in suni[i] so all param reads below are
 // shared between the base grade and serial correction stages.
@@ -651,6 +653,48 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
     );
 }
 
+// DNG WarpRectilinear: per-channel radial factor f = k0 + k1r² + ... applied
+// on the corrected (display-side) normalized radius, blended by amount
+fn dng_warp(rn: f32, ch: u32, amt: f32) -> f32 {
+    if (pg.dh0.z < 0.5) { return 1.0; }
+    let b = 1u + ch * 6u;
+    let r2 = rn * rn;
+    let f = dngb[b] + r2 * (dngb[b + 1u] + r2 * (dngb[b + 2u] +
+        r2 * (dngb[b + 3u] + r2 * (dngb[b + 4u] + r2 * dngb[b + 5u]))));
+    return 1.0 + (f - 1.0) * amt;
+}
+
+// DNG GainMap: bilinear gain at an image-space source position.
+// Layout: dngb[22..32] = rows,cols,planes,plane0,nplanes,spV,spH,orgV,orgH,-
+fn dng_gain(x: f32, y: f32, ch: u32, w: f32, h: f32, amt: f32) -> f32 {
+    if (pg.dh0.w < 0.5) { return 1.0; }
+    let rows = u32(dngb[22]);
+    let cols = u32(dngb[23]);
+    if (rows < 2u || cols < 2u) { return 1.0; }
+    let plane0 = u32(dngb[25]);
+    let npl = u32(dngb[26]);
+    if (ch < plane0 || ch >= plane0 + npl) { return 1.0; }
+    let planes = u32(dngb[24]);
+    let pl = min(ch, max(planes, 1u) - 1u);
+    let v = (y + 0.5) / h;
+    let u = (x + 0.5) / w;
+    let gy = clamp((v - dngb[29]) / max(dngb[27], 1e-6), 0.0, f32(rows - 1u));
+    let gx = clamp((u - dngb[30]) / max(dngb[28], 1e-6), 0.0, f32(cols - 1u));
+    let y0 = u32(floor(gy));
+    let x0 = u32(floor(gx));
+    let y1 = min(y0 + 1u, rows - 1u);
+    let x1 = min(x0 + 1u, cols - 1u);
+    let ty = gy - f32(y0);
+    let tx = gx - f32(x0);
+    let base = 32u;
+    let g00 = dngb[base + (y0 * cols + x0) * planes + pl];
+    let g01 = dngb[base + (y0 * cols + x1) * planes + pl];
+    let g10 = dngb[base + (y1 * cols + x0) * planes + pl];
+    let g11 = dngb[base + (y1 * cols + x1) * planes + pl];
+    let g = mix(mix(g00, g01, tx), mix(g10, g11, tx), ty);
+    return 1.0 + (g - 1.0) * amt;
+}
+
 // stride-1 + lens: reconstruct cam grid into io_a
 @compute @workgroup_size(256)
 fn recon_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
@@ -682,8 +726,13 @@ fn geom_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let dy = y - cy;
     let s = vec3<f32>(g.x, g.y, g.z) * halfd / sqrt(dx * dx + dy * dy);
     var out3: vec3<f32>;
+    let amt = pg.lens3.w;
+    let rn = sqrt(dx * dx + dy * dy) / halfd;
     for (var ch = 0u; ch < 3u; ch = ch + 1u) {
-        out3[ch] = lens_bilinear(cx + dx * s[ch], cy + dy * s[ch], ch);
+        let s_ch = s[ch] * dng_warp(rn, ch, amt);
+        let px = cx + dx * s_ch;
+        let py = cy + dy * s_ch;
+        out3[ch] = lens_bilinear(px, py, ch) * dng_gain(px, py, ch, w, h, amt);
     }
     io_b[i] = vec4<f32>(out3 * g.w, 1.0);
 }
@@ -716,10 +765,15 @@ fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
             let halfd = max(sqrt(cx * cx + cy * cy), 1.0);
             let dx = x - cx;
             let dy = y - cy;
-            let sc = g.y * halfd / sqrt(dx * dx + dy * dy);
+            let rn = sqrt(dx * dx + dy * dy) / halfd;
+            let sc = g.y * halfd * dng_warp(rn, 1u, pg.lens3.w)
+                / sqrt(dx * dx + dy * dy);
             let sx = min(u32(round(cx + dx * sc)), pg.g1.x - 1u);
             let sy = min(u32(round(cy + dy * sc)), pg.g1.y - 1u);
-            cam = demosaic(sx, sy) * g.w;
+            let st = f32(pg.g1.z);
+            cam = demosaic(sx, sy) * g.w
+                * dng_gain((cx + dx * sc) * st, (cy + dy * sc) * st, 1u,
+                    w * st, h * st, pg.lens3.w);
         }
     } else {
         cam = demosaic(i % pg.g1.x, i / pg.g1.x);
@@ -1804,7 +1858,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..15)
+                entries: &(0..16)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -2010,19 +2064,58 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        // lens profile correction: same lookup as the CPU path
+        // lens profile correction: same lookup as the CPU path, plus any
+        // DNG-embedded opcode corrections merged underneath
         let corr = if r.lens_corr > 0.001 {
-            crate::lensdb::correction_for(
+            let mut c = crate::lensdb::correction_for(
                 &m.info.lens,
                 &m.info.make,
                 &m.info.model,
                 m.info.focal,
                 m.info.aperture,
             )
+            .unwrap_or_else(crate::lensdb::Correction::none);
+            c.dng = m.dng_ops.clone();
+            crate::dngops::env_filter(&mut c.dng);
+            if c.is_empty() && c.dng.is_none() {
+                None
+            } else {
+                Some(c)
+            }
         } else {
             None
         };
         let lens_amt = r.lens_corr.min(1.0);
+        let dng = corr.as_ref().and_then(|c| c.dng.as_ref());
+        let dng_warp_en = dng.and_then(|d| d.warp.as_ref()).is_some();
+        let dng_gain_en = dng.and_then(|d| d.gain.as_ref()).is_some();
+        // packed DNG payload: [warp_en, kr[18], center2, pad, gain hdr, map]
+        let mut dng32: Vec<f32> = vec![0.0; 32];
+        if let Some(d) = dng {
+            if let Some(wr) = &d.warp {
+                dng32[0] = 1.0;
+                for ch in 0..3 {
+                    for i in 0..6 {
+                        dng32[1 + ch * 6 + i] = wr.kr[ch][i];
+                    }
+                }
+                dng32[19] = wr.center[0];
+                dng32[20] = wr.center[1];
+            }
+            if let Some(g) = &d.gain {
+                dng32[21] = 1.0;
+                dng32[22] = g.rows as f32;
+                dng32[23] = g.cols as f32;
+                dng32[24] = g.planes as f32;
+                dng32[25] = g.plane0 as f32;
+                dng32[26] = g.nplanes as f32;
+                dng32[27] = g.spacing[0] as f32;
+                dng32[28] = g.spacing[1] as f32;
+                dng32[29] = g.origin[0] as f32;
+                dng32[30] = g.origin[1] as f32;
+                dng32.extend_from_slice(&g.map);
+            }
+        }
 
         let mk_uni = |p: &Params, samp_step: u32| Uni {
             black: m.black,
@@ -2158,7 +2251,12 @@ impl Gpu {
                 p.key_v,
                 p.key_h,
             ],
-            dh0: [p.dehaze, p.dehaze_a, 0.0, 0.0],
+            dh0: [
+                p.dehaze,
+                p.dehaze_a,
+                if dng_warp_en { 1.0 } else { 0.0 },
+                if dng_gain_en { 1.0 } else { 0.0 },
+            ],
             lens0: corr
                 .as_ref()
                 .map(|c| [c.model as f32, c.abc[0], c.abc[1], c.abc[2]])
@@ -2256,10 +2354,11 @@ impl Gpu {
             _ => vec![0u32, 0u32],
         };
         let subj_b = mk_buf("subjbuf", bytemuck::cast_slice(&subj32), storage_in);
+        let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
 
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> =
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
                 .iter()
                 .map(|&i| wgpu::BindGroupEntry {
                     binding: i,
@@ -2278,7 +2377,8 @@ impl Gpu {
                         11 => den_b.as_entire_binding(),
                         12 => subj_b.as_entire_binding(),
                         13 => suni_b.as_entire_binding(),
-                        _ => seeds_b.as_entire_binding(),
+                        14 => seeds_b.as_entire_binding(),
+                        _ => dng_b.as_entire_binding(),
                     },
                 })
                 .collect();

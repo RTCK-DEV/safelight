@@ -89,6 +89,9 @@ pub struct Correction {
     /// full Adobe ACM payload when model == 3 (CPU path uses the complete
     /// 2-D warp incl. tangential terms; GPU uses the radial approx above)
     pub adobe: Option<Box<AdobeCor>>,
+    /// DNG embedded opcode corrections (GainMap + WarpRectilinear)
+    /// baked into the raw file — applied underneath any profile correction
+    pub dng: Option<crate::dngops::DngOps>,
 }
 
 /// Adobe Camera Model correction payload (from .lcp).
@@ -130,6 +133,7 @@ impl Correction {
             scale: 1.0,
             lens_name: String::new(),
             adobe: None,
+            dng: None,
         }
     }
 }
@@ -630,6 +634,7 @@ impl LensDb {
             scale,
             lens_name: name,
             adobe: None,
+            dng: None,
         }
     }
 }

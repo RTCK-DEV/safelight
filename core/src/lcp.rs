@@ -534,6 +534,7 @@ impl LcpDb {
             lens_name: lens.names.first().cloned().unwrap_or_default(),
             adobe: Some(Box::new(adobe)),
             vig_foc: vig_foc[0],
+            dng: None,
         };
         // fit R/B chromatic warps to v+b·r² for the GPU approx
         let fit = |m: Option<[f32; 6]>| -> (f32, f32) {

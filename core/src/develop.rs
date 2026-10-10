@@ -2016,6 +2016,42 @@ fn correct_plane_adobe(
     out
 }
 
+/// lens-correction stage for this frame: external profile (lensfun / Adobe
+/// LCP) merged with any DNG-embedded opcode corrections (GainMap +
+/// WarpRectilinear). Returns None when nothing applies.
+fn lens_stage(m: &Mosaic, r: &Recipe) -> Option<crate::lensdb::Correction> {
+    if r.lens_corr <= 0.001 {
+        return None;
+    }
+    let mut c = crate::lensdb::correction_for(
+        &m.info.lens,
+        &m.info.make,
+        &m.info.model,
+        m.info.focal,
+        m.info.aperture,
+    )
+    .unwrap_or_else(crate::lensdb::Correction::none);
+    c.dng = m.dng_ops.clone();
+    crate::dngops::env_filter(&mut c.dng);
+    if c.dng.is_some() && std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+        eprintln!(
+            "[dng] embedded ops: warp={} gain={:?}",
+            c.dng.as_ref().unwrap().warp.is_some(),
+            c.dng
+                .as_ref()
+                .unwrap()
+                .gain
+                .as_ref()
+                .map(|g| (g.rows, g.cols, g.planes))
+        );
+    }
+    if c.is_empty() && c.dng.is_none() {
+        None
+    } else {
+        Some(c)
+    }
+}
+
 /// geometric remap + vignette compensation for the cam-space plane.
 /// Returns (corrected plane, per-pixel gain). Bilinear per channel —
 /// lateral CA gives R and B their own source radii.
@@ -2036,6 +2072,8 @@ pub fn correct_plane(
     let dmax = w.max(h) as f32;
     let lens_s = halfd
         / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
+    let warp = c.dng.as_ref().and_then(|o| o.warp.as_ref());
+    let gain = c.dng.as_ref().and_then(|o| o.gain.as_ref());
     let mut out = vec![[0.0f32; 3]; w * h];
     let vig_on = c.vig != [0.0; 3];
     for y in 0..h {
@@ -2069,8 +2107,30 @@ pub fn correct_plane(
                 };
                 // blend corrected position with identity by amount
                 let r_px = (rd_ch + (rn - rd_ch) * (1.0 - amount)) * halfd;
-                let (sx, sy) = (cx + ux * r_px, cy + uy * r_px);
+                let (mut sx, mut sy) = (cx + ux * r_px, cy + uy * r_px);
+                // DNG WarpRectilinear: ideal -> warped in halfdiag-normalized
+                // coords about the embedded center (per-channel kr)
+                if let Some(wr) = warp {
+                    let wx = wr.center[0] * w as f32;
+                    let wy = wr.center[1] * h as f32;
+                    let ox = (sx - wx) / halfd;
+                    let oy = (sy - wy) / halfd;
+                    let r2 = ox * ox + oy * oy;
+                    let k = &wr.kr[ch.min(2)];
+                    let f = k[0]
+                        + r2 * (k[1]
+                            + r2 * (k[2]
+                                + r2 * (k[3] + r2 * (k[4] + r2 * k[5]))));
+                    let f = 1.0 + (f - 1.0) * amount;
+                    sx = wx + ox * f * halfd;
+                    sy = wy + oy * f * halfd;
+                }
                 px[ch] = bilinear3(plane, w, h, sx, sy, ch);
+                // DNG GainMap: illumination gain at the source position
+                if let Some(gm) = gain {
+                    let g = gm.at(sx as f64, sy as f64, ch, w, h) as f32;
+                    px[ch] *= 1.0 + (g - 1.0) * amount;
+                }
             }
             if vig_on {
                 // Adobe vignette poly is defined on the distorted radius
@@ -2100,6 +2160,7 @@ pub fn lens_map(
     w: usize,
     h: usize,
     amount: f32,
+    stride: usize,
 ) -> (f32, f32, f32) {
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
@@ -2107,32 +2168,60 @@ pub fn lens_map(
     let dx = x as f32 - cx;
     let dy = y as f32 - cy;
     let rn = (dx * dx + dy * dy).sqrt() / halfd;
-    if rn < 1e-6 {
-        return (x as f32, y as f32, 1.0);
-    }
-    let ru = rn * c.scale;
-    let dmax = w.max(h) as f32;
-    let lens_s = halfd
-        / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
-    let rd = inv_dist(c.model, c.abc, ru, lens_s) / c.scale;
-    let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
-    let g = if c.vig != [0.0; 3] {
-        let rv = if c.vig_adobe {
-            // distorted radius in focal units: dist_px/(vig_foc·Dmax)
-            let dmax = w.max(h) as f32;
-            rd * halfd / (c.vig_foc.max(1e-3) * dmax)
+    let (mut sx, mut sy) = (x as f32, y as f32);
+    let mut g = 1.0f32;
+    if rn >= 1e-6 {
+        let ru = rn * c.scale;
+        let dmax = w.max(h) as f32;
+        let lens_s = halfd
+            / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
+        let rd = inv_dist(c.model, c.abc, ru, lens_s) / c.scale;
+        let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
+        g = if c.vig != [0.0; 3] {
+            let rv = if c.vig_adobe {
+                // distorted radius in focal units: dist_px/(vig_foc·Dmax)
+                let dmax = w.max(h) as f32;
+                rd * halfd / (c.vig_foc.max(1e-3) * dmax)
+            } else {
+                ru
+            };
+            let r2 = rv * rv;
+            let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
+            1.0 + (1.0 / att - 1.0) * amount
         } else {
-            ru
+            1.0
         };
-        let r2 = rv * rv;
-        let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
-        1.0 + (1.0 / att - 1.0) * amount
-    } else {
-        1.0
-    };
-    // src = centre + unit_direction * corrected_radius
-    let s = r_px / (rn * halfd);
-    (cx + dx * s, cy + dy * s, g)
+        // src = centre + unit_direction * corrected_radius
+        let s = r_px / (rn * halfd);
+        sx = cx + dx * s;
+        sy = cy + dy * s;
+    }
+    if let Some(ops) = &c.dng {
+        if let Some(wr) = &ops.warp {
+            let wx = wr.center[0] * w as f32;
+            let wy = wr.center[1] * h as f32;
+            let ox = (sx - wx) / halfd;
+            let oy = (sy - wy) / halfd;
+            let r2 = ox * ox + oy * oy;
+            let k = &wr.kr[1];
+            let f = k[0] + r2 * (k[1] + r2 * (k[2] + r2 * (k[3] + r2 * (k[4] + r2 * k[5]))));
+            let f = 1.0 + (f - 1.0) * amount;
+            sx = wx + ox * f * halfd;
+            sy = wy + oy * f * halfd;
+        }
+        if let Some(gm) = &ops.gain {
+            // map pixels live in full-res image coords — scale the virtual pos
+            let gg = gm.at(
+                sx as f64 * stride as f64,
+                sy as f64 * stride as f64,
+                1,
+                w * stride,
+                h * stride,
+            ) as f32;
+            g *= 1.0 + (gg - 1.0) * amount;
+        }
+    }
+    (sx, sy, g)
 }
 
 fn bilinear3(plane: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize) -> f32 {
@@ -2219,17 +2308,7 @@ pub fn lin_base(d: &Decoded, r: &Recipe) -> Result<(Vec<[f32; 3]>, usize, usize)
             let norm = norm_factors(m);
             let p = build_params(m, r, None);
             let plane = demosaic_plane(m, &norm, &build_demosaic_taps(&m.cfa));
-            let corr = if r.lens_corr > 0.001 {
-                crate::lensdb::correction_for(
-                    &m.info.lens,
-                    &m.info.make,
-                    &m.info.model,
-                    m.info.focal,
-                    m.info.aperture,
-                )
-            } else {
-                None
-            };
+            let corr = lens_stage(m, r);
             let plane = match corr.as_ref() {
                 Some(c) => correct_plane(&plane, vw, vh, c, r.lens_corr.min(1.0)),
                 None => plane,
@@ -2387,17 +2466,7 @@ fn develop_mosaic(
     // demosaiced plane with bilinear per-channel sampling (TCA); previews
     // remap the virtual sampling position instead, so the distortion is
     // visible without paying for a second full-res plane.
-    let corr = if r.lens_corr > 0.001 {
-        crate::lensdb::correction_for(
-            &m.info.lens,
-            &m.info.make,
-            &m.info.model,
-            m.info.focal,
-            m.info.aperture,
-        )
-    } else {
-        None
-    };
+    let corr = lens_stage(m, r);
     let plane = match (plane, &corr) {
         (Some(pl), Some(c)) => Some(correct_plane(&pl, vw, vh, c, r.lens_corr.min(1.0))),
         (pl, _) => pl,
@@ -2437,7 +2506,8 @@ pub fn colorize_plane(
                 Some(pl) => pl[vy * vw + vx],
                 None => match corr {
                     Some(c) => {
-                        let (sx, sy, g) = lens_map(c, vx, vy, vw, vh, p.lens_corr_amt);
+                        let (sx, sy, g) =
+                            lens_map(c, vx, vy, vw, vh, p.lens_corr_amt, stride);
                         let mut cc = demosaic_pixel(
                             m,
                             (sx.round() as usize).min(vw - 1),
@@ -2568,6 +2638,7 @@ fn develop_raster(
             timestamp: 0,
             flip,
         },
+        dng_ops: None,
     };
     // raster: histogram on the decoded image feeds auto-exposure/contrast
     let stats = if Stats::needs(r) {

@@ -9,6 +9,7 @@ pub mod capi;
 pub mod catalog;
 pub mod dcp;
 pub mod decode;
+pub mod dngops;
 pub mod develop;
 pub mod engine;
 pub mod ffi;
