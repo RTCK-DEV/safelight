@@ -1889,9 +1889,23 @@ fn lens_fp(model: u32, abc: [f32; 3], rd: f32) -> f32 {
         1.0 + 3.0 * abc[0] * rd * rd
     }
 }
-fn inv_dist(model: u32, abc: [f32; 3], ru: f32) -> f32 {
+/// Adobe ACM: rd = ru·(1 + k1 ru² + k2 ru⁴ + k3 ru⁶) — forward eval,
+/// no inversion needed (model maps corrected→distorted directly).
+fn adobe_fwd(abc: [f32; 3], ru: f32) -> f32 {
+    let r2 = ru * ru;
+    ru * (1.0 + abc[0] * r2 + abc[1] * r2 * r2 + abc[2] * r2 * r2 * r2)
+}
+
+/// model 3 (Adobe ACM): coefficients are defined on the focal-unit radius
+/// r = dist_px/(foc·Dmax); convert via s = halfd_px/(foc·Dmax).
+/// `foc` = normalized focal (f35mm/35); pass 0 for lensfun models.
+fn inv_dist(model: u32, abc: [f32; 3], ru: f32, s: f32) -> f32 {
     if model == 0 || ru <= 0.0 {
         return ru;
+    }
+    if model == 3 {
+        let s = s.max(1e-3);
+        return (adobe_fwd(abc, ru * s) / s).max(0.0);
     }
     let mut rd = ru;
     for _ in 0..5 {
@@ -1921,6 +1935,87 @@ fn inv_tca(v: f32, b: f32, ru: f32) -> f32 {
     rd
 }
 
+/// Adobe Camera Model path (.lcp): full 2-D corrected→distorted warp with
+/// radial + tangential terms, per-channel chromatic warps on the distorted
+/// green position, and residual-illumination vignette on distorted
+/// focal-unit coords. Mirrors RawTherapee's lcp.cc implementation.
+fn correct_plane_adobe(
+    plane: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    a: &crate::lensdb::AdobeCor,
+    amount: f32,
+) -> Vec<[f32; 3]> {
+    let dmax = w.max(h) as f32;
+    let x0 = a.center[0] * w as f32;
+    let y0 = a.center[1] * h as f32;
+    let fx = a.foc[0] * dmax;
+    let fy = a.foc[1] * dmax;
+    let vx0 = a.vig_center[0] * w as f32;
+    let vy0 = a.vig_center[1] * h as f32;
+    let vfx = a.vig_foc[0].max(1e-3) * dmax;
+    let vfy = a.vig_foc[1].max(1e-3) * dmax;
+    let has_vig = a.vig_a != [0.0; 3];
+    let (k1, k2, k3, ty, tx) = (a.k[0], a.k[1], a.k[2], a.k[3], a.k[4]);
+    let mut out = vec![[0.0f32; 3]; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let xd = (x as f32 - x0) / fx;
+            let yd = (y as f32 - y0) / fy;
+            let rsqr = xd * xd + yd * yd;
+            // forward ACM warp: corrected → distorted (focal units)
+            let cf = 1.0 + rsqr * (k1 + rsqr * (k2 + rsqr * k3)) + 2.0 * (ty * yd + tx * xd);
+            let xg = xd * cf + tx * rsqr;
+            let yg = yd * cf + ty * rsqr;
+            // blend toward identity by amount
+            let xg = xd + (xg - xd) * amount;
+            let yg = yd + (yg - yd) * amount;
+            let mut px = [0.0f32; 3];
+            for ch in 0..3usize {
+                let m = match ch {
+                    0 => a.chr,
+                    2 => a.chb,
+                    _ => None,
+                };
+                let (xc, yc) = match m {
+                    Some(m) => {
+                        let r2 = xg * xg + yg * yg;
+                        let cs = 1.0
+                            + r2 * (m[1] + r2 * (m[2] + r2 * m[3]))
+                            + 2.0 * (m[4] * yg + m[5] * xg);
+                        let xc = m[0] * (xg * cs + m[5] * r2);
+                        let yc = m[0] * (yg * cs + m[4] * r2);
+                        (xg + (xc - xg) * amount, yg + (yc - yg) * amount)
+                    }
+                    None => (xg, yg),
+                };
+                let sx = x0 + xc * fx;
+                let sy = y0 + yc * fy;
+                px[ch] = bilinear3(plane, w, h, sx, sy, ch);
+            }
+            if has_vig {
+                // residual illumination on the distorted source position,
+                // in the vignette model's own frame
+                let sxd = x0 + xg * fx;
+                let syd = y0 + yg * fy;
+                let xdv = (sxd - vx0) / vfx;
+                let ydv = (syd - vy0) / vfy;
+                let rv2 = xdv * xdv + ydv * ydv;
+                let att = (1.0 + a.vig_a[0] * rv2 + a.vig_a[1] * rv2 * rv2
+                    + a.vig_a[2] * rv2 * rv2 * rv2)
+                    .max(0.05);
+                let g = 1.0 + (1.0 / att - 1.0) * amount;
+                for ch in px.iter_mut() {
+                    *ch *= g;
+                }
+            }
+            out[i] = px;
+        }
+    }
+    out
+}
+
 /// geometric remap + vignette compensation for the cam-space plane.
 /// Returns (corrected plane, per-pixel gain). Bilinear per channel —
 /// lateral CA gives R and B their own source radii.
@@ -1931,9 +2026,16 @@ pub fn correct_plane(
     c: &crate::lensdb::Correction,
     amount: f32,
 ) -> Vec<[f32; 3]> {
+    if let Some(a) = &c.adobe {
+        return correct_plane_adobe(plane, w, h, a, amount);
+    }
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
     let halfd = (cx * cx + cy * cy).sqrt().max(1.0);
+    // focal-unit scale for Adobe ACM: halfd_px/(foc·Dmax)
+    let dmax = w.max(h) as f32;
+    let lens_s = halfd
+        / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
     let mut out = vec![[0.0f32; 3]; w * h];
     let vig_on = c.vig != [0.0; 3];
     for y in 0..h {
@@ -1948,7 +2050,7 @@ pub fn correct_plane(
             }
             let (ux, uy) = (dx / (rn * halfd), dy / (rn * halfd));
             let ru = rn * c.scale; // lens-normalised display radius
-            let rd = inv_dist(c.model, c.abc, ru);
+            let rd = inv_dist(c.model, c.abc, ru, lens_s);
             let mut px = [0.0f32; 3];
             for ch in 0..3usize {
                 let (v, b) = match ch {
@@ -1956,17 +2058,27 @@ pub fn correct_plane(
                     1 => (1.0, 0.0),
                     _ => (c.tca[2], c.tca[3]),
                 };
-                let rd_ch = inv_tca(v, b, rd) / c.scale;
+                // Adobe TCA is a forward warp on rd (fitted v+b·r²);
+                // lensfun TCA is rd→ru and needs the inverse
+                let rd_ch = if c.model == 3 {
+                    // fitted Adobe TCA warp is defined on focal units
+                    let s2 = lens_s * lens_s;
+                    rd * (v + b * rd * rd * s2) / c.scale
+                } else {
+                    inv_tca(v, b, rd) / c.scale
+                };
                 // blend corrected position with identity by amount
                 let r_px = (rd_ch + (rn - rd_ch) * (1.0 - amount)) * halfd;
                 let (sx, sy) = (cx + ux * r_px, cy + uy * r_px);
                 px[ch] = bilinear3(plane, w, h, sx, sy, ch);
             }
             if vig_on {
-                let att = (1.0
-                    + c.vig[0] * ru * ru
-                    + c.vig[1] * ru * ru * ru * ru
-                    + c.vig[2] * ru * ru * ru * ru * ru * ru)
+                // Adobe vignette poly is defined on the distorted radius
+                // (coefficients pre-scaled into display-normalised units);
+                // lensfun PA uses the corrected (display) radius.
+                let rv = if c.vig_adobe { rd } else { ru };
+                let r2 = rv * rv;
+                let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2)
                     .max(0.05);
                 let g = 1.0 + (1.0 / att - 1.0) * amount;
                 for ch in px.iter_mut() {
@@ -1999,14 +2111,21 @@ pub fn lens_map(
         return (x as f32, y as f32, 1.0);
     }
     let ru = rn * c.scale;
-    let rd = inv_dist(c.model, c.abc, ru) / c.scale;
+    let dmax = w.max(h) as f32;
+    let lens_s = halfd
+        / (c.adobe.as_ref().map(|a| a.foc[0]).unwrap_or(c.vig_foc).max(1e-3) * dmax);
+    let rd = inv_dist(c.model, c.abc, ru, lens_s) / c.scale;
     let r_px = (rd + (rn - rd) * (1.0 - amount)) * halfd;
     let g = if c.vig != [0.0; 3] {
-        let att = (1.0
-            + c.vig[0] * ru * ru
-            + c.vig[1] * ru * ru * ru * ru
-            + c.vig[2] * ru * ru * ru * ru * ru * ru)
-            .max(0.05);
+        let rv = if c.vig_adobe {
+            // distorted radius in focal units: dist_px/(vig_foc·Dmax)
+            let dmax = w.max(h) as f32;
+            rd * halfd / (c.vig_foc.max(1e-3) * dmax)
+        } else {
+            ru
+        };
+        let r2 = rv * rv;
+        let att = (1.0 + c.vig[0] * r2 + c.vig[1] * r2 * r2 + c.vig[2] * r2 * r2 * r2).max(0.05);
         1.0 + (1.0 / att - 1.0) * amount
     } else {
         1.0
@@ -2101,20 +2220,13 @@ pub fn lin_base(d: &Decoded, r: &Recipe) -> Result<(Vec<[f32; 3]>, usize, usize)
             let p = build_params(m, r, None);
             let plane = demosaic_plane(m, &norm, &build_demosaic_taps(&m.cfa));
             let corr = if r.lens_corr > 0.001 {
-                crate::lensdb::db().and_then(|d| {
-                    let c = d.correction(
-                        &m.info.lens,
-                        &m.info.make,
-                        &m.info.model,
-                        m.info.focal,
-                        m.info.aperture,
-                    );
-                    if c.is_empty() {
-                        None
-                    } else {
-                        Some(c)
-                    }
-                })
+                crate::lensdb::correction_for(
+                    &m.info.lens,
+                    &m.info.make,
+                    &m.info.model,
+                    m.info.focal,
+                    m.info.aperture,
+                )
             } else {
                 None
             };
@@ -2276,20 +2388,13 @@ fn develop_mosaic(
     // remap the virtual sampling position instead, so the distortion is
     // visible without paying for a second full-res plane.
     let corr = if r.lens_corr > 0.001 {
-        crate::lensdb::db().and_then(|d| {
-            let c = d.correction(
-                &m.info.lens,
-                &m.info.make,
-                &m.info.model,
-                m.info.focal,
-                m.info.aperture,
-            );
-            if c.is_empty() {
-                None
-            } else {
-                Some(c)
-            }
-        })
+        crate::lensdb::correction_for(
+            &m.info.lens,
+            &m.info.make,
+            &m.info.model,
+            m.info.focal,
+            m.info.aperture,
+        )
     } else {
         None
     };

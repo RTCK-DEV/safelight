@@ -13,6 +13,7 @@ pub mod develop;
 pub mod engine;
 pub mod ffi;
 pub mod gpu;
+pub mod lcp;
 pub mod lensdb;
 pub mod lut;
 pub mod merge;

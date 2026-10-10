@@ -2,6 +2,11 @@
 
 #include <libraw/libraw.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#include <windows.h>
+#endif
+
 #include <cstdlib>
 #include <cstring>
 
@@ -14,7 +19,19 @@ extern "C" {
 SlRaw* sl_raw_open(const char* path, SlRawInfo* info) {
   if (!path || !info) return nullptr;
   LibRaw* r = new LibRaw();
-  if (r->open_file(path) != LIBRAW_SUCCESS) {
+  int rc;
+#ifdef _WIN32
+  /* paths arrive UTF-8; open via the wchar_t overload */
+  {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    wchar_t* wpath = (wchar_t*)alloca(n * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, n);
+    rc = r->open_file(wpath);
+  }
+#else
+  rc = r->open_file(path);
+#endif
+  if (rc != LIBRAW_SUCCESS) {
     delete r;
     return nullptr;
   }

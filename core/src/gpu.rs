@@ -560,8 +560,19 @@ fn lens_fp(model: u32, rd: f32) -> f32 {
     }
     return 1.0 + 3.0 * pg.lens0.y * rd * rd;
 }
-fn inv_dist(model: u32, ru: f32) -> f32 {
+fn inv_dist(model: u32, ru: f32, lens_s: f32) -> f32 {
     if (model == 0u || ru <= 0.0) { return ru; }
+    if (model == 3u) {
+        // Adobe ACM radial part: rd = ru·(1+k1 ru²+k2 ru⁴+k3 ru⁶) defined
+        // on FOCAL-UNIT radius r = dist_px/(foc·Dmax) — convert through
+        // s = halfd/(foc·Dmax). (tangential terms dropped in preview path)
+        let s = max(lens_s, 1e-3);
+        let ruf = ru * s;
+        let r2 = ruf * ruf;
+        let rdf = ruf * (1.0 + pg.lens0.y * r2 + pg.lens0.z * r2 * r2
+            + pg.lens0.w * r2 * r2 * r2);
+        return max(rdf / s, 0.0);
+    }
     var rd = ru;
     for (var k = 0u; k < 5u; k = k + 1u) {
         rd = rd - (lens_f(model, rd) - ru) / max(lens_fp(model, rd), 1e-4);
@@ -602,14 +613,34 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
     let rn = sqrt(dx * dx + dy * dy) / halfd;
     if (rn < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let ru = rn * pg.lens2.w;
-    let rd = inv_dist(u32(pg.lens0.x), ru);
+    let model = u32(pg.lens0.x);
+    // focal-unit conversion factor for Adobe models: halfd/(foc·Dmax)
+    let lens_s = halfd / (max(pg.lens3.z, 1e-3) * max(w, h));
+    let rd = inv_dist(model, ru, lens_s);
     let amt = pg.lens3.w;
-    let att = max(1.0 + pg.lens2.x * ru * ru + pg.lens2.y * ru * ru * ru * ru
-        + pg.lens2.z * ru * ru * ru * ru * ru * ru, 0.05);
+    // Adobe vignette poly is defined on the distorted radius in focal
+    // units: r = dist_px / (vig_foc·Dmax); lensfun PA uses ru directly
+    var rv = ru;
+    if (pg.lens3.x > 0.5) {
+        let dmax = max(w, h);
+        rv = rd * halfd / (max(pg.lens3.y, 1e-3) * dmax);
+    }
+    let r2 = rv * rv;
+    let att = max(1.0 + pg.lens2.x * r2 + pg.lens2.y * r2 * r2
+        + pg.lens2.z * r2 * r2 * r2, 0.05);
     let gain = 1.0 + (1.0 / att - 1.0) * amt;
-    let rr = inv_tca(pg.lens1.x, pg.lens1.y, rd) / pg.lens2.w;
+    // Adobe TCA is a forward warp on rd; lensfun TCA needs inversion
+    var rr = inv_tca(pg.lens1.x, pg.lens1.y, rd);
+    var rb = inv_tca(pg.lens1.z, pg.lens1.w, rd);
+    if (model == 3u) {
+        // fitted Adobe TCA warp is defined on focal units: b·r_f² = b·(s·rd)²
+        let s2 = lens_s * lens_s;
+        rr = rd * (pg.lens1.x + pg.lens1.y * rd * rd * s2);
+        rb = rd * (pg.lens1.z + pg.lens1.w * rd * rd * s2);
+    }
+    rr = rr / pg.lens2.w;
     let rg = rd / pg.lens2.w;
-    let rb = inv_tca(pg.lens1.z, pg.lens1.w, rd) / pg.lens2.w;
+    rb = rb / pg.lens2.w;
     // blend to identity by amount
     let f = 1.0 - amt;
     return vec4<f32>(
@@ -1981,20 +2012,13 @@ impl Gpu {
 
         // lens profile correction: same lookup as the CPU path
         let corr = if r.lens_corr > 0.001 {
-            crate::lensdb::db().and_then(|d| {
-                let c = d.correction(
-                    &m.info.lens,
-                    &m.info.make,
-                    &m.info.model,
-                    m.info.focal,
-                    m.info.aperture,
-                );
-                if c.is_empty() {
-                    None
-                } else {
-                    Some(c)
-                }
-            })
+            crate::lensdb::correction_for(
+                &m.info.lens,
+                &m.info.make,
+                &m.info.model,
+                m.info.focal,
+                m.info.aperture,
+            )
         } else {
             None
         };
@@ -2144,7 +2168,14 @@ impl Gpu {
                 .as_ref()
                 .map(|c| [c.vig[0], c.vig[1], c.vig[2], c.scale])
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
-            lens3: [0.0, 0.0, 0.0, if corr.is_some() { lens_amt } else { 0.0 }],
+            lens3: [
+                corr.as_ref().map(|c| c.vig_adobe as i32 as f32).unwrap_or(0.0),
+                corr.as_ref().map(|c| c.vig_foc).unwrap_or(0.0),
+                corr.as_ref()
+                    .and_then(|c| c.adobe.as_ref().map(|a| a.foc[0]))
+                    .unwrap_or(0.0),
+                if corr.is_some() { lens_amt } else { 0.0 },
+            ],
             blayers: p.brush_layers,
             bmisc: [p.brush_misc[0], p.brush_misc[1], r.ai_denoise.min(1.0), 0.0],
             bstr: {
