@@ -156,6 +156,13 @@ pub struct Recipe {
     pub highlight_rolloff: f32,
     /// shadow rolloff, 0..2 (1 = linear)
     pub shadow_rolloff: f32,
+    /// LR defringe: [amount 0..1, hue_lo_deg, hue_hi_deg] for the
+    /// purple band (desaturates saturated pixels in the hue range)
+    #[serde(default = "defringe_pu_default")]
+    pub defringe_pu: [f32; 3],
+    /// same for the green band
+    #[serde(default = "defringe_gr_default")]
+    pub defringe_gr: [f32; 3],
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -418,6 +425,12 @@ pub struct PowerWindow {
     pub bl: f32,
 }
 
+fn defringe_pu_default() -> [f32; 3] {
+    [0.0, 246.0, 294.0]
+}
+fn defringe_gr_default() -> [f32; 3] {
+    [0.0, 108.0, 132.0]
+}
 fn default_true() -> bool {
     true
 }
@@ -526,6 +539,8 @@ impl Default for Recipe {
             pivot: 0.18,
             highlight_rolloff: 1.0,
             shadow_rolloff: 1.0,
+            defringe_pu: [0.0, 246.0, 294.0],
+            defringe_gr: [0.0, 108.0, 132.0],
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),

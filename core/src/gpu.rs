@@ -88,6 +88,10 @@ struct Uni {
     fx0: [f32; 4],
     /// lens flare: cx, cy, strength, hue
     flare: [f32; 4],
+    /// defringe purple band: amount, lo_deg, hi_deg, 0
+    defr_pu: [f32; 4],
+    /// defringe green band: amount, lo_deg, hi_deg, 0
+    defr_gr: [f32; 4],
     /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
     wins: [[f32; 4]; 20],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
@@ -181,6 +185,9 @@ struct Uni {
     misc2: vec4<f32>,
     fx0: vec4<f32>,
     flare: vec4<f32>,
+    // defringe bands: amount, lo_deg, hi_deg, unused
+    defr_pu: vec4<f32>,
+    defr_gr: vec4<f32>,
     wins: array<vec4<f32>, 20>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
@@ -1051,6 +1058,15 @@ fn hue_to_rgb(h: f32) -> vec3<f32> {
     return a + (b - a) * f;
 }
 
+// soft-edged membership in a circular hue band (degrees, 5 deg feather)
+fn hue_band(deg: f32, lo: f32, hi: f32) -> f32 {
+    let mid = (lo + hi) * 0.5;
+    var d = abs(deg - mid);
+    if (d > 180.0) { d = 360.0 - d; }
+    let half = max(abs(hi - lo) * 0.5, 0.5);
+    return 1.0 - sstep(half, half + 5.0, d);
+}
+
 fn rgb_to_hsv(x: vec3<f32>) -> vec3<f32> {
     let mx = max(x.x, max(x.y, x.z));
     let mn = min(x.x, min(x.y, x.z));
@@ -1313,6 +1329,18 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         if (mx > 1e-5) { sat_now = (mx - mn) / mx; }
         let s = max(1.0 + pg.a2.z + pg.a2.w * (1.0 - sat_now), 0.0);
         x = vec3<f32>(luma2) + (x - vec3<f32>(luma2)) * s;
+    }
+    // defringe (LR): desaturate chromatic pixels inside the purple and
+    // green hue bands — mirrors develop.rs
+    if (pg.defr_pu.x > 0.0 || pg.defr_gr.x > 0.0) {
+        let hsv = rgb_to_hsv(x);
+        let deg = hsv.x * 360.0;
+        let kp = pg.defr_pu.x * hue_band(deg, pg.defr_pu.y, pg.defr_pu.z)
+            + pg.defr_gr.x * hue_band(deg, pg.defr_gr.y, pg.defr_gr.z);
+        let k = kp * sstep(0.05, 0.3, hsv.y);
+        if (k > 0.0) {
+            x = hsv_to_rgb(hsv.x, max(hsv.y * (1.0 - k), 0.0), hsv.z);
+        }
     }
     // split toning (shadow / midtone / highlight)
     if (pg.st0.w > 0.0 || pg.st1.w > 0.0 || pg.mt0.w > 0.0) {
@@ -2236,6 +2264,8 @@ impl Gpu {
             m2: [p.m[2][0], p.m[2][1], p.m[2][2], 0.0],
             a1: [p.exposure_mul, p.contrast, p.highlights, p.shadows],
             a2: [p.whites, p.blacks, p.saturation, p.vibrance],
+            defr_pu: [p.defringe[0], p.defringe[1], p.defringe[2], 0.0],
+            defr_gr: [p.defringe[4], p.defringe[5], p.defringe[6], 0.0],
             a3: [p.sharpen, p.noise_luma, p.clarity, p.vignette],
             a4: [
                 p.grain,

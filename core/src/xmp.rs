@@ -150,6 +150,17 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             r.grain_rough * 100.0
         ));
     }
+    if r.defringe_pu[0] > 0.0 || r.defringe_gr[0] > 0.0 {
+        a.push_str(&format!(
+            "   crs:DefringePurpleAmount=\"{:.0}\" crs:DefringePurpleHueLo=\"{:.0}\" crs:DefringePurpleHueHi=\"{:.0}\" crs:DefringeGreenAmount=\"{:.0}\" crs:DefringeGreenHueLo=\"{:.0}\" crs:DefringeGreenHueHi=\"{:.0}\"\n",
+            r.defringe_pu[0] * 100.0,
+            ((r.defringe_pu[1] - 210.0) / 1.2).clamp(0.0, 100.0),
+            ((r.defringe_pu[2] - 210.0) / 1.2).clamp(0.0, 100.0),
+            r.defringe_gr[0] * 100.0,
+            ((r.defringe_gr[1] - 60.0) / 1.2).clamp(0.0, 100.0),
+            ((r.defringe_gr[2] - 60.0) / 1.2).clamp(0.0, 100.0)
+        ));
+    }
     if r.vig_mid >= 0.0 || r.vig_round > -2.0 || r.vig_feather >= 0.0 {
         a.push_str(&format!(
             "   crs:PostCropVignetteMidpoint=\"{:.0}\" crs:PostCropVignetteRoundness=\"{:.0}\" crs:PostCropVignetteFeather=\"{:.0}\"\n",
@@ -514,6 +525,26 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr_any(&body, &["crs:GrainRoughness", "crs:GrainFrequency"]) {
             r.grain_rough = (v / 100.0).clamp(0.0, 1.0);
+        }
+        // defringe: LR stores hue ranges on a 0..100 subscale around the
+        // band centre — purple 210..330°, green 60..180°
+        if let Some(v) = attr(&body, "crs:DefringePurpleAmount") {
+            r.defringe_pu[0] = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:DefringePurpleHueLo") {
+            r.defringe_pu[1] = 210.0 + v * 1.2;
+        }
+        if let Some(v) = attr(&body, "crs:DefringePurpleHueHi") {
+            r.defringe_pu[2] = 210.0 + v * 1.2;
+        }
+        if let Some(v) = attr(&body, "crs:DefringeGreenAmount") {
+            r.defringe_gr[0] = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:DefringeGreenHueLo") {
+            r.defringe_gr[1] = 60.0 + v * 1.2;
+        }
+        if let Some(v) = attr(&body, "crs:DefringeGreenHueHi") {
+            r.defringe_gr[2] = 60.0 + v * 1.2;
         }
         if let Some(v) = attr(&body, "crs:CropAngle") {
             r.rotation_deg = v;

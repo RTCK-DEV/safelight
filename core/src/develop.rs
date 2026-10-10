@@ -131,6 +131,9 @@ pub struct Params {
     pub glow: f32,
     /// lens flare [cx, cy, strength, hue] in dst-normalized coords
     pub flare: [f32; 4],
+    /// LR defringe: [pu_amount, pu_lo_deg, pu_hi_deg, 0, gr_amount,
+    /// gr_lo_deg, gr_hi_deg, 0]
+    pub defringe: [f32; 8],
     /// tone equalizer: EV per log2-luma zone (centers -4..+4 EV, 9 zones)
     pub zone_ev: [f32; 9],
     /// imported .cube 3D LUT (applied display-referred) + amount
@@ -1224,6 +1227,16 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             r.flare[2].clamp(0.0, 1.0),
             r.flare[3] - r.flare[3].floor(),
         ],
+        defringe: [
+            r.defringe_pu[0].clamp(0.0, 1.0),
+            r.defringe_pu[1],
+            r.defringe_pu[2],
+            0.0,
+            r.defringe_gr[0].clamp(0.0, 1.0),
+            r.defringe_gr[1],
+            r.defringe_gr[2],
+            0.0,
+        ],
         zone_ev: {
             let mut z = r.zones_ev;
             for v in &mut z {
@@ -1467,6 +1480,27 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         let s = 1.0 + p.saturation + vib;
         for c in &mut x {
             *c = luma + (*c - luma) * s.max(0.0);
+        }
+    }
+    // defringe (LR): desaturate chromatic pixels inside the purple and
+    // green hue bands — CA fringe lives in those bands at high sat
+    if p.defringe[0] > 0.0 || p.defringe[4] > 0.0 {
+        let (h, s, v) = rgb_to_hsv(x);
+        let deg = h * 360.0;
+        let gate = |lo: f32, hi: f32| -> f32 {
+            let mid = (lo + hi) * 0.5;
+            let mut d = (deg - mid).abs();
+            if d > 180.0 {
+                d = 360.0 - d;
+            }
+            let half = ((hi - lo).abs() * 0.5).max(0.5);
+            1.0 - sstep(half, half + 5.0, d)
+        };
+        let k = (p.defringe[0] * gate(p.defringe[1], p.defringe[2])
+            + p.defringe[4] * gate(p.defringe[5], p.defringe[6]))
+            * sstep(0.05, 0.3, s);
+        if k > 0.0 {
+            x = hsv_to_rgb(h, s * (1.0 - k).max(0.0), v);
         }
     }
     // split toning: pull shadows/midtones/highlights toward their tint colors
