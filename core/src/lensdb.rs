@@ -158,7 +158,7 @@ pub fn correction_for(
     if use_adobe {
         if let Some(l) = crate::lcp::db() {
             if let Some(c) =
-                l.correction(exif_lens, make, cam_crop_hint.unwrap_or(1.0), focal, aperture)
+                l.correction(exif_lens, make, model, cam_crop_hint.unwrap_or(1.0), focal, aperture)
             {
                 if !c.is_empty() {
                     return Some(c);

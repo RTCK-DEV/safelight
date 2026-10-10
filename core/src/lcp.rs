@@ -211,6 +211,17 @@ fn parse_lcp(text: &str) -> Option<LcpLens> {
                     }
                 }
             }
+            // UniqueCameraModel carries the EXIF camera-model token
+            // ("DJI AC003 OsmoAction4") — fixed-lens cameras that report
+            // no EXIF lens are matched on this instead
+            for f in ["UniqueCameraModel"] {
+                if let Some(n) = attr_txt(li, f) {
+                    let n = format!("ucm:{n}");
+                    if !names.iter().any(|x| *x == n) {
+                        names.push(n);
+                    }
+                }
+            }
             sensor_factor = attr_val(li, "SensorFormatFactor").unwrap_or(1.0);
         }
         // AlternateLensNames: nested <rdf:li>name</rdf:li> elements
@@ -366,7 +377,7 @@ impl LcpDb {
     fn score(&self, names: &[String], q: &str, qsig: &[&String]) -> usize {
         let mut best = 0usize;
         for n in names {
-            if n.starts_with("make:") {
+            if n.starts_with("make:") || n.starts_with("ucm:") {
                 continue;
             }
             let nn = norm(n);
@@ -398,13 +409,70 @@ impl LcpDb {
         best
     }
 
+    /// fixed-lens camera fallback: files often carry no EXIF lens name
+    /// (DJI drones/action cams, compacts). Match the profile's embedded
+    /// UniqueCameraModel / pretty names against the EXIF camera model —
+    /// bounded to same-make files so it can't grab an unrelated profile.
+    fn find_by_camera(
+        &self,
+        exif_make: &str,
+        exif_model: &str,
+    ) -> Option<std::sync::Arc<LcpLens>> {
+        let mq = norm(exif_model);
+        if mq.len() < 3 {
+            return None;
+        }
+        let make_q = norm(exif_make);
+        let mut n = 0usize;
+        for (p, _names) in &self.files {
+            // same-make files only: either an explicit "make:" filename
+            // alias, or the maker appearing in the filename itself —
+            // without this the parse budget would burn on unrelated brands
+            if !make_q.is_empty() {
+                let gated = _names.iter().any(|nm| {
+                    if let Some(mk) = nm.strip_prefix("make:") {
+                        let fm = norm(mk);
+                        !fm.is_empty()
+                            && (fm == make_q || fm.contains(&make_q) || make_q.contains(&fm))
+                    } else {
+                        norm(nm).contains(&make_q)
+                    }
+                });
+                if !gated {
+                    continue;
+                }
+            }
+            let Some(l) = self.parse_file(p) else {
+                continue;
+            };
+            n += 1;
+            if n > 24 {
+                break;
+            }
+            // UniqueCameraModel / LensPrettyName contains the camera model
+            // string for fixed-lens profiles ("DJI AC003 OsmoAction4")
+            if l.names.iter().any(|nm| {
+                let nn = norm(nm.trim_start_matches("ucm:"));
+                nn.contains(&mq) || (!nn.is_empty() && mq.contains(&nn) && nn.len() >= 6)
+            }) {
+                return Some(l);
+            }
+        }
+        None
+    }
+
     /// best-matching lens: filename index narrows to a few candidates that
     /// get fully parsed on demand. `exif_make` gates the camera brand so a
     /// "45mm F2.8" Nikon-mount profile can't claim a Sony file.
-    fn find(&self, exif_lens: &str, exif_make: &str) -> Option<std::sync::Arc<LcpLens>> {
+    fn find(
+        &self,
+        exif_lens: &str,
+        exif_make: &str,
+        exif_model: &str,
+    ) -> Option<std::sync::Arc<LcpLens>> {
         let q = norm(exif_lens);
         if q.len() < 3 {
-            return None;
+            return self.find_by_camera(exif_make, exif_model);
         }
         let qt = Self::tokens(exif_lens);
         let qsig: Vec<&String> = qt
@@ -465,11 +533,12 @@ impl LcpDb {
         &self,
         exif_lens: &str,
         exif_make: &str,
+        exif_model: &str,
         cam_crop: f32,
         focal: f32,
         aperture: f32,
     ) -> Option<Correction> {
-        let lens = self.find(exif_lens, exif_make)?;
+        let lens = self.find(exif_lens, exif_make, exif_model)?;
         // nearest calibration by focal (entries of a prime share focal;
         // aperture only refines the vignette pick below)
         let mut by_focal: Vec<&Cal> = lens.cals.iter().collect();
@@ -692,5 +761,18 @@ mod tests {
         let l = parse_lcp(SAMPLE).unwrap();
         assert_eq!(l.cals.len(), 1);
         assert!(l.names.iter().any(|n| n.contains("SEL20F28")));
+    }
+}
+
+#[cfg(test)]
+mod dji_tests {
+    #[test]
+    fn dji_action4_model_fallback() {
+        let Some(db) = crate::lcp::db() else { return };
+        // DJI DNG carries no EXIF lens — match on the camera model
+        let c = db.correction("", "DJI", "AC003", 1.0, 2.34, 2.8);
+        let c = c.expect("DJI AC003 should match OSMO ACTION 4 profile");
+        eprintln!("matched '{}' model={} k={:?}", c.lens_name, c.model, c.abc);
+        assert!(c.model == 3, "should have ACM distortion");
     }
 }
