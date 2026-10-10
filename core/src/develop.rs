@@ -94,7 +94,7 @@ pub struct Params {
     pub q_show: bool,
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
-    pub wins: [[f32; 16]; 4],
+    pub wins: [[f32; 20]; 4],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -102,7 +102,7 @@ pub struct Params {
     /// [seg_start, seg_count, 0, 0],
     /// [xmin, ymin, xmax, ymax] aspect-space bbox (padded by radius).
     /// Layer params (ev,sat,temp,strength) in brush_layers;
-    /// (contrast,clarity,dehaze,tint) in brush_layers2.
+    /// (contrast,clarity,dehaze,tint,hi,sh,wh,bl) in brush_layers2.
     /// brush_misc = [n_strokes, dst_aspect, link_q_bits, 0].
     /// brush_seeds = per-stroke edge-aware seed colour [r,g,b,tol],
     /// parallel to strokes (tol>0 = enabled; rgb filled at render time
@@ -110,7 +110,7 @@ pub struct Params {
     pub brush_segs: Vec<[f32; 4]>,
     pub brush_strokes: Vec<[f32; 4]>,
     pub brush_layers: [[f32; 4]; 4],
-    pub brush_layers2: [[f32; 4]; 4],
+    pub brush_layers2: [[f32; 8]; 4],
     pub brush_misc: [f32; 4],
     pub brush_seeds: Vec<[f32; 4]>,
     /// HDR zone wheels [hue, amt, ev, sat] for dark/shadow/light/global
@@ -900,7 +900,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // window_mask runs in dst-normalized post-crop space, so translate here.
     let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
-    let mut wins = [[0.0; 16]; 4];
+    let mut wins = [[0.0; 20]; 4];
     for (i, w) in r.windows.iter().take(4).enumerate() {
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
@@ -947,6 +947,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             w.clarity.clamp(-1.0, 1.0),
             w.dehaze.clamp(-1.0, 1.0),
             w.tint.clamp(-1.0, 1.0),
+            w.hi.clamp(-1.0, 1.0),
+            w.sh.clamp(-1.0, 1.0),
+            w.wh.clamp(-1.0, 1.0),
+            w.bl.clamp(-1.0, 1.0),
         ];
     }
 
@@ -961,7 +965,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut brush_strokes: Vec<[f32; 4]> = Vec::new();
     let mut brush_seeds: Vec<[f32; 4]> = Vec::new();
     let mut brush_layers = [[0.0f32; 4]; 4];
-    let mut brush_layers2 = [[0.0f32; 4]; 4];
+    let mut brush_layers2 = [[0.0f32; 8]; 4];
     let mut link_bits = 0.0f32;
     for (li, b) in r.brushes.iter().take(4).enumerate() {
         brush_layers[li] = [
@@ -979,6 +983,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             b.clarity.clamp(-1.0, 1.0),
             b.dehaze.clamp(-1.0, 1.0),
             b.tint.clamp(-1.0, 1.0),
+            b.hi.clamp(-1.0, 1.0),
+            b.sh.clamp(-1.0, 1.0),
+            b.wh.clamp(-1.0, 1.0),
+            b.bl.clamp(-1.0, 1.0),
         ];
         if b.link_q {
             link_bits += (1u32 << li) as f32;
@@ -3328,7 +3336,7 @@ fn local_ops(
         }
         adj[0] += win[9] * mask * 0.08;
         adj[2] -= win[9] * mask * 0.08;
-        local_extra(adj, mask, win[12], win[13], win[14], win[15]);
+        local_extra(adj, mask, &win[12..20]);
     }
     // adjustment brushes: same local ev/sat/temp inside stroke masks
     let n_str = p.brush_misc[0] as usize;
@@ -3399,18 +3407,22 @@ fn local_ops(
         adj[0] += lp[2] * mask * 0.08;
         adj[2] -= lp[2] * mask * 0.08;
         let ex = p.brush_layers2[li];
-        local_extra(adj, mask, ex[0], ex[1], ex[2], ex[3]);
+        local_extra(adj, mask, &ex);
     }
 }
 
 /// extended LR local adjustments inside a window/brush mask:
-/// contrast (luma-pivot), clarity (midtone-weighted contrast),
-/// dehaze (shadow density + gain) and tint (green/magenta axis).
-fn local_extra(adj: &mut [f32; 3], mask: f32, con: f32, cla: f32, deh: f32, tin: f32) {
+/// ex = [contrast, clarity, dehaze, tint, highlights, shadows, whites,
+/// blacks] — luma-pivot contrast, midtone-weighted clarity, dehaze
+/// density, green/magenta tint axis and tone-band offsets mirroring
+/// the global tone stage's shaping weights.
+fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
+    let (con, cla, deh, tin) = (ex[0], ex[1], ex[2], ex[3]);
+    let (hi, sh, wh, bl) = (ex[4], ex[5], ex[6], ex[7]);
     if tin != 0.0 {
         adj[1] -= tin * mask * 0.06;
     }
-    if con != 0.0 || cla != 0.0 || deh != 0.0 {
+    if con != 0.0 || cla != 0.0 || deh != 0.0 || hi != 0.0 || sh != 0.0 || wh != 0.0 || bl != 0.0 {
         let l = (0.2126 * adj[0] + 0.7152 * adj[1] + 0.0722 * adj[2]).clamp(0.0, 1.0);
         let mid = 4.0 * l * (1.0 - l);
         let k = (con + cla * mid * 0.8 + deh * 0.2) * mask * 0.9;
@@ -3422,6 +3434,37 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, con: f32, cla: f32, deh: f32, tin:
             for c in adj.iter_mut() {
                 *c *= 1.0 + 0.08 * f;
                 *c -= 0.015 * f * (1.0 - l);
+            }
+        }
+        // tone-band offsets: same band weights as build_tone_lut
+        if sh != 0.0 {
+            let s = sh * mask * 0.22 * (1.0 - sstep(0.0, 0.5, l)) * (1.0 - l / 1.6).max(0.0);
+            for c in adj.iter_mut() {
+                *c += s;
+            }
+        }
+        if hi != 0.0 {
+            let d = 1.0 + hi * mask * 0.9 * sstep(0.45, 1.2, l);
+            for c in adj.iter_mut() {
+                *c /= d;
+            }
+        }
+        if wh != 0.0 {
+            let g = 1.0 + wh * mask * 0.35 * sstep(0.5, 1.0, l);
+            for c in adj.iter_mut() {
+                *c *= g;
+            }
+        }
+        if bl != 0.0 {
+            let lw = 1.0 - sstep(0.0, 0.4, l);
+            if bl > 0.0 {
+                for c in adj.iter_mut() {
+                    *c += bl * mask * 0.06 * lw;
+                }
+            } else {
+                for c in adj.iter_mut() {
+                    *c *= 1.0 + bl * mask * 0.25 * lw;
+                }
             }
         }
     }

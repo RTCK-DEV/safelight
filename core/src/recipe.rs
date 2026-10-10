@@ -335,6 +335,15 @@ pub struct BrushLayer {
     /// green(-)/magenta(+) axis -1..1
     #[serde(default)]
     pub tint: f32,
+    /// tone-band offsets (LR Local{Highlights,Shadows,Whites,Blacks}), -1..1
+    #[serde(default)]
+    pub hi: f32,
+    #[serde(default)]
+    pub sh: f32,
+    #[serde(default)]
+    pub wh: f32,
+    #[serde(default)]
+    pub bl: f32,
     pub strokes: Vec<BrushStroke>,
 }
 
@@ -353,6 +362,10 @@ impl Default for BrushLayer {
             clarity: 0.0,
             dehaze: 0.0,
             tint: 0.0,
+            hi: 0.0,
+            sh: 0.0,
+            wh: 0.0,
+            bl: 0.0,
             strokes: Vec::new(),
         }
     }
@@ -394,6 +407,15 @@ pub struct PowerWindow {
     /// green(-)/magenta(+) axis -1..1
     #[serde(default)]
     pub tint: f32,
+    /// tone-band offsets (LR Local{Highlights,Shadows,Whites,Blacks}), -1..1
+    #[serde(default)]
+    pub hi: f32,
+    #[serde(default)]
+    pub sh: f32,
+    #[serde(default)]
+    pub wh: f32,
+    #[serde(default)]
+    pub bl: f32,
 }
 
 fn default_true() -> bool {
@@ -426,6 +448,10 @@ impl Default for PowerWindow {
             clarity: 0.0,
             dehaze: 0.0,
             tint: 0.0,
+            hi: 0.0,
+            sh: 0.0,
+            wh: 0.0,
+            bl: 0.0,
         }
     }
 }

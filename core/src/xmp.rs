@@ -186,6 +186,16 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         if w.tint != 0.0 {
             s += &format!(" crs:LocalTint=\"{:.0}\"", w.tint * 100.0);
         }
+        for (v, name) in [
+            (w.hi, "crs:LocalHighlights2012"),
+            (w.sh, "crs:LocalShadows2012"),
+            (w.wh, "crs:LocalWhites2012"),
+            (w.bl, "crs:LocalBlacks2012"),
+        ] {
+            if v != 0.0 {
+                s += &format!(" {name}=\"{:.0}\"", v * 100.0);
+            }
+        }
         s
     };
     let grads: Vec<_> = r
@@ -756,6 +766,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             let cla = loc(&["crs:LocalClarity2012", "crs:LocalClarity"]);
             let deh = loc(&["crs:LocalDehaze"]);
             let tin = loc(&["crs:LocalTint"]);
+            let hi = loc(&["crs:LocalHighlights2012", "crs:LocalHighlights"]);
+            let sh = loc(&["crs:LocalShadows2012", "crs:LocalShadows"]);
+            let wh = loc(&["crs:LocalWhites2012", "crs:LocalWhites"]);
+            let bl = loc(&["crs:LocalBlacks2012", "crs:LocalBlacks"]);
             let feather_of =
                 |mb: &str| (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0);
             // LR midpoint (0..100): 0 = at the zero-effect boundary.
@@ -777,6 +791,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 clarity: cla,
                 dehaze: deh,
                 tint: tin,
+                hi,
+                sh,
+                wh,
+                bl,
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -868,6 +886,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     clarity: cla,
                     dehaze: deh,
                     tint: tin,
+                    hi,
+                    sh,
+                    wh,
+                    bl,
                     strokes,
                 });
             }
@@ -1033,6 +1055,10 @@ mod tests {
             clarity: 0.0,
             dehaze: 0.0,
             tint: 0.0,
+            hi: 0.0,
+            sh: 0.0,
+            wh: 0.0,
+            bl: 0.0,
         }];
         sc.rating = 4;
         sc.label = "Red".into();
