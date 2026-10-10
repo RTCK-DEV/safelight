@@ -135,6 +135,64 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         a.push_str(&format!("   xmp:Label=\"{}\"\n", esc(&sc.label)));
     }
     a.push_str("   ara:Format=\"1\">\n");
+    // LR-readable local corrections: gradient/circle windows -> the legacy
+    // correction lists LR still reads on import.
+    let local_attrs = |w: &crate::recipe::PowerWindow| {
+        format!(
+            "crs:LocalExposure2012=\"{:+.2}\" crs:LocalSaturation=\"{:.2}\" crs:LocalTemperature=\"{:.0}\"",
+            w.ev,
+            w.sat * 100.0,
+            w.temp * 100.0
+        )
+    };
+    let grads: Vec<_> = r
+        .windows
+        .iter()
+        .filter(|w| w.enabled && w.kind == "gradient")
+        .collect();
+    if !grads.is_empty() {
+        a.push_str("   <crs:GradientBasedCorrections><rdf:Seq>\n");
+        for w in grads {
+            let mid = (1.0 - w.mid.clamp(0.01, 0.99)) * 100.0;
+            a.push_str(&format!(
+                "    <rdf:li crs:What=\"Correction\" crs:CorrectionAmount=\"{:.3}\" crs:CorrectionActive=\"true\" {}>\n     <crs:CorrectionMasks><rdf:Seq>\n      <rdf:li crs:What=\"Mask/Gradient\" crs:MaskValue=\"1\" crs:ZeroX=\"{:.6}\" crs:ZeroY=\"{:.6}\" crs:FullX=\"{:.6}\" crs:FullY=\"{:.6}\" crs:Top=\"0\" crs:Bottom=\"1\" crs:Left=\"0\" crs:Right=\"1\" crs:Angle=\"0\" crs:Midpoint=\"{:.0}\" crs:Feather=\"{:.0}\" crs:Flipped=\"false\" crs:Version=\"1\"/>\n     </rdf:Seq></crs:CorrectionMasks>\n    </rdf:li>\n",
+                w.opacity.clamp(0.0, 1.0),
+                local_attrs(w),
+                w.p[2],
+                w.p[3],
+                w.p[0],
+                w.p[1],
+                mid,
+                w.p[5] * 100.0
+            ));
+        }
+        a.push_str("   </rdf:Seq></crs:GradientBasedCorrections>\n");
+    }
+    let circs: Vec<_> = r
+        .windows
+        .iter()
+        .filter(|w| w.enabled && w.kind == "circle")
+        .collect();
+    if !circs.is_empty() {
+        a.push_str("   <crs:CircularGradientBasedCorrections><rdf:Seq>\n");
+        for w in circs {
+            let mid = (1.0 - w.mid.clamp(0.01, 0.99)) * 100.0;
+            a.push_str(&format!(
+                "    <rdf:li crs:What=\"Correction\" crs:CorrectionAmount=\"{:.3}\" crs:CorrectionActive=\"true\" {}>\n     <crs:CorrectionMasks><rdf:Seq>\n      <rdf:li crs:What=\"Mask/CircularGradient\" crs:MaskValue=\"1\" crs:Top=\"{:.6}\" crs:Bottom=\"{:.6}\" crs:Left=\"{:.6}\" crs:Right=\"{:.6}\" crs:Angle=\"{:.1}\" crs:Midpoint=\"{:.0}\" crs:Roundness=\"0\" crs:Feather=\"{:.0}\" crs:Flipped=\"{}\" crs:Version=\"1\"/>\n     </rdf:Seq></crs:CorrectionMasks>\n    </rdf:li>\n",
+                w.opacity.clamp(0.0, 1.0),
+                local_attrs(w),
+                w.p[1] - w.p[3],
+                w.p[1] + w.p[3],
+                w.p[0] - w.p[2],
+                w.p[0] + w.p[2],
+                w.p[4],
+                mid,
+                w.p[5] * 100.0,
+                w.invert
+            ));
+        }
+        a.push_str("   </rdf:Seq></crs:CircularGradientBasedCorrections>\n");
+    }
     // full-fidelity recipe for our own round-trip
     if let Ok(js) = serde_json::to_string(&sc.recipe) {
         a.push_str(&format!("   <ara:Recipe>{}</ara:Recipe>\n", esc(&js)));
@@ -409,8 +467,238 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
             w[2] += bl * 0.6 + pu * 0.3 + aq * 0.1;
             r.mono = w;
         }
+        // local corrections: graduated/radial filters -> power windows,
+        // brush dabs -> adjustment-brush layers.
+        local_corrections(&body, r);
     }
     sc.recipe
+}
+
+/// `crs:NAME="v"` attribute OR `<crs:NAME>v</crs:NAME>` element form.
+fn field_str(body: &str, name: &str) -> Option<String> {
+    if let Some(v) = attr_str(body, name) {
+        return Some(v);
+    }
+    let open = format!("<{name}>");
+    let i = body.find(&open)? + open.len();
+    let e = body[i..].find(&format!("</{name}>"))? + i;
+    Some(body[i..e].trim().to_string())
+}
+
+fn field(body: &str, name: &str) -> Option<f32> {
+    field_str(body, name)?.parse().ok()
+}
+
+fn field_any(body: &str, names: &[&str]) -> Option<f32> {
+    names.iter().find_map(|n| field(body, n))
+}
+
+fn truthy(v: Option<String>) -> bool {
+    matches!(v.as_deref(), Some("true") | Some("True") | Some("1"))
+}
+
+/// depth-aware split into top-level `<rdf:li>` elements (self-closing or
+/// paired); each returned item is the element's full text.
+fn li_blocks(seq: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < seq.len() {
+        let rest = &seq[i..];
+        if rest.starts_with("</rdf:li>") {
+            depth -= 1;
+            i += 9;
+            if depth == 0 {
+                items.push(seq[start..i].to_string());
+            }
+        } else if rest.starts_with("<rdf:li") {
+            let gt = rest.find('>').map(|x| x + i).unwrap_or(seq.len() - 1);
+            let selfclose = seq[..gt].ends_with('/');
+            if depth == 0 && selfclose {
+                items.push(seq[i..=gt].to_string());
+            } else if depth == 0 {
+                start = i;
+                depth = 1;
+            } else if !selfclose {
+                depth += 1;
+            }
+            i = gt + 1;
+        } else {
+            i += 1;
+        }
+    }
+    items
+}
+
+/// top-level `<rdf:li>` items inside `<tag>…</tag>` — li_blocks itself is
+/// depth-aware, so the whole element body can be scanned directly.
+fn seq_items(body: &str, tag: &str) -> Vec<String> {
+    let Some(ti) = body.find(&format!("<{tag}")) else {
+        return Vec::new();
+    };
+    let Some(gt) = body[ti..].find('>') else {
+        return Vec::new();
+    };
+    let si = ti + gt + 1;
+    let Some(ei) = body[si..].find(&format!("</{tag}>")) else {
+        return Vec::new();
+    };
+    li_blocks(&body[si..si + ei])
+}
+
+/// every `<rdf:li>` in `item` carrying `crs:What="Mask/{what}"`.
+fn mask_blocks(item: &str, what: &str) -> Vec<String> {
+    let pat = format!("Mask/{what}");
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = item[from..].find(&pat) {
+        let pos = from + rel;
+        if let Some(ls) = item[..pos].rfind("<rdf:li") {
+            out.extend(li_blocks(&item[ls..]).into_iter().next());
+        }
+        from = pos + pat.len();
+    }
+    out
+}
+
+/// LR local corrections (graduated filter, radial filter, adjustment
+/// brush) → our power windows and brush layers. Handles both the legacy
+/// per-kind lists and the unified LR11+ MaskGroupBasedCorrections.
+fn local_corrections(body: &str, r: &mut Recipe) {
+    use crate::recipe::{BrushLayer, BrushStroke, PowerWindow};
+    for tag in [
+        "crs:GradientBasedCorrections",
+        "crs:CircularGradientBasedCorrections",
+        "crs:PaintBasedCorrections",
+        "crs:MaskGroupBasedCorrections",
+    ] {
+        for item in seq_items(body, tag) {
+            let what = field_str(&item, "crs:What").unwrap_or_default();
+            if !what.contains("Correction") {
+                continue;
+            }
+            if let Some(a) = field_str(&item, "crs:CorrectionActive") {
+                if a == "false" || a == "False" || a == "0" {
+                    continue;
+                }
+            }
+            let amount = field(&item, "crs:CorrectionAmount")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let ev = field_any(&item, &["crs:LocalExposure2012", "crs:LocalExposure"])
+                .unwrap_or(0.0)
+                .clamp(-4.0, 4.0);
+            let mut sat = field(&item, "crs:LocalSaturation").unwrap_or(0.0);
+            if sat.abs() > 1.5 {
+                sat /= 100.0;
+            }
+            let sat = sat.clamp(-1.0, 1.0);
+            let temp = (field(&item, "crs:LocalTemperature").unwrap_or(0.0) / 100.0)
+                .clamp(-1.0, 1.0);
+            let feather_of = |mb: &str| {
+                (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0)
+            };
+            // LR midpoint (0..100): 0 = at the zero-effect boundary.
+            let mid_of = |mb: &str| {
+                (1.0 - field(mb, "crs:Midpoint").unwrap_or(50.0) / 100.0)
+                    .clamp(0.01, 0.99)
+            };
+            let win = |kind: &str, p: [f32; 6], mid: f32, invert: bool| PowerWindow {
+                kind: kind.into(),
+                p,
+                ev,
+                sat,
+                temp,
+                invert,
+                enabled: true,
+                opacity: amount,
+                link_q: false,
+                mid,
+            };
+            // linear gradient: full effect at (FullX,FullY), zero at
+            // (ZeroX,ZeroY); "Flipped" swaps the two ends.
+            for mb in mask_blocks(&item, "Gradient") {
+                let mut zx = field(&mb, "crs:ZeroX").unwrap_or(0.5);
+                let mut zy = field(&mb, "crs:ZeroY").unwrap_or(0.5);
+                let mut fx = field(&mb, "crs:FullX").unwrap_or(0.5);
+                let mut fy = field(&mb, "crs:FullY").unwrap_or(0.5);
+                if truthy(field_str(&mb, "crs:Flipped")) {
+                    std::mem::swap(&mut zx, &mut fx);
+                    std::mem::swap(&mut zy, &mut fy);
+                }
+                let soft = feather_of(&mb);
+                let mid = mid_of(&mb);
+                r.windows
+                    .push(win("gradient", [fx, fy, zx, zy, 0.0, soft], mid, false));
+            }
+            // radial filter: ellipse bounding box + rotation; Flipped /
+            // MaskInverted applies the adjustment outside the ellipse.
+            for mb in mask_blocks(&item, "CircularGradient") {
+                let t = field(&mb, "crs:Top").unwrap_or(0.25);
+                let b = field(&mb, "crs:Bottom").unwrap_or(0.75);
+                let l = field(&mb, "crs:Left").unwrap_or(0.25);
+                let rt = field(&mb, "crs:Right").unwrap_or(0.75);
+                let ang = field(&mb, "crs:Angle").unwrap_or(0.0);
+                let flipped = truthy(field_str(&mb, "crs:Flipped"))
+                    || truthy(field_str(&mb, "crs:MaskInverted"));
+                let soft = feather_of(&mb);
+                let mid = mid_of(&mb);
+                r.windows.push(win(
+                    "circle",
+                    [
+                        (l + rt) * 0.5,
+                        (t + b) * 0.5,
+                        (rt - l).abs() * 0.5,
+                        (b - t).abs() * 0.5,
+                        ang,
+                        soft,
+                    ],
+                    mid,
+                    flipped,
+                ));
+            }
+            // brush: dab list + radius/flow → stroke(s) in one layer.
+            let mut strokes = Vec::new();
+            for mb in mask_blocks(&item, "Paint") {
+                let radius = field(&mb, "crs:Radius").unwrap_or(0.05).clamp(0.005, 0.5);
+                let flow = (field(&mb, "crs:Flow").unwrap_or(100.0) / 100.0).clamp(0.0, 1.0);
+                let mut pts = Vec::new();
+                for dab in seq_items(&mb, "crs:Dabs") {
+                    if let (Some(gt), Some(lt)) = (dab.find('>'), dab.rfind('<')) {
+                        let mut it = dab[gt + 1..lt]
+                            .split_whitespace()
+                            .filter_map(|v| v.parse::<f32>().ok());
+                        if let (Some(x), Some(y)) = (it.next(), it.next()) {
+                            pts.push([x, y]);
+                        }
+                    }
+                }
+                if !pts.is_empty() {
+                    strokes.push(BrushStroke {
+                        pts,
+                        radius,
+                        soft: 0.5,
+                        opacity: flow,
+                        erase: false,
+                    });
+                }
+            }
+            if !strokes.is_empty() {
+                r.brushes.push(BrushLayer {
+                    enabled: true,
+                    opacity: amount,
+                    ev,
+                    sat,
+                    temp,
+                    link_q: false,
+                    edge_aware: false,
+                    edge_tol: 0.5,
+                    strokes,
+                });
+            }
+        }
+    }
 }
 
 /// `<crs:ToneCurvePV2012>`-style rdf:Seq of "x, y" pairs (0..255 ints) ->
@@ -552,6 +840,7 @@ mod tests {
             enabled: true,
             opacity: 1.0,
             link_q: false,
+            mid: 0.0,
         }];
         sc.rating = 4;
         sc.label = "Red".into();
@@ -593,6 +882,104 @@ mod tests {
         }
         assert_eq!(sc.rating, 3);
         assert_eq!(sc.label, "Blue");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lr_local_corrections_map_to_windows_and_brushes() {
+        let body = r##"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" crs:ProcessVersion="11.0">
+ <crs:GradientBasedCorrections>
+  <rdf:Seq>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:LocalExposure2012="-1.20" crs:LocalSaturation="20" crs:LocalTemperature="-15">
+    <crs:CorrectionMasks>
+     <rdf:Seq>
+      <rdf:li crs:What="Mask/Gradient" crs:MaskValue="1" crs:ZeroX="0.5" crs:ZeroY="0.60" crs:FullX="0.5" crs:FullY="0.20" crs:Top="0" crs:Bottom="1" crs:Left="0" crs:Right="1" crs:Angle="0" crs:Midpoint="50" crs:Feather="50" crs:Flipped="false" crs:Version="1"/>
+     </rdf:Seq>
+    </crs:CorrectionMasks>
+   </rdf:li>
+  </rdf:Seq>
+ </crs:GradientBasedCorrections>
+ <crs:CircularGradientBasedCorrections>
+  <rdf:Seq>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="0.8" crs:CorrectionActive="true" crs:LocalExposure2012="+0.50">
+    <crs:CorrectionMasks>
+     <rdf:Seq>
+      <rdf:li crs:What="Mask/CircularGradient" crs:MaskValue="1" crs:Top="0.3" crs:Bottom="0.7" crs:Left="0.4" crs:Right="0.8" crs:Angle="15" crs:Midpoint="25" crs:Roundness="0" crs:Feather="60" crs:Flipped="true" crs:Version="1"/>
+     </rdf:Seq>
+    </crs:CorrectionMasks>
+   </rdf:li>
+  </rdf:Seq>
+ </crs:CircularGradientBasedCorrections>
+ <crs:PaintBasedCorrections>
+  <rdf:Seq>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:LocalExposure2012="+0.30">
+    <crs:CorrectionMasks>
+     <rdf:Seq>
+      <rdf:li crs:What="Mask/Paint" crs:MaskValue="1" crs:Radius="0.08" crs:Flow="80">
+       <crs:Dabs><rdf:Seq><rdf:li>0.4 0.3</rdf:li><rdf:li>0.45 0.32</rdf:li><rdf:li>0.5 0.35</rdf:li></rdf:Seq></crs:Dabs>
+      </rdf:li>
+     </rdf:Seq>
+    </crs:CorrectionMasks>
+   </rdf:li>
+  </rdf:Seq>
+ </crs:PaintBasedCorrections>
+</rdf:Description></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(body);
+        assert_eq!(r.windows.len(), 2);
+        let g = &r.windows[0];
+        assert_eq!(g.kind, "gradient");
+        // Full point at top, zero below — our window runs full→zero.
+        assert!((g.p[0] - 0.5).abs() < 1e-6 && (g.p[1] - 0.2).abs() < 1e-6);
+        assert!((g.p[2] - 0.5).abs() < 1e-6 && (g.p[3] - 0.6).abs() < 1e-6);
+        assert!((g.ev + 1.2).abs() < 1e-6);
+        assert!((g.sat - 0.2).abs() < 1e-6);
+        assert!((g.temp + 0.15).abs() < 1e-6);
+        assert!((g.mid - 0.5).abs() < 1e-6 && (g.p[5] - 0.5).abs() < 1e-6);
+        let c = &r.windows[1];
+        assert_eq!(c.kind, "circle");
+        assert!((c.p[0] - 0.6).abs() < 1e-6 && (c.p[1] - 0.5).abs() < 1e-6);
+        assert!((c.p[2] - 0.2).abs() < 1e-6 && (c.p[3] - 0.2).abs() < 1e-6);
+        assert!((c.p[4] - 15.0).abs() < 1e-6);
+        assert!(c.invert);
+        assert!((c.opacity - 0.8).abs() < 1e-6);
+        assert!((c.mid - 0.75).abs() < 1e-6 && (c.p[5] - 0.6).abs() < 1e-6);
+        assert_eq!(r.brushes.len(), 1);
+        let st = &r.brushes[0].strokes[0];
+        assert_eq!(st.pts.len(), 3);
+        assert!((st.pts[0][0] - 0.4).abs() < 1e-6 && (st.radius - 0.08).abs() < 1e-6);
+        assert!((r.brushes[0].ev - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn write_xmp_emits_lr_local_corrections() {
+        let dir = std::env::temp_dir().join(format!("xmp_test_w_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = dir.join("img.arw");
+        std::fs::write(&asset, b"fake").unwrap();
+        let mut sc = Sidecar::default();
+        sc.recipe.windows.push(crate::recipe::PowerWindow {
+            kind: "gradient".into(),
+            p: [0.5, 0.2, 0.5, 0.6, 0.0, 0.5],
+            ev: -1.0,
+            mid: 0.5,
+            ..Default::default()
+        });
+        sc.recipe.windows.push(crate::recipe::PowerWindow {
+            kind: "circle".into(),
+            p: [0.6, 0.5, 0.2, 0.15, 10.0, 0.4],
+            ev: 0.4,
+            mid: 0.7,
+            invert: true,
+            ..Default::default()
+        });
+        write_xmp(&asset, &sc).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(xml.contains("crs:GradientBasedCorrections"));
+        assert!(xml.contains("crs:What=\"Mask/Gradient\""));
+        assert!(xml.contains("crs:FullX=\"0.500000\""));
+        assert!(xml.contains("crs:CircularGradientBasedCorrections"));
+        assert!(xml.contains("crs:What=\"Mask/CircularGradient\""));
+        assert!(xml.contains("crs:Flipped=\"true\""));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

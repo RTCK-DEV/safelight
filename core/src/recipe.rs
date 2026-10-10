@@ -335,6 +335,11 @@ pub struct PowerWindow {
     /// gate this window's mask by the HSL qualifier matte (intersect)
     #[serde(default)]
     pub link_q: bool,
+    /// transition midpoint (LR-style): for "gradient" the 50% mark's
+    /// position along the p1→p2 span, for "circle" the 50% mark's
+    /// normalized radius. 0 = legacy default (0.5 / 1-soft/2).
+    #[serde(default)]
+    pub mid: f32,
 }
 
 fn default_true() -> bool {
@@ -356,6 +361,7 @@ impl Default for PowerWindow {
             invert: false,
             enabled: true,
             opacity: 1.0,
+            mid: 0.0,
         }
     }
 }

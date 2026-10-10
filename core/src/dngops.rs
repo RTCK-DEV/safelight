@@ -204,6 +204,26 @@ impl<'a> Be<'a> {
     }
 }
 
+/// verbose dump of opcode ids present in a list (diagnostics)
+fn dump_opcode_ids(d: &[u8], tag: u16) {
+    let b = Be(d);
+    if d.len() < 4 {
+        return;
+    }
+    let n = b.u32(0).min(64) as usize;
+    let mut p = 4usize;
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        if p + 16 > d.len() {
+            break;
+        }
+        let (id, _ver, _flags, sz) = (b.u32(p), b.u32(p + 4), b.u32(p + 8), b.u32(p + 12));
+        ids.push(format!("{id}({sz})"));
+        p += 16 + sz as usize;
+    }
+    eprintln!("[dng] tag {tag:#x} opcodes: {}", ids.join(" "));
+}
+
 fn parse_opcodes(d: &[u8]) -> DngOps {
     let b = Be(d);
     let mut ops = DngOps {
@@ -335,6 +355,9 @@ pub fn parse(path: &Path) -> Option<DngOps> {
         for tag in [0xC740u16, 0xC741, 0xC74E] {
             if let Some((_, cnt, off)) = r.tag(ifd, tag) {
                 let end = (off + cnt as usize).min(data.len());
+                if std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+                    dump_opcode_ids(&data[off..end], tag);
+                }
                 let ops = parse_opcodes(&data[off..end]);
                 if ops.warp.is_some() {
                     merged.warp = ops.warp;

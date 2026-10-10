@@ -924,7 +924,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             } else {
                 0.0
             },
-            0.0,
+            w.mid,
         ];
     }
 
@@ -3278,16 +3278,18 @@ fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>)
         let hf = w[4].max(0.005);
         sstep(lo - lf, lo + lf, l) * (1.0 - sstep(hi - hf, hi + hf, l))
     } else if kind == 1 {
-        // gradient: [x1,y1,x2,y2,*,soft] — full cover before the p1..p2 span
+        // gradient: [x1,y1,x2,y2,mid,soft] — full cover before the p1..p2
+        // span; the 1→0 ramp centres at t=mid (0.5 unless overridden).
         let (ax, ay, bx, by) = (w[1], w[2], w[3], w[4]);
         let soft = w[6].max(0.02);
+        let mid = if w[11] > 0.001 { w[11] } else { 0.5 };
         let dx = bx - ax;
         let dy = by - ay;
         let len2 = (dx * dx + dy * dy).max(1e-6);
         let t = ((nx - ax) * dx + (ny - ay) * dy) / len2;
-        1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t)
+        1.0 - sstep(mid - soft * 0.5, mid + soft * 0.5, t)
     } else {
-        // circle/ellipse: [cx,cy,rx,ry,rot,soft]
+        // circle/ellipse: [cx,cy,rx,ry,rot,soft] — mid moves the 50% radius.
         let rot = w[5].to_radians();
         let dx = nx - w[1];
         let dy = ny - w[2];
@@ -3296,7 +3298,15 @@ fn window_mask(w: &[f32], nx: f32, ny: f32, col: [f32; 3], subj: Option<&Matte>)
         let ux = (dx * rot.cos() + dy * rot.sin()) / rx;
         let uy = (-dx * rot.sin() + dy * rot.cos()) / ry;
         let d = (ux * ux + uy * uy).sqrt();
-        1.0 - sstep(1.0 - w[6].clamp(0.0, 0.95), 1.0, d)
+        let soft = w[6].clamp(0.0, 0.95);
+        let mid = if w[11] > 0.001 {
+            w[11].clamp(0.01, 0.99)
+        } else {
+            1.0 - soft * 0.5
+        };
+        let r0 = (mid - soft * 0.5).max(0.0);
+        let r1 = (mid + soft * 0.5).min(1.0);
+        1.0 - sstep(r0, r1.max(r0 + 0.01), d)
     };
     if inv {
         1.0 - mask

@@ -1513,6 +1513,7 @@ fn seed_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
 // shared power-window mask eval (used by local_ops and the stage key).
 fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
+    let mid_in = w2.w;
     let kb = u32(w2.y);
     let kind = kb & 1u;
     var mask = 0.0;
@@ -1528,7 +1529,8 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         let len2 = max(dot(dvec, dvec), 1e-6);
         let t = dot(vec2<f32>(nx, ny) - w0.xy, dvec) / len2;
         let soft = max(w1.y, 0.02);
-        mask = 1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t);
+        let mid = select(0.5, mid_in, mid_in > 0.001);
+        mask = 1.0 - sstep(mid - soft * 0.5, mid + soft * 0.5, t);
     } else {
         let rot = w1.x * 0.0174533;
         let dd = vec2<f32>(nx, ny) - w0.xy;
@@ -1536,7 +1538,11 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
         let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
         let d = length(vec2<f32>(ux, uy));
-        mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
+        let soft = clamp(w1.y, 0.0, 0.95);
+        let rmid = select(1.0 - soft * 0.5, clamp(mid_in, 0.01, 0.99), mid_in > 0.001);
+        let r0 = max(rmid - soft * 0.5, 0.0);
+        let r1 = min(rmid + soft * 0.5, 1.0);
+        mask = 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
     }
     if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
     if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
@@ -2214,7 +2220,7 @@ impl Gpu {
                 for (i, w) in p.wins.iter().take(4).enumerate() {
                     a[i * 4] = [w[1], w[2], w[3], w[4]];
                     a[i * 4 + 1] = [w[5], w[6], w[7], w[8]];
-                    a[i * 4 + 2] = [w[9], w[0], w[10], 0.0];
+                    a[i * 4 + 2] = [w[9], w[0], w[10], w[11]];
                 }
                 a
             },
