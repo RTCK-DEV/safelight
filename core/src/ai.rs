@@ -7,8 +7,29 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(target_os = "macos")]
 const ORT_RELEASE_URL: &str =
     "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-arm64-1.22.0.tgz";
+#[cfg(target_os = "windows")]
+const ORT_RELEASE_URL: &str =
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip";
+#[cfg(target_os = "linux")]
+const ORT_RELEASE_URL: &str =
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz";
+
+#[cfg(target_os = "windows")]
+pub(crate) const ORT_LIB_NAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "macos")]
+pub(crate) const ORT_LIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(target_os = "linux")]
+pub(crate) const ORT_LIB_NAME: &str = "libonnxruntime.so";
+
+#[cfg(target_os = "windows")]
+const ORT_PKG_DIR: &str = "onnxruntime-win-x64-1.22.0";
+#[cfg(target_os = "macos")]
+const ORT_PKG_DIR: &str = "onnxruntime-osx-arm64-1.22.0";
+#[cfg(target_os = "linux")]
+const ORT_PKG_DIR: &str = "onnxruntime-linux-x64-1.22.0";
 const SCUNET_BASE: &str = "https://huggingface.co/Heliosoph/scunet-onnx/resolve/main";
 const U2NET_BASE: &str = "https://huggingface.co/Heliosoph/u2net-onnx/resolve/main";
 
@@ -38,7 +59,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Locate (or fetch) libonnxruntime.dylib.
+/// Locate (or fetch) the ONNX Runtime shared library.
 fn ort_dylib() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
         if Path::new(&p).exists() {
@@ -49,8 +70,8 @@ fn ort_dylib() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         for cand in [
             exe.parent()
-                .map(|p| p.join("../Frameworks/libonnxruntime.dylib")),
-            exe.parent().map(|p| p.join("libonnxruntime.dylib")),
+                .map(|p| p.join(format!("../Frameworks/{ORT_LIB_NAME}"))),
+            exe.parent().map(|p| p.join(ORT_LIB_NAME)),
         ]
         .into_iter()
         .flatten()
@@ -61,35 +82,76 @@ fn ort_dylib() -> Result<PathBuf> {
         }
     }
     let dir = ai_dir();
-    let lib = dir.join("libonnxruntime.dylib");
+    let lib = dir.join(ORT_LIB_NAME);
     if lib.exists() {
         return Ok(lib);
     }
-    // Fetch the release tarball and extract just the dylib.
-    let tgz = dir.join("ort.tgz");
-    download(ORT_RELEASE_URL, &tgz)?;
-    let status = std::process::Command::new("tar")
-        .args([
-            "xzf",
-            &tgz.to_string_lossy(),
-            "-C",
-            &dir.to_string_lossy(),
-            "--strip-components=2",
-            "onnxruntime-osx-arm64-1.22.0/lib/libonnxruntime.1.22.0.dylib",
-        ])
-        .status()?;
-    if !status.success() {
-        bail!("tar extract onnxruntime failed");
+    // Fetch the release archive and extract just the library.
+    #[cfg(target_os = "windows")]
+    {
+        let zip = dir.join("ort.zip");
+        download(ORT_RELEASE_URL, &zip)?;
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Add-Type -A System.IO.Compression.FileSystem; \
+                     [IO.Compression.ZipFile]::ExtractToDirectory('{}','{}')",
+                    zip.to_string_lossy(),
+                    dir.to_string_lossy()
+                ),
+            ])
+            .status()?;
+        if !status.success() {
+            bail!("zip extract onnxruntime failed");
+        }
+        let extracted = dir.join(ORT_PKG_DIR).join("lib").join(ORT_LIB_NAME);
+        if extracted.exists() {
+            std::fs::rename(&extracted, &lib)?;
+        }
+        // onnxruntime.dll resolves its providers next to itself
+        for aux in ["onnxruntime_providers_shared.dll"] {
+            let src = dir.join(ORT_PKG_DIR).join("lib").join(aux);
+            let dst = dir.join(aux);
+            if src.exists() && !dst.exists() {
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir.join(ORT_PKG_DIR));
+        let _ = std::fs::remove_file(&zip);
     }
-    let extracted = dir.join("libonnxruntime.1.22.0.dylib");
-    if extracted.exists() {
-        std::fs::rename(&extracted, &lib)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        const MEMBER: &str = "libonnxruntime.1.22.0.dylib";
+        #[cfg(target_os = "linux")]
+        const MEMBER: &str = "libonnxruntime.so.1.22.0";
+        let tgz = dir.join("ort.tgz");
+        download(ORT_RELEASE_URL, &tgz)?;
+        let status = std::process::Command::new("tar")
+            .args([
+                "xzf",
+                &tgz.to_string_lossy(),
+                "-C",
+                &dir.to_string_lossy(),
+                "--strip-components=2",
+                &format!("{ORT_PKG_DIR}/lib/{MEMBER}"),
+            ])
+            .status()?;
+        if !status.success() {
+            bail!("tar extract onnxruntime failed");
+        }
+        let extracted = dir.join(MEMBER);
+        if extracted.exists() {
+            std::fs::rename(&extracted, &lib)?;
+        }
+        let _ = std::fs::remove_file(&tgz);
     }
-    let _ = std::fs::remove_file(&tgz);
     if lib.exists() {
         Ok(lib)
     } else {
-        bail!("libonnxruntime not present after download")
+        bail!("{ORT_LIB_NAME} not present after download")
     }
 }
 

@@ -46,7 +46,7 @@ impl Engine {
         // load-dynamic fallback reads that env var, so every ort code path
         // (including any that might run before ai::ort_ready) can dlopen it.
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-            let lib = crate::ai::ai_dir().join("libonnxruntime.dylib");
+            let lib = crate::ai::ai_dir().join(crate::ai::ORT_LIB_NAME);
             if lib.exists() {
                 unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib) };
             }
@@ -175,11 +175,26 @@ impl Engine {
     pub fn ai_subject_prepare(&self, path: &Path) -> Result<(usize, usize)> {
         let img = self.render(path, &Recipe::default(), 1024)?;
         let (w, h) = (img.width as usize, img.height as usize);
-        let rgb8: Vec<u8> = img
+        // exposure-normalize the inference input: U-2-Net was trained on
+        // normally-exposed photos, so lift dark previews toward p95≈0.85
+        // (the matte is brightness-invariant in intent, not in practice).
+        let mut rgb8: Vec<u8> = img
             .data
             .chunks_exact(4)
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
+        let mut lums: Vec<u16> = rgb8
+            .chunks_exact(3)
+            .map(|c| (54 * c[0] as u16 + 183 * c[1] as u16 + 19 * c[2] as u16) / 255)
+            .collect();
+        lums.sort_unstable();
+        let p95 = lums[(lums.len() * 95 / 100).min(lums.len() - 1)] as f32 / 255.0;
+        if p95 > 1e-3 && p95 < 0.7 {
+            let g = (0.85 / p95).min(8.0);
+            for c in rgb8.iter_mut() {
+                *c = ((*c as f32 * g).min(255.0)) as u8;
+            }
+        }
         let matte = crate::ai::subject_mask(&rgb8, w, h)?;
         let pix: Vec<u16> = matte
             .iter()
