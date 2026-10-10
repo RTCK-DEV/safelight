@@ -1669,6 +1669,21 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
     var mask = 0.0;
     if ((kb & 16u) != 0u) {
         mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 64u) != 0u) {
+        // LR person-part mask (MaskSubType=3): subject matte gated by a
+        // soft ellipse prior positioned at the named body region.
+        let rot = w1.x * 0.0174533;
+        let dd = vec2<f32>(nx, ny) - w0.xy;
+        let rr = max(w0.zw, vec2<f32>(0.005));
+        let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
+        let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
+        let d = length(vec2<f32>(ux, uy));
+        let soft = clamp(w1.y, 0.0, 0.95);
+        let rmid = select(1.0 - soft * 0.5, clamp(mid_in, 0.01, 0.99), mid_in > 0.001);
+        let r0 = max(rmid - soft * 0.5, 0.0);
+        let r1 = min(rmid + soft * 0.5, 1.0);
+        let ell = 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
+        mask = ell * select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
     } else if ((kb & 32u) != 0u) {
         mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
     } else if ((kb & 4u) != 0u) {

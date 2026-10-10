@@ -756,6 +756,23 @@ fn mask_blocks(item: &str, what: &str) -> Vec<String> {
     out
 }
 
+/// LR person-part mask names (MaskSubType=3) → soft-ellipse prior over a
+/// typically-framed portrait subject: (cx, cy, rx, ry) in normalized image
+/// coords. We have no per-part segmentation model, so the subject matte is
+/// gated by this region — approximate, but lands the adjustment on the
+/// right end of the person instead of dropping it entirely.
+fn part_prior(name: &str) -> (f32, f32, f32, f32) {
+    match name {
+        "Iris and Pupil" | "Eye Sclera" | "Eyebrows" => (0.5, 0.28, 0.10, 0.07),
+        "Lips" | "Teeth" | "Facial Hair" => (0.5, 0.36, 0.09, 0.07),
+        "Face Skin" | "Facial Skin" => (0.5, 0.28, 0.13, 0.15),
+        "Hair" => (0.5, 0.14, 0.16, 0.12),
+        "Body Skin" => (0.5, 0.55, 0.25, 0.40),
+        "Clothes" => (0.5, 0.72, 0.22, 0.26),
+        _ => (0.5, 0.30, 0.15, 0.30),
+    }
+}
+
 /// LR local corrections (graduated filter, radial filter, adjustment
 /// brush) → our power windows and brush layers. Handles both the legacy
 /// per-kind lists and the unified LR11+ MaskGroupBasedCorrections.
@@ -788,19 +805,31 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 sat /= 100.0;
             }
             let sat = sat.clamp(-1.0, 1.0);
-            let temp =
-                (field(&item, "crs:LocalTemperature").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
+            // LR writes local sliders either 0-100 (UI units) or already
+            // normalized (-1..1) in Adaptive/preset XMP — the 1.5 threshold
+            // distinguishes the two, same convention as saturation above.
+            let loc = |names: &[&str]| {
+                let v = field_any(&item, names).unwrap_or(0.0);
+                (if v.abs() > 1.5 { v / 100.0 } else { v }).clamp(-1.0, 1.0)
+            };
+            let temp = loc(&["crs:LocalTemperature"]);
             // extended LR local adjustments (contrast/clarity/dehaze/tint)
-            let loc =
-                |names: &[&str]| (field_any(&item, names).unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
             let con = loc(&["crs:LocalContrast2012", "crs:LocalContrast"]);
-            let cla = loc(&["crs:LocalClarity2012", "crs:LocalClarity"]);
+            // texture/sharpness/noise have no dedicated channel: fold them
+            // into the midtone-contrast channel (clarity) as an approximation
+            let cla = (loc(&["crs:LocalClarity2012", "crs:LocalClarity"])
+                + loc(&["crs:LocalTexture"]) * 0.6
+                + loc(&["crs:LocalSharpness"]) * 0.5
+                - loc(&["crs:LocalLuminanceNoise"]) * 0.6)
+                .clamp(-1.0, 1.0);
             let deh = loc(&["crs:LocalDehaze"]);
             let tin = loc(&["crs:LocalTint"]);
             let hi = loc(&["crs:LocalHighlights2012", "crs:LocalHighlights"]);
             let sh = loc(&["crs:LocalShadows2012", "crs:LocalShadows"]);
             let wh = loc(&["crs:LocalWhites2012", "crs:LocalWhites"]);
             let bl = loc(&["crs:LocalBlacks2012", "crs:LocalBlacks"]);
+            // legacy PV2003 "Brightness" ≈ gamma-lift — approximate as exposure
+            let ev = (ev + loc(&["crs:LocalBrightness"]) * 0.5).clamp(-4.0, 4.0);
             let feather_of =
                 |mb: &str| (field(mb, "crs:Feather").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0);
             // LR midpoint (0..100): 0 = at the zero-effect boundary.
@@ -870,13 +899,19 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 ));
             }
             // AI masks (MaskGroupBasedCorrections): MaskSubType 1 = AI
-            // subject matte, 2 = sky (heuristic matte)
+            // subject matte, 2 = sky (heuristic matte), 3 = person part
+            // (subject matte gated by a body-region prior from MaskName)
             for mb in mask_blocks(&item, "Image") {
                 let sub = field(&mb, "crs:MaskSubType").unwrap_or(0.0) as i32;
                 if sub == 1 {
                     r.windows.push(win("subject", [0.0; 6], 0.0, false));
                 } else if sub == 2 {
                     r.windows.push(win("sky", [0.0; 6], 0.0, false));
+                } else if sub == 3 {
+                    let name = field_str(&mb, "crs:MaskName").unwrap_or_default();
+                    let (cx, cy, rx, ry) = part_prior(&name);
+                    r.windows
+                        .push(win("part", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
                 }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
@@ -1216,6 +1251,48 @@ mod tests {
         assert!((c[0] - 0.6).abs() < 1e-6 && (c[1] - 0.5).abs() < 1e-6);
         assert!((c[2] - 0.4).abs() < 1e-6 && (c[3] - 0.5).abs() < 1e-6);
         assert!((c[4] - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ai_mask_subtypes_and_fractional_locals() {
+        // Adobe Adaptive presets write fractional (-1..1) local sliders and
+        // AI mask subtypes: 1 = subject, 2 = sky, 3 = person part.
+        let body = r##"<x:xmpmeta><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="">
+ <crs:MaskGroupBasedCorrections>
+  <rdf:Seq>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:LocalDehaze="0.247045" crs:LocalLuminanceNoise="0.798285" crs:LocalSaturation="-0.350261">
+    <crs:CorrectionMasks>
+     <rdf:Seq>
+      <rdf:li crs:What="Mask/Image" crs:MaskName="Sky" crs:MaskSubType="2"/>
+     </rdf:Seq>
+    </crs:CorrectionMasks>
+   </rdf:li>
+   <rdf:li crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:LocalSaturation="0.07325" crs:LocalSharpness="0.144355">
+    <crs:CorrectionMasks>
+     <rdf:Seq>
+      <rdf:li crs:What="Mask/Image" crs:MaskName="Iris and Pupil" crs:MaskSubType="3"/>
+     </rdf:Seq>
+    </crs:CorrectionMasks>
+   </rdf:li>
+  </rdf:Seq>
+ </crs:MaskGroupBasedCorrections>
+</rdf:Description></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(body);
+        assert_eq!(r.windows.len(), 2);
+        let sky = &r.windows[0];
+        assert_eq!(sky.kind, "sky");
+        // fractional values pass through unscaled (not divided by 100)
+        assert!((sky.dehaze - 0.247045).abs() < 1e-5);
+        assert!((sky.sat + 0.350261).abs() < 1e-5);
+        // luminance noise folds into negative clarity
+        assert!(sky.clarity < -0.4);
+        let part = &r.windows[1];
+        assert_eq!(part.kind, "part");
+        // Iris prior: centered near the upper-middle of the frame
+        assert!((part.p[0] - 0.5).abs() < 1e-6 && (part.p[1] - 0.28).abs() < 1e-6);
+        assert!((part.sat - 0.07325).abs() < 1e-5);
+        // sharpness folds into positive clarity
+        assert!(part.clarity > 0.05);
     }
 
     #[test]

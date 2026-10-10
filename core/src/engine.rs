@@ -98,7 +98,7 @@ impl Engine {
         let subj = if recipe
             .windows
             .iter()
-            .any(|w| w.kind == "subject" && w.enabled)
+            .any(|w| (w.kind == "subject" || w.kind == "part") && w.enabled)
         {
             load_subject_cache(path)
         } else {

@@ -926,13 +926,15 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         let lum = w.kind == "lum";
         let subj = w.kind == "subject";
         let skyw = w.kind == "sky";
+        let part = w.kind == "part";
         wins[i] = [
             (if grad { 1.0 } else { 0.0 })
                 + (if w.invert { 2.0 } else { 0.0 })
                 + (if lum { 4.0 } else { 0.0 })
                 + (if w.link_q { 8.0 } else { 0.0 })
                 + (if subj { 16.0 } else { 0.0 })
-                + (if skyw { 32.0 } else { 0.0 }),
+                + (if skyw { 32.0 } else { 0.0 })
+                + (if part { 64.0 } else { 0.0 }),
             if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
             if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
             if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
@@ -3545,6 +3547,28 @@ fn window_mask(
     let mask = if base & 16 != 0 {
         // AI subject matte: bilinear sample in normalized dst coords
         subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if base & 64 != 0 {
+        // LR person-part mask (MaskSubType=3): subject matte gated by a
+        // soft ellipse prior positioned at the named body region
+        // (approximation — we have no per-part segmentation model).
+        let rot = w[5].to_radians();
+        let dx = nx - w[1];
+        let dy = ny - w[2];
+        let rx = w[3].max(0.005);
+        let ry = w[4].max(0.005);
+        let ux = (dx * rot.cos() + dy * rot.sin()) / rx;
+        let uy = (-dx * rot.sin() + dy * rot.cos()) / ry;
+        let d = (ux * ux + uy * uy).sqrt();
+        let soft = w[6].clamp(0.0, 0.95);
+        let mid = if w[11] > 0.001 {
+            w[11].clamp(0.01, 0.99)
+        } else {
+            1.0 - soft * 0.5
+        };
+        let r0 = (mid - soft * 0.5).max(0.0);
+        let r1 = (mid + soft * 0.5).min(1.0);
+        let ell = 1.0 - sstep(r0, r1.max(r0 + 0.01), d);
+        ell * subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
     } else if base & 32 != 0 {
         // heuristic sky matte (LR sky AI masks)
         sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
@@ -4037,4 +4061,36 @@ fn sharpen_clarity(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LR person-part masks (kind "part", flag 64): the subject matte is
+    /// gated by a soft ellipse prior — full matte → mask ≈ ellipse, zero
+    /// matte → mask 0 even inside the prior.
+    #[test]
+    fn part_mask_gates_subject_matte_by_region() {
+        let m = Matte {
+            w: 8,
+            h: 8,
+            data: vec![65535u16; 64],
+        };
+        // flag 64, centre (.5,.3), radii (.1,.07), rot 0, soft .4, mid 0
+        let mut w = [0.0f32; 20];
+        w[0] = 64.0;
+        w[1] = 0.5;
+        w[2] = 0.3;
+        w[3] = 0.1;
+        w[4] = 0.07;
+        w[6] = 0.4;
+        w[10] = 1.0;
+        // centre of the prior → mask ≈ 1
+        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None) > 0.9);
+        // far outside the ellipse → ≈ 0
+        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None) < 0.05);
+        // no subject matte → no mask at all
+        assert_eq!(window_mask(&w, 0.5, 0.3, [0.5; 3], None, None), 0.0);
+    }
 }
