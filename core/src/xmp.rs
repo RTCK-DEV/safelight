@@ -136,6 +136,14 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         lr(r.vignette, 100.0),
         lr(r.grain, 100.0)
     ));
+    if r.vig_mid >= 0.0 || r.vig_round > -2.0 || r.vig_feather >= 0.0 {
+        a.push_str(&format!(
+            "   crs:PostCropVignetteMidpoint=\"{:.0}\" crs:PostCropVignetteRoundness=\"{:.0}\" crs:PostCropVignetteFeather=\"{:.0}\"\n",
+            if r.vig_mid >= 0.0 { r.vig_mid } else { 0.5 } * 100.0,
+            if r.vig_round > -2.0 { r.vig_round } else { 0.0 } * 100.0,
+            if r.vig_feather >= 0.0 { r.vig_feather } else { 0.5 } * 100.0
+        ));
+    }
     if sc.rating != 0 {
         a.push_str(&format!("   xmp:Rating=\"{}\"\n", sc.rating.clamp(-1, 5)));
     }
@@ -425,6 +433,15 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(v) = attr(&body, "crs:PostCropVignetteAmount") {
             r.vignette = v / 100.0;
         }
+        if let Some(v) = attr(&body, "crs:PostCropVignetteMidpoint") {
+            r.vig_mid = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:PostCropVignetteRoundness") {
+            r.vig_round = (v / 100.0).clamp(-1.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:PostCropVignetteFeather") {
+            r.vig_feather = (v / 100.0).clamp(0.0, 1.0);
+        }
         if let Some(v) = attr(&body, "crs:GrainAmount") {
             r.grain = (v / 100.0).clamp(0.0, 1.0);
         }
@@ -703,6 +720,15 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     mid,
                     flipped,
                 ));
+            }
+            // AI masks (MaskGroupBasedCorrections): MaskSubType 1 = AI
+            // subject → our subject matte window. (2 = sky: no matte.)
+            for mb in mask_blocks(&item, "Image") {
+                let sub = field(&mb, "crs:MaskSubType").unwrap_or(0.0) as i32;
+                if sub == 1 {
+                    r.windows
+                        .push(win("subject", [0.0; 6], 0.0, false));
+                }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
             let mut strokes = Vec::new();

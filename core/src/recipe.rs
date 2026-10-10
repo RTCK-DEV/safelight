@@ -56,6 +56,18 @@ pub struct Recipe {
     pub clarity: f32,
     /// corner darkening -1..1 (positive darkens)
     pub vignette: f32,
+    /// post-crop vignette midpoint: normalized radius of the 50% mark,
+    /// 0..1 (LR 0..100). -1 = unset → legacy fixed ramp
+    #[serde(default = "neg_one")]
+    pub vig_mid: f32,
+    /// post-crop vignette roundness -1..1: -1 = frame-following square,
+    /// +1 = circle (LR -100..100). -2 = unset
+    #[serde(default = "neg_two")]
+    pub vig_round: f32,
+    /// post-crop vignette feather 0..1: transition width (LR 0..100).
+    /// -1 = unset
+    #[serde(default = "neg_one")]
+    pub vig_feather: f32,
     /// film grain 0..1
     pub grain: f32,
     // ---- grading (DaVinci-style lift/gamma/gain + split tone + look) ----
@@ -352,6 +364,12 @@ fn default_true() -> bool {
 fn default_one() -> f32 {
     1.0
 }
+fn neg_one() -> f32 {
+    -1.0
+}
+fn neg_two() -> f32 {
+    -2.0
+}
 
 impl Default for PowerWindow {
     fn default() -> Self {
@@ -391,6 +409,9 @@ impl Default for Recipe {
             rotation_deg: 0.0,
             clarity: 0.0,
             vignette: 0.0,
+            vig_mid: -1.0,
+            vig_round: -2.0,
+            vig_feather: -1.0,
             grain: 0.0,
             lift: [0.0; 3],
             gamma: [1.0; 3],

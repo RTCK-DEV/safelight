@@ -42,6 +42,8 @@ pub struct Params {
     pub rotation_deg: f32,
     pub clarity: f32,
     pub vignette: f32,
+    /// post-crop vignette shape [mid, round, feather]; mid<0 = legacy ramp
+    pub vig_shape: [f32; 3],
     pub grain: f32,
     // grading
     pub lift: [f32; 3],
@@ -1063,6 +1065,27 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         rotation_deg: r.rotation_deg.clamp(-45.0, 45.0),
         clarity: r.clarity.clamp(-1.0, 1.0),
         vignette: r.vignette.clamp(-1.0, 1.0),
+        vig_shape: if r.vig_mid < 0.0 && r.vig_round <= -2.0 && r.vig_feather < 0.0 {
+            [-1.0, 0.0, 0.0]
+        } else {
+            [
+                if r.vig_mid >= 0.0 {
+                    r.vig_mid.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                },
+                if r.vig_round > -2.0 {
+                    r.vig_round.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                },
+                if r.vig_feather >= 0.0 {
+                    r.vig_feather.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                },
+            ]
+        },
         grain: r.grain.clamp(0.0, 1.0),
         lift: [
             r.lift[0].clamp(-0.5, 0.5),
@@ -3042,8 +3065,23 @@ fn finish_linear(
             if p.vignette != 0.0 {
                 let vx = nx * 2.0 - 1.0;
                 let vy = ny * 2.0 - 1.0;
-                let d = (vx * vx + vy * vy).sqrt() * 0.7071;
-                let f = 1.0 - p.vignette * sstep(0.35, 1.05, d) * 0.9;
+                // LR post-crop vignette shape: midpoint = 50% radius,
+                // feather = ramp width, roundness mixes frame-aligned
+                // (chebyshev) distance toward circular.
+                let (d, r0, r1) = if p.vig_shape[0] >= 0.0 {
+                    let dc = (vx * vx + vy * vy).sqrt() * 0.7071;
+                    let dr = vx.abs().max(vy.abs());
+                    let w = (p.vig_shape[1] + 1.0) * 0.5;
+                    let wid = p.vig_shape[2].max(0.02);
+                    (
+                        dr + (dc - dr) * w,
+                        p.vig_shape[0] - wid * 0.5,
+                        p.vig_shape[0] + wid * 0.5,
+                    )
+                } else {
+                    ((vx * vx + vy * vy).sqrt() * 0.7071, 0.35, 1.05)
+                };
+                let f = 1.0 - p.vignette * sstep(r0, r1, d) * 0.9;
                 for c in &mut adj {
                     *c *= f;
                 }

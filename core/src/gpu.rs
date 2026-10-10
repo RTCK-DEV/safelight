@@ -125,8 +125,10 @@ struct Uni {
     cs: [[f32; 4]; 7],
     /// ColorWarper: 8 points × 2 vec4 ([h,s,dh,ds] then [radius,0,0,0])
     warp: [[f32; 4]; 16],
-    /// [n_warp, has_cs, 0, 0]
+    /// [n_warp, has_cs, sharp_mask, 0]
     csn: [f32; 4],
+    /// post-crop vignette shape [mid, round, feather, 0] (mid<0 = legacy)
+    extra0: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -200,6 +202,8 @@ struct Uni {
     cs: array<vec4<f32>, 7>,
     warp: array<vec4<f32>, 16>,
     csn: vec4<f32>,
+    // post-crop vignette shape [mid, round, feather, 0]
+    extra0: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1776,8 +1780,18 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     if (pg.a3.w != 0.0) {
         let vx = nx * 2.0 - 1.0;
         let vy = ny * 2.0 - 1.0;
-        let d = length(vec2<f32>(vx, vy)) * 0.7071;
-        adj = adj * (1.0 - pg.a3.w * sstep(0.35, 1.05, d) * 0.9);
+        var d = length(vec2<f32>(vx, vy)) * 0.7071;
+        var r0 = 0.35;
+        var r1 = 1.05;
+        if (pg.extra0.x >= 0.0) {
+            let dr = max(abs(vx), abs(vy));
+            let w = (pg.extra0.y + 1.0) * 0.5;
+            let wid = max(pg.extra0.z, 0.02);
+            d = dr + (d - dr) * w;
+            r0 = pg.extra0.x - wid * 0.5;
+            r1 = pg.extra0.x + wid * 0.5;
+        }
+        adj = adj * (1.0 - pg.a3.w * sstep(r0, r1, d) * 0.9);
     }
     let enc = srgb_encode(clamp(adj.x, 0.0, 1.0)) * 255.0 + 0.5;
     let enc2 = srgb_encode(clamp(adj.y, 0.0, 1.0)) * 255.0 + 0.5;
@@ -2312,6 +2326,7 @@ impl Gpu {
                 p.sharp_mask,
                 0.0,
             ],
+            extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
