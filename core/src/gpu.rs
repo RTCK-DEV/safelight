@@ -137,6 +137,10 @@ struct Uni {
     extra0: [f32; 4],
     /// [grain_size px, grain_rough, sharp_radius, sharp_detail]
     extra1: [f32; 4],
+    /// LR camera calibration: 3x3 matrix rows + [shadow_tint,0,0,0]
+    cal0: [f32; 4],
+    cal1: [f32; 4],
+    cal2: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -219,6 +223,10 @@ struct Uni {
     extra0: vec4<f32>,
     // [grain cell size, roughness, sharpen radius, sharpen detail]
     extra1: vec4<f32>,
+    // LR camera calibration: 3x3 matrix rows + [shadow_tint,0,0,0]
+    cal0: vec4<f32>,
+    cal1: vec4<f32>,
+    cal2: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1337,7 +1345,23 @@ fn qual_mask(c: vec3<f32>) -> f32 {
 }
 
 fn adjust(px: vec3<f32>) -> vec3<f32> {
-    var x = px * pg.a1.x;
+    // camera calibration: primary hue/sat matrix + shadow green/magenta
+    var x = px;
+    if (abs(pg.cal0.x - 1.0) > 1e-5 || abs(pg.cal1.y - 1.0) > 1e-5
+        || abs(pg.cal2.z - 1.0) > 1e-5 || abs(pg.cal0.y) > 1e-5
+        || abs(pg.cal0.z) > 1e-5 || abs(pg.cal1.x) > 1e-5
+        || abs(pg.cal1.z) > 1e-5 || abs(pg.cal2.x) > 1e-5
+        || abs(pg.cal2.y) > 1e-5) {
+        x = vec3<f32>(
+            dot(pg.cal0.xyz, x),
+            dot(pg.cal1.xyz, x),
+            dot(pg.cal2.xyz, x));
+    }
+    if (pg.cal0.w != 0.0) {
+        let l = luma(x);
+        x = vec3<f32>(x.x, x.y - pg.cal0.w * (1.0 - sstep(0.0, 0.4, l)) * 0.05, x.z);
+    }
+    x = x * pg.a1.x;
     // auto-contrast percentile remap
     if (pg.misc.y - pg.misc.x < 0.999 || pg.misc.x > 0.001) {
         x = (x - vec3<f32>(pg.misc.x)) / max(pg.misc.y - pg.misc.x, 0.02);
@@ -2601,6 +2625,9 @@ impl Gpu {
             ],
             extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
             extra1: [p.grain_size, p.grain_rough, p.sharp_radius, p.sharp_detail],
+            cal0: [p.calib[0], p.calib[1], p.calib[2], p.calib[9]],
+            cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
+            cal2: [p.calib[6], p.calib[7], p.calib[8], 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so

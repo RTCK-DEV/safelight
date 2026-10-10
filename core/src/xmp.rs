@@ -169,6 +169,18 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             if r.vig_feather >= 0.0 { r.vig_feather } else { 0.5 } * 100.0
         ));
     }
+    if r.calib.iter().any(|&v| v != 0.0) {
+        a.push_str(&format!(
+            "   crs:ShadowTint=\"{:.0}\" crs:RedHue=\"{:.0}\" crs:RedSaturation=\"{:.0}\" crs:GreenHue=\"{:.0}\" crs:GreenSaturation=\"{:.0}\" crs:BlueHue=\"{:.0}\" crs:BlueSaturation=\"{:.0}\"\n",
+            r.calib[0] * 100.0,
+            r.calib[1] * 100.0,
+            r.calib[2] * 100.0,
+            r.calib[3] * 100.0,
+            r.calib[4] * 100.0,
+            r.calib[5] * 100.0,
+            r.calib[6] * 100.0
+        ));
+    }
     if sc.rating != 0 {
         a.push_str(&format!("   xmp:Rating=\"{}\"\n", sc.rating.clamp(-1, 5)));
     }
@@ -546,6 +558,18 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(v) = attr(&body, "crs:DefringeGreenHueHi") {
             r.defringe_gr[2] = 60.0 + v * 1.2;
         }
+        // camera calibration panel: ShadowTint + per-primary hue/sat
+        // (all -100..100 → -1..1)
+        let cal = |names: &[&str]| (attr_any(&body, names).unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0);
+        r.calib = [
+            cal(&["crs:ShadowTint"]),
+            cal(&["crs:RedHue"]),
+            cal(&["crs:RedSaturation"]),
+            cal(&["crs:GreenHue"]),
+            cal(&["crs:GreenSaturation"]),
+            cal(&["crs:BlueHue"]),
+            cal(&["crs:BlueSaturation"]),
+        ];
         if let Some(v) = attr(&body, "crs:CropAngle") {
             r.rotation_deg = v;
         }

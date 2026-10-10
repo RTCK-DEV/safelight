@@ -170,6 +170,9 @@ pub struct Params {
     /// profile tone curve as a 256-entry LUT on each channel 0..1,
     /// applied at the start of adjust() (empty = identity)
     pub profile_tone_lut: Vec<f32>,
+    /// LR camera calibration: 3x3 chroma-rotation matrix (row-major 9)
+    /// + shadow green/magenta tint [9..12]
+    pub calib: [f32; 12],
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -1275,6 +1278,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         profile_hsm,
         profile_look,
         profile_tone_lut,
+        calib: calib_matrix(&r.calib),
     };
     // heuristic look adjustments are skipped when the named look was
     // upgraded to a real .dcp (the profile IS the look now)
@@ -1409,8 +1413,58 @@ fn zone_ev_at(l: f32, z: &[f32; 9]) -> f32 {
 /// apply tone+color adjustments on linear sRGB triple. Shared logic with gpu shader.
 /// order: exposure -> auto-contrast remap -> lift/gamma/gain -> blacks/whites ->
 ///        contrast -> shadows/highlights -> saturation/vibrance -> split tone -> LUT
+/// LR camera calibration → 3x3 matrix + shadow tint packed into 12
+/// floats. Each primary's chroma vector (primary - gray/3) is rotated in
+/// the plane ⟂ (1,1,1) by its hue slider (±60° max, + = toward the next
+/// primary on the hue wheel) and scaled by its saturation slider.
+fn calib_matrix(c: &[f32; 7]) -> [f32; 12] {
+    let g = 1.0f32 / 3.0;
+    let gh = 1.0 / 3.0f32.sqrt();
+    let mut out = [0.0f32; 12];
+    for j in 0..3 {
+        let mut v = [0.0f32; 3];
+        v[j] = 1.0 - g;
+        v[(j + 1) % 3] -= g;
+        v[(j + 2) % 3] -= g;
+        let vl = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        let e1 = [v[0] / vl, v[1] / vl, v[2] / vl];
+        // e2 = gray_hat × e1 (unit, since gray ⊥ e1)
+        let e2 = [
+            gh * (e1[2] - e1[1]),
+            gh * (e1[0] - e1[2]),
+            gh * (e1[1] - e1[0]),
+        ];
+        let h = c[1 + j * 2].clamp(-1.0, 1.0) * std::f32::consts::FRAC_PI_3;
+        let s = 1.0 + c[2 + j * 2].clamp(-1.0, 1.0);
+        let (ch, sh) = (h.cos() * vl * s, h.sin() * vl * s);
+        for k in 0..3 {
+            // column j = gray/3 + s * rotated chroma
+            out[k * 3 + j] = g + ch * e1[k] + sh * e2[k];
+        }
+    }
+    out[9] = c[0].clamp(-1.0, 1.0);
+    out
+}
+
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     let mut x = rgb;
+    // camera calibration: primary hue/sat matrix + shadow green/magenta
+    let ident = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    if p.calib[..9]
+        .iter()
+        .zip(ident)
+        .any(|(a, b)| (a - b).abs() > 1e-5)
+    {
+        x = [
+            p.calib[0] * x[0] + p.calib[1] * x[1] + p.calib[2] * x[2],
+            p.calib[3] * x[0] + p.calib[4] * x[1] + p.calib[5] * x[2],
+            p.calib[6] * x[0] + p.calib[7] * x[1] + p.calib[8] * x[2],
+        ];
+    }
+    if p.calib[9] != 0.0 {
+        let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        x[1] -= p.calib[9] * (1.0 - sstep(0.0, 0.4, l)) * 0.05;
+    }
     // .dcp profile "look": ProfileLookTable (HSV shift in working space)
     // then ProfileToneCurve — the profile's base rendering, applied before
     // user edits (dcpsim order: matrix -> looktable -> tonecurve -> user).

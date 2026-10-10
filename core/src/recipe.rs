@@ -163,6 +163,11 @@ pub struct Recipe {
     /// same for the green band
     #[serde(default = "defringe_gr_default")]
     pub defringe_gr: [f32; 3],
+    /// LR camera calibration: [shadow_tint, red_hue, red_sat, green_hue,
+    /// green_sat, blue_hue, blue_sat] all normalized -1..1. Applied as a
+    /// 3x3 chroma-rotation matrix + shadow green/magenta shift.
+    #[serde(default)]
+    pub calib: [f32; 7],
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -541,6 +546,7 @@ impl Default for Recipe {
             shadow_rolloff: 1.0,
             defringe_pu: [0.0, 246.0, 294.0],
             defringe_gr: [0.0, 108.0, 132.0],
+            calib: [0.0; 7],
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),
