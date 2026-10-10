@@ -175,6 +175,10 @@ pub struct Recipe {
     /// 1-subject matte as the focus proxy)
     #[serde(default)]
     pub lens_blur: f32,
+    /// LR Lens Blur bokeh options: [highlight_boost, highlight_thresh,
+    /// aspect(-1..1 squash), shape(0=disc,1=ring), spherical_aberration]
+    #[serde(default)]
+    pub lens_blur_opts: [f32; 5],
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -564,6 +568,7 @@ impl Default for Recipe {
             calib: [0.0; 7],
             texture: 0.0,
             lens_blur: 0.0,
+            lens_blur_opts: [0.0; 5],
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),

@@ -191,9 +191,15 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     a.push_str("   ara:Format=\"1\">\n");
     // Lens Blur (LR12+): child element, not an attribute
     if r.lens_blur > 0.001 {
+        let o = r.lens_blur_opts;
         a.push_str(&format!(
-            "   <crs:LensBlur crs:Version=\"1\" crs:Active=\"true\" crs:FocalRange=\"0 0 100 100\" crs:BlurAmount=\"{:.0}\" crs:BokehShape=\"0\" crs:BokehShapeDetail=\"0\" crs:HighlightsThreshold=\"50\" crs:HighlightsBoost=\"50\" crs:CatEyeAmount=\"0\" crs:CatEyeScale=\"100\" crs:BokehAspect=\"0\" crs:BokehRotation=\"0\" crs:SphericalAberration=\"80\"/>\n",
-            r.lens_blur * 100.0
+            "   <crs:LensBlur crs:Version=\"1\" crs:Active=\"true\" crs:FocalRange=\"0 0 100 100\" crs:BlurAmount=\"{:.0}\" crs:BokehShape=\"{:.0}\" crs:BokehShapeDetail=\"0\" crs:HighlightsThreshold=\"{:.0}\" crs:HighlightsBoost=\"{:.0}\" crs:CatEyeAmount=\"0\" crs:CatEyeScale=\"100\" crs:BokehAspect=\"{:.0}\" crs:BokehRotation=\"0\" crs:SphericalAberration=\"{:.0}\"/>\n",
+            r.lens_blur * 100.0,
+            o[3],
+            o[1] * 100.0,
+            o[0] * 100.0,
+            o[2] * 100.0,
+            o[4] * 100.0
         ));
     }
     // LR-readable local corrections: gradient/circle windows -> the legacy
@@ -601,6 +607,19 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
             let lb = &body[ls..ls + le];
             if attr_str(lb, "crs:Active").as_deref() != Some("false") {
                 r.lens_blur = (attr(lb, "crs:BlurAmount").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0);
+                // bokeh options: [highlight_boost, highlight_thresh, aspect,
+                // shape(0=disc,1=ring), spherical_aberration]
+                r.lens_blur_opts = [
+                    (attr(lb, "crs:HighlightsBoost").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0),
+                    (attr(lb, "crs:HighlightsThreshold").unwrap_or(50.0) / 100.0).clamp(0.0, 1.0),
+                    (attr(lb, "crs:BokehAspect").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+                    if attr(lb, "crs:BokehShape").unwrap_or(0.0) >= 1.0 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    (attr(lb, "crs:SphericalAberration").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+                ];
             }
         }
         // legacy split toning + PV2012 color grading share our

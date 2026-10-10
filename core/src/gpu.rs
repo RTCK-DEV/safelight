@@ -143,6 +143,10 @@ struct Uni {
     cal2: [f32; 4],
     /// LR Texture (global): fine-scale midtone contrast, -1..1
     tex0: [f32; 4],
+    /// LR Lens Blur bokeh: [highlight_boost, highlight_thresh, aspect, shape]
+    lb0: [f32; 4],
+    /// [spherical_aberration, 0, 0, 0]
+    lb1: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -232,6 +236,10 @@ struct Uni {
     cal2: vec4<f32>,
     // LR Texture (global): fine-scale midtone contrast at tex0.x
     tex0: vec4<f32>,
+    // LR Lens Blur bokeh: [highlight_boost, highlight_thresh, aspect, shape]
+    lb0: vec4<f32>,
+    // [spherical_aberration, 0, 0, 0]
+    lb1: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1747,22 +1755,43 @@ fn lbl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     let my = i / mw;
     let r = max(2.0, pg.csn.w * 10.0);
     let r2 = r * r;
+    // lb0 = [highlight_boost, highlight_thresh, aspect, shape]; lb1.x = sa
+    let boost = pg.lb0.x;
+    let thr = pg.lb0.y;
+    let aspect = clamp(pg.lb0.z, -0.8, 0.8);
+    let shape = pg.lb0.w;
+    let sa = pg.lb1.x;
     var acc = vec3<f32>(0.0);
     var wsum = 0.0;
     let ri = i32(ceil(r));
     for (var dy = -ri; dy <= ri; dy = dy + 1) {
         for (var dx = -ri; dx <= ri; dx = dx + 1) {
-            let d2 = f32(dx * dx + dy * dy);
+            let dyy = f32(dy) * (1.0 + aspect);
+            let d2 = f32(dx * dx) + dyy * dyy;
             if (d2 > r2) { continue; }
             let nx2 = i32(mx) + dx;
             let ny2 = i32(my) + dy;
             if (nx2 < 0 || ny2 < 0 || nx2 >= i32(mw) || ny2 >= i32(mh)) {
                 continue;
             }
-            let wg = exp(-d2 / (0.45 * r2));
+            var wg = exp(-d2 / (0.45 * r2));
+            if (shape > 0.5) {
+                let dr = sqrt(d2);
+                let dd = (dr - 0.72 * r) / (0.15 * r);
+                wg = exp(-dd * dd);
+            } else if (sa > 0.0) {
+                wg = wg * (1.0 + sa * 1.5 * sstep(0.55, 0.95, d2 / r2));
+            } else {
+                wg = wg * (1.0 + sa * 0.4);
+            }
             let sx = min(u32((f32(nx2) + 0.5) / f32(mw) * f32(w)), w - 1u);
             let sy = min(u32((f32(ny2) + 0.5) / f32(mh) * f32(h)), h - 1u);
-            acc = acc + io_a[sy * w + sx].xyz * wg;
+            var c = io_a[sy * w + sx].xyz;
+            if (boost > 0.001) {
+                let l = clamp(luma(c), 0.0, 1.0);
+                c = c * (1.0 + boost * 2.0 * sstep(thr, 1.0, l));
+            }
+            acc = acc + c * wg;
             wsum = wsum + wg;
         }
     }
@@ -2710,6 +2739,13 @@ impl Gpu {
             cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
             cal2: [p.calib[6], p.calib[7], p.calib[8], 0.0],
             tex0: [p.texture, 0.0, 0.0, 0.0],
+            lb0: [
+                p.lens_blur_opts[0],
+                p.lens_blur_opts[1],
+                p.lens_blur_opts[2],
+                p.lens_blur_opts[3],
+            ],
+            lb1: [p.lens_blur_opts[4], 0.0, 0.0, 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so

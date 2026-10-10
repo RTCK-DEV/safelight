@@ -177,6 +177,8 @@ pub struct Params {
     pub calib: [f32; 12],
     /// LR Lens Blur amount 0..1 — defocus blend gated by (1-subject matte)
     pub lens_blur: f32,
+    /// [highlight_boost, highlight_thresh, aspect, shape, spherical_ab]
+    pub lens_blur_opts: [f32; 5],
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -1293,6 +1295,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         profile_tone_lut,
         calib: calib_matrix(&r.calib),
         lens_blur: r.lens_blur.clamp(0.0, 1.0),
+        lens_blur_opts: r.lens_blur_opts,
     };
     // heuristic look adjustments are skipped when the named look was
     // upgraded to a real .dcp (the profile IS the look now)
@@ -3189,7 +3192,7 @@ fn finish_linear(
     // (1 - subject matte) — the matte is the focus proxy (LR uses a depth
     // map; "keep the subject sharp, blur the rest" approximates it)
     let lbl = if p.lens_blur > 0.001 {
-        Some(lens_blur_img(&lin, w, h, p.lens_blur))
+        Some(lens_blur_img(&lin, w, h, p.lens_blur, p.lens_blur_opts))
     } else {
         None
     };
@@ -3859,7 +3862,19 @@ fn veg_matte(lin: &[[f32; 3]], w: usize, h: usize) -> Matte {
 
 /// lens blur source: a matte-res (<=192) gaussian-disc blurred copy of the
 /// linear image. Radius scales with amount — mirrors gpu.rs lbl_main.
-fn lens_blur_img(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> (Vec<[f32; 3]>, usize, usize) {
+/// LR Lens Blur bokeh kernel — gaussian disc with shape variants:
+/// aspect squashes the disc into an ellipse, shape=1 is a ring, positive
+/// spherical aberration hardens the disc rim ("bubble"), HighlightsBoost
+/// over-weights bright taps so speculars bloom into bokeh discs.
+/// Mirrored by gpu.rs lbl_main — keep the math identical.
+fn lens_blur_img(
+    lin: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    amt: f32,
+    o: [f32; 5],
+) -> (Vec<[f32; 3]>, usize, usize) {
+    let (boost, thr, aspect, shape, sa) = (o[0], o[1], o[2], o[3], o[4]);
     let mw = w.min(192).max(2);
     let mh = h.min(192).max(2);
     let r = (amt * 10.0).max(2.0);
@@ -3869,10 +3884,11 @@ fn lens_blur_img(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> (Vec<[f32; 3
     for my in 0..mh {
         for mx in 0..mw {
             let mut acc = [0.0f32; 3];
-            let mut wsum = 0.0;
+            let mut wsum = 0.0f32;
             for dy in -ri..=ri {
                 for dx in -ri..=ri {
-                    let d2 = (dx * dx + dy * dy) as f32;
+                    let dyy = dy as f32 * (1.0 + aspect.clamp(-0.8, 0.8));
+                    let d2 = dx as f32 * dx as f32 + dyy * dyy;
                     if d2 > r2 {
                         continue;
                     }
@@ -3881,10 +3897,28 @@ fn lens_blur_img(lin: &[[f32; 3]], w: usize, h: usize, amt: f32) -> (Vec<[f32; 3
                     if nx2 < 0 || ny2 < 0 || nx2 >= mw as i32 || ny2 >= mh as i32 {
                         continue;
                     }
-                    let wg = (-d2 / (0.45 * r2)).exp();
+                    let mut wg = (-d2 / (0.45 * r2)).exp();
+                    if shape > 0.5 {
+                        // ring bokeh: band at ~0.72r
+                        let dr = d2.sqrt();
+                        let dd = (dr - 0.72 * r) / (0.15 * r);
+                        wg = (-dd * dd).exp();
+                    } else if sa > 0.0 {
+                        // hard-edged "bubble" discs: boost the rim
+                        wg *= 1.0 + sa * 1.5 * sstep(0.55, 0.95, d2 / r2);
+                    } else {
+                        wg *= 1.0 + sa * 0.4;
+                    }
                     let sx = (((nx2 as f32 + 0.5) / mw as f32) * w as f32) as usize % w;
                     let sy = (((ny2 as f32 + 0.5) / mh as f32) * h as f32) as usize % h;
-                    let c = lin[sy * w + sx];
+                    let mut c = lin[sy * w + sx];
+                    if boost > 0.001 {
+                        let l = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).clamp(0.0, 1.0);
+                        let bs = 1.0 + boost * 2.0 * sstep(thr, 1.0, l);
+                        for k in 0..3 {
+                            c[k] *= bs;
+                        }
+                    }
                     for k in 0..3 {
                         acc[k] += c[k] * wg;
                     }
