@@ -736,11 +736,28 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         "camera_landscape",
         "camera_faithful",
     ];
-    let prof = if !r.profile.is_empty() || DCP_LOOK_NAMES.contains(&r.look.as_str()) {
+    let mut prof = if !r.profile.is_empty() || DCP_LOOK_NAMES.contains(&r.look.as_str()) {
         load_dcp_profile(r, m)
     } else {
         None
     };
+    // enhanced .xmp profile (crs:Look → Settings/**/Profiles/*.xmp): the
+    // profile's own CameraProfile supplies the base .dcp, its baked-in
+    // grade merges under the user's adjustments.
+    let r_eff_storage;
+    let mut r = r;
+    if prof.is_none() && !r.profile.is_empty() {
+        if let Some((pr, amt)) = crate::xmp::load_xmp_profile(&r.profile) {
+            let mut rr = r.clone();
+            crate::xmp::merge_profile_under(&mut rr, &pr, amt);
+            if !pr.profile.is_empty() {
+                rr.profile = pr.profile.clone();
+            }
+            prof = load_dcp_profile(&rr, m);
+            r_eff_storage = rr;
+            r = &r_eff_storage;
+        }
+    }
     let dcp_active = prof.is_some();
 
     if r.temp_abs > 0.0 {

@@ -471,6 +471,23 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                 _ => p,
             };
         }
+        // <crs:Look><rdf:Description crs:Name="Adobe Landscape" …/> —
+        // the modern profile picker (enhanced .xmp profiles live under
+        // Settings/**/Profiles). CameraProfile wins when both are set.
+        let look_span = body.find("<crs:Look>").map(|ls| {
+            let le = body[ls..]
+                .find("</crs:Look>")
+                .map(|e| ls + e + "</crs:Look>".len())
+                .unwrap_or(body.len());
+            (ls, le)
+        });
+        if let Some((ls, le)) = look_span {
+            if let Some(n) = attr_str(&body[ls..le], "crs:Name") {
+                if r.profile.is_empty() {
+                    r.profile = n;
+                }
+            }
+        }
         // enhanced/Look profiles embed their grade as encoded tables:
         // crs:LookTable → dng_look_table (HSV map, applied where a DCP's
         // ProfileLookTable goes — replaces it); crs:RGBTable →
@@ -569,6 +586,17 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr(&body, "crs:PerspectiveHorizontal") {
             r.key_h = (v / 100.0 * 0.4).clamp(-0.4, 0.4);
+        }
+        // transform-panel rotate adds on top of the crop-tool angle
+        if let Some(v) = attr(&body, "crs:PerspectiveRotate") {
+            r.rotation_deg += v.clamp(-45.0, 45.0);
+        }
+        // transform-panel scale (>100): post-transform zoom → symmetric crop
+        if let Some(v) = attr(&body, "crs:PerspectiveScale") {
+            if v > 100.5 && r.crop == [0.0; 4] {
+                let m = ((1.0 - 100.0 / v) * 0.5).clamp(0.0, 0.45);
+                r.crop = [m, m, m, m];
+            }
         }
         // spot removal -> clone stamps
         for item in seq_items(&body, "crs:RetouchAreas") {
@@ -855,7 +883,13 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         local_corrections(&body, r);
         // preset strength (LR Amount slider): scale all adjustment deltas
         // toward their defaults; geometry/masks/WB are untouched inside.
-        if let Some(a) = attr(&body, "crs:Amount") {
+        // The crs:Amount inside a nested <crs:Look> is the *profile's*
+        // amount, not preset strength — exclude that block.
+        let amt_body: std::borrow::Cow<str> = match look_span {
+            Some((ls, le)) => format!("{}{}", &body[..ls], &body[le..]).into(),
+            None => body.into(),
+        };
+        if let Some(a) = attr(&amt_body, "crs:Amount") {
             r.scale(a.clamp(0.0, 2.0));
         }
     }
@@ -983,6 +1017,116 @@ fn land_prior(name: &str) -> (f32, f32, f32, f32) {
 /// LR local corrections (graduated filter, radial filter, adjustment
 /// brush) → our power windows and brush layers. Handles both the legacy
 /// per-kind lists and the unified LR11+ MaskGroupBasedCorrections.
+/// Locate an enhanced profile .xmp by display name ("Adobe Landscape",
+/// "Artistic 01", …). Searches the profile dirs (LR's Settings tree and
+/// ~/.safelight/profiles) for a matching filename stem, preferring paths
+/// under a "Profiles" folder.
+pub fn find_xmp_profile(name: &str) -> Option<std::path::PathBuf> {
+    let norm = name.trim().to_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    let mut fallback = None;
+    for dir in crate::dcp::profile_dirs() {
+        let mut stack = vec![dir];
+        let mut depth_guard = 0usize;
+        while let Some(d) = stack.pop() {
+            depth_guard += 1;
+            if depth_guard > 4000 {
+                break;
+            }
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    // bound the walk: LR's Settings tree is shallow
+                    if p.components().count() <= d.components().count() + 6 {
+                        stack.push(p);
+                    }
+                    continue;
+                }
+                if p.extension().and_then(|s| s.to_str()) != Some("xmp") {
+                    continue;
+                }
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if stem == norm {
+                    if p.to_string_lossy().to_lowercase().contains("profile") {
+                        return Some(p);
+                    }
+                    fallback.get_or_insert(p);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Load an enhanced profile .xmp as a Recipe + its crs:Amount strength
+/// (the profile "Amount" slider, default 1).
+pub fn load_xmp_profile(name: &str) -> Option<(Recipe, f32)> {
+    let path = find_xmp_profile(name)?;
+    let body = std::fs::read_to_string(&path).ok()?;
+    let r = crs_to_recipe(&body);
+    let amt = body
+        .find("<crs:Look>")
+        .and_then(|i| {
+            let e = body[i..]
+                .find("</crs:Look>")
+                .map(|x| i + x)
+                .unwrap_or(body.len());
+            attr(&body[i..e], "crs:Amount")
+        })
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    Some((r, amt))
+}
+
+/// Merge a profile .xmp's baked-in grade UNDER the user's recipe: the
+/// profile's sliders/curves/tables apply first, scaled by `amt` (the LR
+/// profile Amount slider). Fields the user already set are composed
+/// additively — matching LR's "profile then adjustments" order.
+pub fn merge_profile_under(dst: &mut Recipe, pr: &Recipe, amt: f32) {
+    if amt <= 0.001 {
+        return;
+    }
+    let s = |v: &mut f32, d: f32| *v += d * amt;
+    s(&mut dst.exposure, pr.exposure);
+    s(&mut dst.contrast, pr.contrast);
+    s(&mut dst.highlights, pr.highlights);
+    s(&mut dst.shadows, pr.shadows);
+    s(&mut dst.whites, pr.whites);
+    s(&mut dst.blacks, pr.blacks);
+    s(&mut dst.saturation, pr.saturation);
+    s(&mut dst.vibrance, pr.vibrance);
+    s(&mut dst.clarity, pr.clarity);
+    s(&mut dst.texture, pr.texture);
+    s(&mut dst.dehaze, pr.dehaze);
+    s(&mut dst.noise_luma, pr.noise_luma);
+    s(&mut dst.noise_chroma, pr.noise_chroma);
+    s(&mut dst.vignette, pr.vignette);
+    if dst.look_table.is_none() {
+        dst.look_table = pr.look_table.clone();
+    }
+    if dst.rgb_lut.is_none() {
+        dst.rgb_lut = pr.rgb_lut.clone();
+        dst.lut_amount *= amt * pr.lut_amount;
+    }
+    // profile tone curve applies under the user's — take it when the
+    // user's curve is the default identity
+    let ident = |c: &Vec<[f32; 2]>| {
+        c.len() == 2 && (c[0][0] - c[0][1]).abs() < 1e-4 && (c[1][0] - c[1][1]).abs() < 1e-4
+    };
+    if ident(&dst.curve) && !ident(&pr.curve) {
+        dst.curve = pr.curve.clone();
+    }
+}
+
 /// Float list inside an `<rdf:li>` item (strips the element tags).
 fn li_floats(li: &str) -> Option<Vec<f32>> {
     let inner = match (li.find('>'), li.rfind('<')) {
@@ -1805,5 +1949,66 @@ mod tests {
         assert!((r.windows[0].pcs[0].1 - 0.72).abs() < 1e-5);
         assert!((r.windows[0].pcs[1].0[0] - 0.650076).abs() < 1e-5);
         assert!((r.windows[0].pcs[1].1 - 0.46).abs() < 1e-5);
+    }
+
+    /// encode bytes the way Adobe writes crs:Table_* payloads: LE u32
+    /// uncompressed length, zlib stream, then their base85 alphabet
+    /// (little-endian u32 per 5-char group, digits ordered LSB-first).
+    #[cfg(test)]
+    fn b85_encode(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 85] = b"0123456789abcdefghijklmnopqrstuvwxyz\
+            ABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&'|()[]{}@%$#";
+        let mut s = String::with_capacity(bytes.len() / 4 * 5 + 5);
+        for chunk in bytes.chunks(4) {
+            let mut b = [0u8; 4];
+            b[..chunk.len()].copy_from_slice(chunk);
+            let mut v = u32::from_le_bytes(b);
+            for _ in 0..chunk.len() + 1 {
+                s.push(DIGITS[(v % 85) as usize] as char);
+                v /= 85;
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn look_profile_xmp_parses() {
+        // synthesize a tiny dng_look_table (4 hue × 2 sat × 2 val),
+        // wrap it the way Adobe profile .xmp files do and check the
+        // whole crs:Look / crs:LookTable / crs:Table_<digest> chain.
+        let mut bin = Vec::new();
+        bin.extend(0u32.to_le_bytes()); // BTT_LOOK_TABLE
+        bin.extend(1u32.to_le_bytes()); // version
+        for d in [4u32, 2, 2] {
+            bin.extend(d.to_le_bytes());
+        }
+        for _ in 0..16u32 {
+            bin.extend(12.5f32.to_le_bytes()); // hue shift
+            bin.extend(1.0f32.to_le_bytes()); // sat scale
+            bin.extend(1.0f32.to_le_bytes()); // val scale
+        }
+        let mut payload = (bin.len() as u32).to_le_bytes().to_vec();
+        payload.extend(miniz_oxide::deflate::compress_to_vec_zlib(&bin, 6));
+        let enc = b85_encode(&payload);
+
+        let xmp = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:ProcessVersion="15.4"><crs:Look><rdf:Description crs:Name="Adobe Landscape" crs:Amount="0.5" crs:LookTable="abc123" crs:Table_abc123="{enc}"/></crs:Look></rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let r = crs_to_recipe(&xmp);
+        assert_eq!(r.profile, "Adobe Landscape");
+        let lt = r.look_table.expect("look table decoded");
+        assert_eq!(lt.dims, [4, 2, 2]);
+        assert!((lt.data[0][0] - 12.5).abs() < 1e-4);
+        // the Look's own crs:Amount must NOT be treated as preset
+        // strength — nothing was set, so nothing should be scaled.
+        assert!(r.exposure.abs() < 1e-6 && r.contrast.abs() < 1e-6);
+    }
+
+    #[test]
+    fn look_name_falls_back_to_camera_profile() {
+        let xmp = r#"<rdf:Description rdf:about="" crs:CameraProfile="Adobe Standard"><crs:Look><rdf:Description crs:Name="Adobe Landscape"/></crs:Look></rdf:Description>"#;
+        let r = crs_to_recipe(xmp);
+        // explicit CameraProfile wins over the Look name
+        assert_eq!(r.profile, "Adobe Standard");
     }
 }
