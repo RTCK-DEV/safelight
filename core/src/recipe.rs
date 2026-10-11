@@ -218,6 +218,15 @@ pub struct Recipe {
     pub lut_file: String,
     /// 0..1 blend amount of the LUT
     pub lut_amount: f32,
+    /// decoded Adobe `crs:Table_*` RGB LUT (from Look/enhanced profiles),
+    /// applied display-referred like `lut_file`. Not serialized — the
+    /// encoded payload lives in the source XMP.
+    #[serde(skip)]
+    pub rgb_lut: Option<crate::lut::CubeLut>,
+    /// decoded Adobe `crs:LookTable` HSV map (dng_look_table); replaces the
+    /// DCP profile's look table when the XMP carries one.
+    #[serde(skip)]
+    pub look_table: Option<crate::dcp::HsMap>,
     /// keystone correction: vertical trapezoid warp -0.4..0.4
     /// (>0 widens the bottom — fixes converging verticals shot from below)
     pub key_v: f32,
@@ -594,6 +603,8 @@ impl Default for Recipe {
             wb_pick_size: 0.025,
             lut_file: String::new(),
             lut_amount: 1.0,
+            rgb_lut: None,
+            look_table: None,
             key_v: 0.0,
             key_h: 0.0,
             lens_corr: 1.0,

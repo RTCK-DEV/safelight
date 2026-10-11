@@ -451,6 +451,33 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                 _ => p,
             };
         }
+        // enhanced/Look profiles embed their grade as encoded tables:
+        // crs:LookTable → dng_look_table (HSV map, applied where a DCP's
+        // ProfileLookTable goes — replaces it); crs:RGBTable →
+        // dng_rgb_table (RGB LUT applied near the end like a .cube LUT).
+        // crs:Table_<digest> carries the base85+zlib payload.
+        for (key_attr, is_rgb) in [("crs:LookTable", false), ("crs:RGBTable", true)] {
+            let Some(id) = attr_str(&body, key_attr) else {
+                continue;
+            };
+            let key = format!("crs:Table_{id}");
+            let Some(payload) = attr_str(&body, &key) else {
+                continue;
+            };
+            match crate::rgbtable::decode(&payload) {
+                Some(crate::rgbtable::Table::Look(map)) if !is_rgb => {
+                    r.look_table = Some(map);
+                }
+                Some(crate::rgbtable::Table::Rgb(t)) => {
+                    r.rgb_lut = Some(crate::rgbtable::to_cube(&t, t.divisions as usize));
+                }
+                _ => {}
+            }
+        }
+        // presets can dial the embedded RGB table down (0..1)
+        if let Some(a) = attr(&body, "crs:RGBTableAmount") {
+            r.lut_amount = a.clamp(0.0, 1.0);
+        }
         if let Some(v) = attr_any(&body, &["crs:Exposure2012", "crs:Exposure"]) {
             r.exposure = v;
         }

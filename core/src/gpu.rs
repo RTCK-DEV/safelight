@@ -260,6 +260,9 @@ struct Uni {
 @group(0) @binding(11) var<storage, read> denbuf: array<u32>;
 @group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
 @group(0) @binding(16) var<storage, read_write> skybuf: array<u32>;
+// profile look table (HsMap): [hd, sd, vd] then cells of
+// [hue_shift_deg, sat_scale, val_scale] in (h,s,v) order, val fastest
+@group(0) @binding(18) var<storage, read> lookbuf: array<f32>;
 // lens blur: matte-res defocused copy of the linear image,
 // [0].xy = (mw,mh), data at [1..]
 @group(0) @binding(17) var<storage, read_write> lbl: array<vec4<f32>>;
@@ -540,7 +543,7 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
 }
 
 fn wb_matrix(cam: vec3<f32>) -> vec3<f32> {
-    let cw = clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+    let cw = hsm_apply(clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0)));
     return vec3<f32>(
         dot(pg.m0.xyz, cw),
         dot(pg.m1.xyz, cw),
@@ -1366,6 +1369,72 @@ fn qual_mask(c: vec3<f32>) -> f32 {
     return mask;
 }
 
+// DNG ProfileLookTable / ProfileHueSatMap: trilinear HSV shift map.
+// Mirrors HsMap::lookup + apply in dcp.rs. lookbuf layout:
+//   [0..3] look dims, look cells, 256 tone-curve floats,
+//   [..+3] hsm dims, hsm cells
+fn map_cell(base: u32, h: u32, s: u32, v: u32, c: u32) -> f32 {
+    let hd = u32(lookbuf[base]);
+    let sd = u32(lookbuf[base + 1u]);
+    // dng_hue_sat_map storage: value outer, hue middle, sat fastest
+    let i = base + 3u + ((v * hd + h) * sd + s) * 3u + c;
+    return lookbuf[i];
+}
+
+fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
+    let hd = u32(lookbuf[base]);
+    let sd = u32(lookbuf[base + 1u]);
+    let vd = u32(lookbuf[base + 2u]);
+    if (hd < 1u || sd < 1u || vd < 1u) { return x; }
+    let hsv = rgb_to_hsv(x);
+    if (hsv.y <= 1e-6) { return x; }
+    let hf = fract(hsv.x) * f32(hd);
+    let h0 = min(u32(hf), hd - 1u);
+    let h1 = (h0 + 1u) % hd;
+    let ht = hf - f32(h0);
+    let sf = max(min(hsv.y * f32(sd - 1u), f32(sd - 1u) - 1e-6), 0.0);
+    let s0 = u32(sf);
+    let s1 = min(s0 + 1u, sd - 1u);
+    let st = sf - f32(s0);
+    let vf = max(min(hsv.z * f32(vd - 1u), f32(vd - 1u) - 1e-6), 0.0);
+    let v0 = u32(vf);
+    let v1 = min(v0 + 1u, vd - 1u);
+    let vt = vf - f32(v0);
+    var d = vec3<f32>();
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        let c00 = mix(
+            mix(map_cell(base, h0, s0, v0, c), map_cell(base, h0, s1, v0, c), st),
+            mix(map_cell(base, h0, s0, v1, c), map_cell(base, h0, s1, v1, c), st),
+            vt);
+        let c11 = mix(
+            mix(map_cell(base, h1, s0, v0, c), map_cell(base, h1, s1, v0, c), st),
+            mix(map_cell(base, h1, s0, v1, c), map_cell(base, h1, s1, v1, c), st),
+            vt);
+        if (c == 0u) {
+            // hue shift: interpolate on the circle
+            var dd = c11 - c00;
+            if (dd > 180.0) { dd = dd - 360.0; }
+            if (dd < -180.0) { dd = dd + 360.0; }
+            d.x = c00 + dd * ht;
+        } else {
+            let v2 = c00 + (c11 - c00) * ht;
+            if (c == 1u) { d.y = v2; } else { d.z = v2; }
+        }
+    }
+    return hsv_to_rgb(hsv.x + d.x / 360.0, clamp(hsv.y * d.y, 0.0, 1.0), max(hsv.z * d.z, 0.0));
+}
+
+fn look_apply(x: vec3<f32>) -> vec3<f32> {
+    return map_apply(0u, x);
+}
+
+// DNG ProfileHueSatMap — same trilinear map evaluated in camera space
+// between WB and the color matrix (DNG spec order, mirrors colorize_plane).
+fn hsm_apply(x: vec3<f32>) -> vec3<f32> {
+    let base = 3u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u + 256u;
+    return map_apply(base, x);
+}
+
 fn adjust(px: vec3<f32>) -> vec3<f32> {
     // camera calibration: primary hue/sat matrix + shadow green/magenta
     var x = px;
@@ -1382,6 +1451,16 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     if (pg.cal0.w != 0.0) {
         let l = luma(x);
         x = vec3<f32>(x.x, x.y - pg.cal0.w * (1.0 - sstep(0.0, 0.4, l)) * 0.05, x.z);
+    }
+    // profile look table (DCP/XMP) before exposure — mirrors develop.rs
+    x = look_apply(x);
+    // DCP ProfileToneCurve — appended to lookbuf after the look cells
+    if (pg.bmisc.w > 0.5) {
+        let pto = 3u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u;
+        x = vec3<f32>(
+            lookbuf[pto + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
+            lookbuf[pto + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
+            lookbuf[pto + u32(clamp(x.z, 0.0, 1.0) * 255.0)]);
     }
     x = x * pg.a1.x;
     // auto-contrast percentile remap
@@ -2287,7 +2366,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..18)
+                entries: &(0..19)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -2425,12 +2504,15 @@ impl Gpu {
         });
         // master 256 + per-channel 768 + hue-curves 1280 + tone 512
         const LUT_N: u64 = 2816;
-        // .cube 3D LUT (loaded once for sizing; build_params hits the cache)
-        let lut3d = if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
-            crate::lut::load(&r.lut_file)
-        } else {
-            None
-        };
+        // .cube 3D LUT (loaded once for sizing; build_params hits the
+        // cache); embedded Adobe profile LUT takes precedence
+        let lut3d = r.rgb_lut.clone().or_else(|| {
+            if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
+                crate::lut::load(&r.lut_file)
+            } else {
+                None
+            }
+        });
         // header after the curve region: [size, amt, dmin*3, dscale*3] then data
         let n_stg = r.stages.iter().filter(|s| s.enabled).take(4).count() as u64;
         // per-stage curve/tone regions follow the base 3D LUT data; each stage's
@@ -2724,7 +2806,16 @@ impl Gpu {
                 }
                 a
             },
-            bmisc: [p.brush_misc[0], p.brush_misc[1], r.ai_denoise.min(1.0), 0.0],
+            bmisc: [
+                p.brush_misc[0],
+                p.brush_misc[1],
+                r.ai_denoise.min(1.0),
+                if p.profile_tone_lut.is_empty() {
+                    0.0
+                } else {
+                    1.0
+                },
+            ],
             bstr: {
                 let mut a = [[0.0f32; 4]; 192];
                 for (i, s) in p.brush_strokes.iter().take(192).enumerate() {
@@ -2828,35 +2919,60 @@ impl Gpu {
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
         // lens blur: matte-res defocused copy (header vec4 + 192² pixels)
         let lbl_b = mk_buf("lblbuf", &vec![0u8; (1 + 192 * 192) * 16], storage_in);
+        // HSV shift maps + profile tone: [look dims+cells][256 tone][hsm
+        // dims+cells]. Tone guarded by bmisc.w; maps self-guard via dims==0.
+        let push_map = |v: &mut Vec<f32>, m: &Option<crate::dcp::HsMap>| match m {
+            Some(m) if !m.data.is_empty() => {
+                v.extend([m.dims[0] as f32, m.dims[1] as f32, m.dims[2] as f32]);
+                for cell in &m.data {
+                    v.extend_from_slice(cell);
+                }
+            }
+            _ => v.extend([0.0; 3]),
+        };
+        let look32: Vec<f32> = {
+            let mut v = Vec::new();
+            push_map(&mut v, &p0.profile_look);
+            if p0.profile_tone_lut.is_empty() {
+                v.extend([0.0; 256]);
+            } else {
+                v.extend_from_slice(&p0.profile_tone_lut);
+            }
+            push_map(&mut v, &p0.profile_hsm);
+            v
+        };
+        let look_b = mk_buf("lookbuf", bytemuck::cast_slice(&look32), storage_in);
 
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> =
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-                    .iter()
-                    .map(|&i| wgpu::BindGroupEntry {
-                        binding: i,
-                        resource: match i {
-                            0 => uni_b.as_entire_binding(),
-                            1 => raw_b.as_entire_binding(),
-                            2 => cfa_b.as_entire_binding(),
-                            3 => io_a.as_entire_binding(),
-                            4 => io_b.as_entire_binding(),
-                            5 => out_b.as_entire_binding(),
-                            6 => lut_b.as_entire_binding(),
-                            7 => stats_b.as_entire_binding(),
-                            8 => idx_b.as_entire_binding(),
-                            9 => tap_b.as_entire_binding(),
-                            10 => brush_b.as_entire_binding(),
-                            11 => den_b.as_entire_binding(),
-                            12 => subj_b.as_entire_binding(),
-                            13 => suni_b.as_entire_binding(),
-                            14 => seeds_b.as_entire_binding(),
-                            15 => dng_b.as_entire_binding(),
-                            16 => sky_b.as_entire_binding(),
-                            _ => lbl_b.as_entire_binding(),
-                        },
-                    })
-                    .collect();
+            let entries: Vec<wgpu::BindGroupEntry> = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            ]
+            .iter()
+            .map(|&i| wgpu::BindGroupEntry {
+                binding: i,
+                resource: match i {
+                    0 => uni_b.as_entire_binding(),
+                    1 => raw_b.as_entire_binding(),
+                    2 => cfa_b.as_entire_binding(),
+                    3 => io_a.as_entire_binding(),
+                    4 => io_b.as_entire_binding(),
+                    5 => out_b.as_entire_binding(),
+                    6 => lut_b.as_entire_binding(),
+                    7 => stats_b.as_entire_binding(),
+                    8 => idx_b.as_entire_binding(),
+                    9 => tap_b.as_entire_binding(),
+                    10 => brush_b.as_entire_binding(),
+                    11 => den_b.as_entire_binding(),
+                    12 => subj_b.as_entire_binding(),
+                    13 => suni_b.as_entire_binding(),
+                    14 => seeds_b.as_entire_binding(),
+                    15 => dng_b.as_entire_binding(),
+                    16 => sky_b.as_entire_binding(),
+                    17 => lbl_b.as_entire_binding(),
+                    _ => look_b.as_entire_binding(),
+                },
+            })
+            .collect();
             dev.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipe.layout,

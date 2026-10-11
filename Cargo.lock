@@ -1846,6 +1846,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "log",
+ "miniz_oxide 0.8.9",
  "ort",
  "pollster",
  "roxmltree",

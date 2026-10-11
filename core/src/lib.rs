@@ -20,6 +20,7 @@ pub mod lut;
 pub mod merge;
 pub mod nef_he;
 pub mod recipe;
+pub mod rgbtable;
 pub mod x3f;
 pub mod xmp;
 

@@ -24,8 +24,8 @@ pub type Mat3 = [[f32; 3]; 3];
 pub struct HsMap {
     /// [hue_divs, sat_divs, val_divs]
     pub dims: [u32; 3],
-    /// hue-major order: idx = h*sat*val_divs... DNG order is (hue, sat, val)
-    /// with val fastest.
+    /// dng_hue_sat_map storage order: value outermost, hue middle,
+    /// saturation fastest — idx = (v * hue_divs + h) * sat_divs + s.
     pub data: Vec<[f32; 3]>,
 }
 
@@ -64,7 +64,7 @@ impl HsMap {
     }
 
     /// trilinear sample: (hue 0..1 cyclic, sat 0..1, val 0..1) -> [dH(deg), sS, vS]
-    fn lookup(&self, h: f32, s: f32, v: f32) -> [f32; 3] {
+    pub fn lookup(&self, h: f32, s: f32, v: f32) -> [f32; 3] {
         let (hd, sd, vd) = (
             self.dims[0] as usize,
             self.dims[1] as usize,
@@ -86,7 +86,7 @@ impl HsMap {
         let v0 = vf.floor() as usize;
         let v1 = (v0 + 1).min(vd - 1);
         let vt = vf - v0 as f32;
-        let at = |h: usize, s: usize, v: usize| -> [f32; 3] { self.data[(h * sd + s) * vd + v] };
+        let at = |h: usize, s: usize, v: usize| -> [f32; 3] { self.data[(v * hd + h) * sd + s] };
         let mut out = [0.0f32; 3];
         for c in 0..3 {
             // hue shift interpolates with wraparound-aware shortest path

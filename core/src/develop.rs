@@ -819,6 +819,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             }
             profile_baseline_ev = prof.baseline_exposure;
         }
+        // XMP LookTable (dng_look_table) replaces the DCP look
+        if let Some(lt) = &r.look_table {
+            profile_look = Some(lt.clone());
+        }
     }
 
     // post-WB+matrix mean luma: luma/M/WB are all linear, so luma of the
@@ -1276,11 +1280,14 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             }
             z
         },
-        lut3d: if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
-            crate::lut::load(&r.lut_file)
-        } else {
-            None
-        },
+        // embedded Adobe profile LUT takes precedence over a file LUT
+        lut3d: r.rgb_lut.clone().or_else(|| {
+            if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
+                crate::lut::load(&r.lut_file)
+            } else {
+                None
+            }
+        }),
         lut_amt: r.lut_amount.clamp(0.0, 1.0),
         key_v: r.key_v.clamp(-0.4, 0.4),
         key_h: r.key_h.clamp(-0.4, 0.4),
