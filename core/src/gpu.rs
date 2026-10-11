@@ -97,6 +97,10 @@ struct Uni {
     /// per-window LR range refine: 2 vec4 per window
     /// [mode,kind,p0,p1] / [p2,p3,0,0] — kind 1=color(h,s,tol,inv), 2=lum
     refines: [[f32; 4]; 32],
+    /// per-window LocalPointColors: 10 vec4 per window —
+    /// [n,0,0,0] then ≤2 swatches of 5 vec4:
+    /// [src3,var] [shift3,amt] [hr4] [sr4] [lr4]
+    lpcs: [[f32; 4]; 176],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
@@ -205,6 +209,9 @@ struct Uni {
     defr_gr: vec4<f32>,
     wins: array<vec4<f32>, 96>,
     refines: array<vec4<f32>, 32>,
+    // per-window local point colours: [n,0,0,0] then ≤2 swatches of
+    // [src3,var] [shift3,amt] [hr4] [sr4] [lr4]
+    lpcs: array<vec4<f32>, 176>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
     ze0: vec4<f32>,
@@ -2102,6 +2109,38 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             let ex2 = pg.wins[wi * 6u + 4u];
             let ex3 = pg.wins[wi * 6u + 5u];
             adj = local_extra(adj, mask, ex, ex2, ex3.x);
+            // masked point colours (LR LocalPointColors) — mirrors the
+            // lpcs block in develop.rs local_ops
+            let nlp = u32(pg.lpcs[wi * 11u].x);
+            for (var s = 0u; s < nlp; s = s + 1u) {
+                let d = wi * 11u + 1u + s * 5u;
+                let v0 = pg.lpcs[d];
+                let t = clamp(mask * v0.w, 0.0, 1.0);
+                if (t <= 0.001) { continue; }
+                let v1 = pg.lpcs[d + 1u];
+                var hr = pg.lpcs[d + 2u];
+                var sr = pg.lpcs[d + 3u];
+                var lr = pg.lpcs[d + 4u];
+                let hsv = rgb_to_hsv(adj);
+                let k = max(v1.w * 2.0, 0.0);
+                let hc = (hr.x + hr.w) * 0.5;
+                let sc = (sr.x + sr.w) * 0.5;
+                let lc = (lr.x + lr.w) * 0.5;
+                hr = clamp(hc + (hr - vec4<f32>(hc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                sr = clamp(sc + (sr - vec4<f32>(sc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                lr = clamp(lc + (lr - vec4<f32>(lc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                let hpos = fract(hsv.x - v0.x + 0.5);
+                let w = trap01(hpos, hr.x, hr.y, hr.z, hr.w)
+                    * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
+                    * trap01(hsv.z, lr.x, lr.y, lr.z, lr.w);
+                if (w > 1e-4) {
+                    let tgt = hsv_to_rgb(
+                        fract(hsv.x + v1.x * w * 0.5 + 1.0),
+                        clamp(hsv.y * (1.0 + v1.y * w), 0.0, 1.0),
+                        max(hsv.z * (1.0 + v1.z * w), 0.0));
+                    adj = adj + (tgt - adj) * t;
+                }
+            }
         }
     }
     let n_str = u32(pg.bmisc.x);
@@ -2826,6 +2865,22 @@ impl Gpu {
                 for (i, rf) in p.refines.iter().take(16).enumerate() {
                     a[i * 2] = [rf[0], rf[1], rf[2], rf[3]];
                     a[i * 2 + 1] = [rf[4], rf[5], 0.0, 0.0];
+                }
+                a
+            },
+            lpcs: {
+                let mut a = [[0.0f32; 4]; 176];
+                for (i, lp) in p.lpcs.iter().take(16).enumerate() {
+                    a[i * 11] = [lp[0], 0.0, 0.0, 0.0];
+                    for s in 0..2usize {
+                        let o = 1 + s * 20;
+                        let d = i * 11 + 1 + s * 5;
+                        a[d] = [lp[o], lp[o + 1], lp[o + 2], lp[o + 19]];
+                        a[d + 1] = [lp[o + 3], lp[o + 4], lp[o + 5], lp[o + 6]];
+                        a[d + 2] = [lp[o + 7], lp[o + 8], lp[o + 9], lp[o + 10]];
+                        a[d + 3] = [lp[o + 11], lp[o + 12], lp[o + 13], lp[o + 14]];
+                        a[d + 4] = [lp[o + 15], lp[o + 16], lp[o + 17], lp[o + 18]];
+                    }
                 }
                 a
             },

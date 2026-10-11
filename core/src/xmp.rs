@@ -952,6 +952,23 @@ fn land_prior(name: &str) -> (f32, f32, f32, f32) {
 /// LR local corrections (graduated filter, radial filter, adjustment
 /// brush) → our power windows and brush layers. Handles both the legacy
 /// per-kind lists and the unified LR11+ MaskGroupBasedCorrections.
+/// Float list inside an `<rdf:li>` item (strips the element tags).
+fn li_floats(li: &str) -> Option<Vec<f32>> {
+    let inner = match (li.find('>'), li.rfind('<')) {
+        (Some(a), Some(b)) if b > a => &li[a + 1..b],
+        _ => li,
+    };
+    let v: Vec<f32> = inner
+        .split([',', ' ', '\n', '\r', '\t'])
+        .filter_map(|t| t.trim().parse::<f32>().ok())
+        .collect();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 fn local_corrections(body: &str, r: &mut Recipe) {
     use crate::recipe::{BrushLayer, BrushStroke, PowerWindow};
     for tag in [
@@ -1045,6 +1062,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 bl,
                 texture: tex,
                 refine: [0.0; 6],
+                pcs: Vec::new(),
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -1211,6 +1229,35 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                         opacity: flow,
                         erase: false,
                     });
+                }
+            }
+            // masked point colours: crs:LocalPointColors rows (same 19-float
+            // serialisation as crs:PointColors) scoped to this correction's
+            // mask, each with a LocalColorVariance strength. Attach to every
+            // window this correction produced.
+            let vars: Vec<f32> = seq_items(&item, "crs:LocalColorVariance")
+                .iter()
+                .filter_map(|li| {
+                    let (Some(gt), Some(lt)) = (li.find('>'), li.rfind('<')) else {
+                        return None;
+                    };
+                    li[gt + 1..lt].trim().parse().ok()
+                })
+                .collect();
+            let mut pcs: Vec<([f32; 19], f32)> = Vec::new();
+            for (si, li) in seq_items(&item, "crs:LocalPointColors").iter().enumerate() {
+                let Some(row) = li_floats(li) else { continue };
+                if row.len() != 19 {
+                    continue;
+                }
+                let mut v = [0.0f32; 19];
+                v.copy_from_slice(&row);
+                pcs.push((v, vars.get(si).copied().unwrap_or(1.0)));
+            }
+            if !pcs.is_empty() {
+                let from = n_win0.min(r.windows.len());
+                for w in r.windows[from..].iter_mut() {
+                    w.pcs.extend(pcs.iter().cloned());
                 }
             }
             if !strokes.is_empty() {
@@ -1423,6 +1470,7 @@ mod tests {
             bl: 0.0,
             texture: 0.0,
             refine: [0.0; 6],
+            pcs: Vec::new(),
         }];
         sc.rating = 4;
         sc.label = "Red".into();
@@ -1695,5 +1743,26 @@ mod tests {
         assert_eq!(r2.windows.len(), 2);
         assert_eq!(r2.windows[1].kind, "crange");
         assert!((r2.windows[1].p[0] - 0.562975).abs() < 1e-5);
+    }
+
+    #[test]
+    fn local_point_colors_parse() {
+        // real Adobe "Adaptive - Landscape/Autumn01" structure: a Vegetation
+        // mask correction carrying two LocalPointColors swatches with
+        // per-swatch LocalColorVariance strengths.
+        let xmp = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"><crs:MaskGroupBasedCorrections><rdf:Seq><rdf:li><rdf:Description crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:CorrectionName="Vegetation"><crs:LocalPointColors><rdf:Seq>
+        <rdf:li>0.648015, 0.915783, 0.651444, 0.000000, 0.050000, 0.110000, 0.500000, 0.000000, 0.170000, 0.670000, 1.000000, 0.185782, 0.735783, 1.000000, 1.000000, 0.097473, 0.647473, 1.000000, 1.000000</rdf:li>
+        <rdf:li>0.650076, 0.919954, 0.062072, 0.000000, 0.080000, 0.000000, 0.500000, 0.000000, 0.333333, 0.666667, 1.000000, 0.189954, 0.739954, 1.000000, 1.000000, 0.000000, 0.096355, 0.456355, 1.000000</rdf:li>
+        </rdf:Seq></crs:LocalPointColors><crs:LocalColorVariance><rdf:Seq><rdf:li>0.720000</rdf:li><rdf:li>0.460000</rdf:li></rdf:Seq></crs:LocalColorVariance>
+        <crs:CorrectionMasks><rdf:Seq><rdf:li crs:What="Mask/Image" crs:MaskName="Vegetation" crs:MaskSubType="0" crs:MaskValue="1"/></rdf:Seq></crs:CorrectionMasks></rdf:Description></rdf:li></rdf:Seq></crs:MaskGroupBasedCorrections></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let r = crs_to_recipe(xmp);
+        assert_eq!(r.windows.len(), 1);
+        assert_eq!(r.windows[0].kind, "veg");
+        assert_eq!(r.windows[0].pcs.len(), 2);
+        // swatch rows preserved verbatim + variance attached in order
+        assert!((r.windows[0].pcs[0].0[0] - 0.648015).abs() < 1e-5);
+        assert!((r.windows[0].pcs[0].1 - 0.72).abs() < 1e-5);
+        assert!((r.windows[0].pcs[1].0[0] - 0.650076).abs() < 1e-5);
+        assert!((r.windows[0].pcs[1].1 - 0.46).abs() < 1e-5);
     }
 }

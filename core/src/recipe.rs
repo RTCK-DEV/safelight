@@ -474,6 +474,10 @@ pub struct PowerWindow {
     /// (h01, sat, tol, inv), kind 2=lum (lo, hi, feather, inv).
     #[serde(default)]
     pub refine: [f32; 6],
+    /// LR LocalPointColors: masked point-colour swatches scoped to this
+    /// window — raw 19-float rows + per-swatch variance (LocalColorVariance).
+    #[serde(default)]
+    pub pcs: Vec<([f32; 19], f32)>,
 }
 
 fn defringe_pu_default() -> [f32; 3] {
@@ -521,6 +525,7 @@ impl Default for PowerWindow {
             bl: 0.0,
             texture: 0.0,
             refine: [0.0; 6],
+            pcs: Vec::new(),
         }
     }
 }

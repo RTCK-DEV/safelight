@@ -104,6 +104,9 @@ pub struct Params {
     /// per-window LR range refinement: [mode, kind, p0..p3]; mode 0=none,
     /// 1=subtract, 2=intersect; kind 1=color(h,s,tol,inv), 2=lum(lo,hi,f,inv)
     pub refines: [[f32; 6]; 16],
+    /// per-window LocalPointColors: [0]=count (≤2), swatch s at 1+s*20:
+    /// [src3, shift3, amt, hr4, sr4, lr4, variance]
+    pub lpcs: [[f32; 41]; 16],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -927,8 +930,24 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
     let mut wins = [[0.0; 24]; 16];
     let mut refines = [[0.0; 6]; 16];
+    let mut lpcs = [[0.0; 41]; 16];
     for (i, w) in r.windows.iter().take(16).enumerate() {
         refines[i] = w.refine;
+        let mut n = 0usize;
+        for (row, var) in w.pcs.iter().take(2) {
+            if let Some(sw) = pc_normalize(row) {
+                let o = 1 + n * 20;
+                lpcs[i][o..o + 3].copy_from_slice(&sw.src);
+                lpcs[i][o + 3..o + 6].copy_from_slice(&sw.shift);
+                lpcs[i][o + 6] = sw.amt;
+                lpcs[i][o + 7..o + 11].copy_from_slice(&sw.hr);
+                lpcs[i][o + 11..o + 15].copy_from_slice(&sw.sr);
+                lpcs[i][o + 15..o + 19].copy_from_slice(&sw.lr);
+                lpcs[i][o + 19] = var.clamp(0.0, 1.0);
+                n += 1;
+            }
+        }
+        lpcs[i][0] = n as f32;
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
             // [x1,y1,x2,y2]: both endpoints move through the same map
@@ -1262,6 +1281,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         has_qual: r.qh[1] > 0.0,
         wins,
         refines,
+        lpcs,
         n_wins: r.windows.len().min(16) as u32,
         zones: [
             zone_pack(r.z_dark),
@@ -1560,8 +1580,31 @@ pub fn pc_normalize(v: &[f32; 19]) -> Option<PcSwatch> {
         return None;
     }
     let in01 = |x: f32| (0.0..=1.0 + 1e-4).contains(&x);
-    // layout A: range blocks [LF,LN,UF,UN] at 0,5,11; shifts at 4,9,15;
-    // amount at 10; src at 16..19 (hue 0..6, lum, sat)
+    // layout B (confirmed against real LR preset XMP — Adobe Premium
+    // "Adaptive" presets serialize swatches this way, and community
+    // dumps of the Lua PointColors structure match): src at 0..3
+    // (hue 0..6, sat, lum), shifts at 3..6 (hue, sat, lum),
+    // RangeAmount at 6, natural-order [LN,LF,UF,UN] ranges at 7,11,15.
+    let b_ok = (0.0..=6.0).contains(&v[0])
+        && in01(v[1])
+        && in01(v[2])
+        && in01(v[6])
+        && [7usize, 11, 15].iter().all(|&i| {
+            v[i] <= v[i + 1] + 1e-4 && v[i + 1] <= v[i + 2] + 1e-4 && v[i + 2] <= v[i + 3] + 1e-4
+        });
+    if b_ok {
+        return Some(PcSwatch {
+            src: [v[0] / 6.0, v[1], v[2]],
+            shift: [v[3], v[4], v[5]],
+            amt: v[6],
+            hr: [v[7], v[8], v[9], v[10]],
+            sr: [v[11], v[12], v[13], v[14]],
+            lr: [v[15], v[16], v[17], v[18]],
+        });
+    }
+    // layout A (alternative hypothesis kept for robustness): range
+    // blocks [LF,LN,UF,UN] at 0,5,11; shifts at 4,9,15; amount at 10;
+    // src at 16..19 (hue 0..6, lum, sat)
     let a_ok = in01(v[10])
         && (0.0..=6.0).contains(&v[16])
         && in01(v[17])
@@ -1580,25 +1623,6 @@ pub fn pc_normalize(v: &[f32; 19]) -> Option<PcSwatch> {
             hr: [v[1], v[0], v[2], v[3]],
             lr: [v[6], v[5], v[7], v[8]],
             sr: [v[12], v[11], v[13], v[14]],
-        });
-    }
-    // layout B: src at 0..3 (hue 0..6), shifts at 3..6, amount at 6,
-    // natural-order ranges at 7,11,15
-    let b_ok = (0.0..=6.0).contains(&v[0])
-        && in01(v[1])
-        && in01(v[2])
-        && in01(v[6])
-        && [7usize, 11, 15].iter().all(|&i| {
-            v[i] <= v[i + 1] + 1e-4 && v[i + 1] <= v[i + 2] + 1e-4 && v[i + 2] <= v[i + 3] + 1e-4
-        });
-    if b_ok {
-        return Some(PcSwatch {
-            src: [v[0] / 6.0, v[1], v[2]],
-            shift: [v[3], v[4], v[5]],
-            amt: v[6],
-            hr: [v[7], v[8], v[9], v[10]],
-            sr: [v[11], v[12], v[13], v[14]],
-            lr: [v[15], v[16], v[17], v[18]],
         });
     }
     None
@@ -3723,6 +3747,28 @@ fn local_ops(
         adj[0] += win[9] * mask * 0.08;
         adj[2] -= win[9] * mask * 0.08;
         local_extra(adj, mask, &win[12..21]);
+        // masked point colours (LR LocalPointColors): transform the pixel
+        // colour inside the mask, folded into the local gain
+        let lp = &p.lpcs[wi];
+        for s in 0..(lp[0] as usize).min(2) {
+            let o = 1 + s * 20;
+            let t = (mask * lp[o + 19]).clamp(0.0, 1.0);
+            if t <= 0.001 {
+                continue;
+            }
+            let sw = PcSwatch {
+                src: [lp[o], lp[o + 1], lp[o + 2]],
+                shift: [lp[o + 3], lp[o + 4], lp[o + 5]],
+                amt: lp[o + 6],
+                hr: [lp[o + 7], lp[o + 8], lp[o + 9], lp[o + 10]],
+                sr: [lp[o + 11], lp[o + 12], lp[o + 13], lp[o + 14]],
+                lr: [lp[o + 15], lp[o + 16], lp[o + 17], lp[o + 18]],
+            };
+            let tgt = pc_apply(*adj, &sw);
+            for c in 0..3 {
+                adj[c] += (tgt[c] - adj[c]) * t;
+            }
+        }
     }
     // adjustment brushes: same local ev/sat/temp inside stroke masks
     let n_str = p.brush_misc[0] as usize;
@@ -4689,6 +4735,21 @@ mod tests {
         }
         let sw2 = pc_normalize(&b).unwrap();
         assert!((sw2.src[0] - 0.5).abs() < 1e-5);
+        // real row from Adobe's "Adaptive - Landscape/Autumn01" preset
+        // (layout B: src(h06,s,l) + shifts(h,s,l) + amount + three ranges)
+        let v2: [f32; 19] = [
+            0.648015, 0.915783, 0.651444, 0.0, 0.05, 0.11, 0.5, 0.0, 0.17, 0.67, 1.0, 0.185782,
+            0.735783, 1.0, 1.0, 0.097473, 0.647473, 1.0, 1.0,
+        ];
+        let sw3 = pc_normalize(&v2).unwrap();
+        assert!((sw3.src[0] - 0.648015 / 6.0).abs() < 1e-5);
+        assert!((sw3.src[1] - 0.915783).abs() < 1e-5);
+        assert!((sw3.src[2] - 0.651444).abs() < 1e-5);
+        assert!((sw3.shift[1] - 0.05).abs() < 1e-6);
+        assert!((sw3.shift[2] - 0.11).abs() < 1e-6);
+        // src colour sits inside its own sat/lum full zones
+        assert!(sw3.sr[1] <= sw3.src[1] && sw3.src[1] <= sw3.sr[3]);
+        assert!(sw3.lr[1] <= sw3.src[2] && sw3.src[2] <= sw3.lr[3]);
     }
 
     #[test]
