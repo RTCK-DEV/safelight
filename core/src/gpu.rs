@@ -93,7 +93,7 @@ struct Uni {
     /// defringe green band: amount, lo_deg, hi_deg, 0
     defr_gr: [f32; 4],
     /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
-    wins: [[f32; 4]; 24],
+    wins: [[f32; 4]; 96],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
@@ -200,7 +200,7 @@ struct Uni {
     // defringe bands: amount, lo_deg, hi_deg, unused
     defr_pu: vec4<f32>,
     defr_gr: vec4<f32>,
-    wins: array<vec4<f32>, 24>,
+    wins: array<vec4<f32>, 96>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
     ze0: vec4<f32>,
@@ -1859,8 +1859,18 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         mask = ellm(w0, w1, w2, nx, ny) * select(0.0, veg_bil(nx, ny), skybuf[0] > 0u);
     } else if ((kb & 256u) != 0u) {
         // LR landscape semantic class (MaskSubType=0, non-sky):
-        // (1 - sky matte) gated by a region prior for the named class
-        mask = ellm(w0, w1, w2, nx, ny) * (1.0 - select(0.0, sky_bil(nx, ny), skybuf[0] > 0u));
+        // (1 - sky matte) gated by a region prior for the named class.
+        // Semantic classes are disjoint in LR — normalize by the sum of
+        // all nsky region priors so overlapping priors share weight.
+        var cover = 0.0;
+        for (var wi = 0u; wi < u32(pg.misc2.x); wi = wi + 1u) {
+            let ok = u32(pg.wins[wi * 6u + 2u].y);
+            if ((ok & 256u) != 0u && pg.wins[wi * 6u + 2u].z > 0.0) {
+                cover = cover + ellm(pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny);
+            }
+        }
+        mask = ellm(w0, w1, w2, nx, ny) / max(cover, 1.0)
+            * (1.0 - select(0.0, sky_bil(nx, ny), skybuf[0] > 0u));
     } else if ((kb & 32u) != 0u) {
         mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
     } else if ((kb & 4u) != 0u) {
@@ -2635,8 +2645,8 @@ impl Gpu {
             ],
             flare: p.flare,
             wins: {
-                let mut a = [[0.0f32; 4]; 24];
-                for (i, w) in p.wins.iter().take(4).enumerate() {
+                let mut a = [[0.0f32; 4]; 96];
+                for (i, w) in p.wins.iter().take(16).enumerate() {
                     a[i * 6] = [w[1], w[2], w[3], w[4]];
                     a[i * 6 + 1] = [w[5], w[6], w[7], w[8]];
                     a[i * 6 + 2] = [w[9], w[0], w[10], w[11]];

@@ -100,7 +100,7 @@ pub struct Params {
     pub q_show: bool,
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
-    pub wins: [[f32; 24]; 4],
+    pub wins: [[f32; 24]; 16],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -916,8 +916,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // window_mask runs in dst-normalized post-crop space, so translate here.
     let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
-    let mut wins = [[0.0; 24]; 4];
-    for (i, w) in r.windows.iter().take(4).enumerate() {
+    let mut wins = [[0.0; 24]; 16];
+    for (i, w) in r.windows.iter().take(16).enumerate() {
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
             // [x1,y1,x2,y2]: both endpoints move through the same map
@@ -1232,7 +1232,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
-        n_wins: r.windows.len().min(4) as u32,
+        n_wins: r.windows.len().min(16) as u32,
         zones: [
             zone_pack(r.z_dark),
             zone_pack(r.z_shadow),
@@ -3253,7 +3253,16 @@ fn finish_linear(
                 if sp.n_wins > 0 {
                     let mut wu = 0.0f32;
                     for win in sp.wins.iter().take(sp.n_wins as usize) {
-                        let mut m2 = window_mask(win, nx, ny, col, subj, sky, veg) * win[10];
+                        let mut m2 = window_mask(
+                            win,
+                            nx,
+                            ny,
+                            col,
+                            subj,
+                            sky,
+                            veg,
+                            &sp.wins[..sp.n_wins as usize],
+                        ) * win[10];
                         if (win[0] as i32) & 8 != 0 {
                             m2 *= qual_mask(col, sp);
                         }
@@ -3501,7 +3510,16 @@ fn local_ops(
     }
     // power windows: local ev/sat/temp inside the mask
     for win in p.wins.iter().take(p.n_wins as usize) {
-        let mut mask = window_mask(win, nx, ny, col, subj, sky, veg) * win[10];
+        let mut mask = window_mask(
+            win,
+            nx,
+            ny,
+            col,
+            subj,
+            sky,
+            veg,
+            &p.wins[..p.n_wins as usize],
+        ) * win[10];
         // link_q: gate the window by the HSL qualifier matte
         if (win[0] as i32) & 8 != 0 {
             mask *= qual_mask(col, p);
@@ -3694,6 +3712,7 @@ fn window_mask(
     subj: Option<&Matte>,
     sky: Option<&Matte>,
     veg: Option<&Matte>,
+    wins: &[[f32; 24]],
 ) -> f32 {
     let base = w[0] as i32;
     let kind = base % 2;
@@ -3712,8 +3731,17 @@ fn window_mask(
         ell_mask(w, nx, ny) * veg.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
     } else if base & 256 != 0 {
         // LR landscape semantic mask (MaskSubType=0, non-sky classes):
-        // (1 - sky matte) gated by a region prior for the named class
-        ell_mask(w, nx, ny) * (1.0 - sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0))
+        // (1 - sky matte) gated by a region prior for the named class.
+        // Semantic classes are disjoint in LR — normalize by the sum of
+        // all nsky region priors so overlapping priors share weight.
+        let ell = ell_mask(w, nx, ny);
+        let mut cover = 0.0;
+        for o in wins.iter() {
+            if (o[0] as i32) & 256 != 0 && o[10] > 0.0 {
+                cover += ell_mask(o, nx, ny);
+            }
+        }
+        ell / cover.max(1.0) * (1.0 - sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0))
     } else if base & 32 != 0 {
         // heuristic sky matte (LR sky AI masks)
         sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
@@ -4362,10 +4390,13 @@ mod tests {
         w[6] = 0.4;
         w[10] = 1.0;
         // centre of the prior → mask ≈ 1
-        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None, None) > 0.9);
+        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None, None, &[]) > 0.9);
         // far outside the ellipse → ≈ 0
-        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None, None) < 0.05);
+        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None, None, &[]) < 0.05);
         // no subject matte → no mask at all
-        assert_eq!(window_mask(&w, 0.5, 0.3, [0.5; 3], None, None, None), 0.0);
+        assert_eq!(
+            window_mask(&w, 0.5, 0.3, [0.5; 3], None, None, None, &[]),
+            0.0
+        );
     }
 }
