@@ -769,6 +769,11 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         // local corrections: graduated/radial filters -> power windows,
         // brush dabs -> adjustment-brush layers.
         local_corrections(&body, r);
+        // preset strength (LR Amount slider): scale all adjustment deltas
+        // toward their defaults; geometry/masks/WB are untouched inside.
+        if let Some(a) = attr(&body, "crs:Amount") {
+            r.scale(a.clamp(0.0, 2.0));
+        }
     }
     sc.recipe
 }
@@ -1246,6 +1251,26 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amount_scales_adjustments() {
+        let xmp = r##"<x:xmpmeta xmlns:x="x" xmlns:crs="y">
+<rdf:RDF xmlns:rdf="r"><rdf:Description rdf:about=""
+ crs:Exposure2012="1.0" crs:Contrast2012="50"
+ crs:Saturation="-20" crs:Amount="0.5"/></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(xmp);
+        assert!((r.exposure - 0.5).abs() < 1e-4, "exposure {}", r.exposure);
+        assert!((r.saturation - (-0.1)).abs() < 1e-4, "sat {}", r.saturation);
+        // contrast is parsed in LR units — half of whatever it was
+        assert!(r.contrast.abs() < 0.51);
+    }
+
+    #[test]
+    fn amount_default_one_is_noop() {
+        let xmp = r##"<rdf:Description rdf:about="" crs:Exposure2012="1.0" crs:Amount="1.0"/>"##;
+        let r = crs_to_recipe(xmp);
+        assert!((r.exposure - 1.0).abs() < 1e-4);
+    }
 
     #[test]
     fn roundtrip_sl_recipe_lossless() {

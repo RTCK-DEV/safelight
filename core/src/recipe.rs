@@ -628,6 +628,149 @@ impl Recipe {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+
+    /// LR `crs:Amount` / preset-strength scaling: every adjustment delta is
+    /// interpolated toward its default by factor `a` (0 = neutral, 1 = full,
+    /// up to 2 = boosted). Mask/brush geometry, WB pick, crop and transform
+    /// (keystone/rotation/lens) are left alone — Amount does not reshape
+    /// masks or straighten the horizon.
+    pub fn scale(&mut self, a: f32) {
+        if (a - 1.0).abs() < 1e-6 {
+            return;
+        }
+        let s = |v: &mut f32| *v *= a;
+        let s3 = |v: &mut [f32; 3]| v.iter_mut().for_each(|x| *x *= a);
+        // basic tone/colour
+        s(&mut self.exposure);
+        s(&mut self.contrast);
+        s(&mut self.highlights);
+        s(&mut self.shadows);
+        s(&mut self.whites);
+        s(&mut self.blacks);
+        s(&mut self.saturation);
+        s(&mut self.vibrance);
+        s(&mut self.temperature);
+        s(&mut self.tint);
+        // detail
+        s(&mut self.sharpen);
+        s(&mut self.noise_luma);
+        s(&mut self.noise_chroma);
+        s(&mut self.clarity);
+        s(&mut self.texture);
+        s(&mut self.dehaze);
+        // effects
+        s(&mut self.vignette);
+        s(&mut self.grain);
+        s(&mut self.glow);
+        s(&mut self.beauty);
+        s(&mut self.ca_fix);
+        s(&mut self.deband);
+        s(&mut self.lens_blur);
+        s(&mut self.flare[2]);
+        // lift/gamma/gain are multiplicative-1 defaults
+        s3(&mut self.lift);
+        s3(&mut self.offset);
+        for v in self.gamma.iter_mut().chain(self.gain.iter_mut()) {
+            *v = 1.0 + (*v - 1.0) * a;
+        }
+        // split toning / color grading sats + zone adjustments
+        s(&mut self.shadow_sat);
+        s(&mut self.highlight_sat);
+        s(&mut self.midtone_sat);
+        for z in [
+            &mut self.z_dark,
+            &mut self.z_shadow,
+            &mut self.z_light,
+            &mut self.z_global,
+        ] {
+            z[1] *= a;
+            z[2] *= a;
+            z[3] *= a;
+        }
+        for v in &mut self.qadj {
+            *v *= a;
+        }
+        for v in &mut self.zones_ev {
+            *v *= a;
+        }
+        // camera calibration + defringe amounts
+        for v in &mut self.calib {
+            *v *= a;
+        }
+        self.defringe_pu[0] *= a;
+        self.defringe_gr[0] *= a;
+        // channel mixer: scale the delta from identity
+        for (i, v) in self.mixer.iter_mut().enumerate() {
+            let id = if i % 4 == 0 { 1.0 } else { 0.0 };
+            *v = id + (*v - id) * a;
+        }
+        // tone curves: scale the y-delta (master/rgb) or the 1.0-gain
+        // (hue/lum/sat-domain curves)
+        for pts in [
+            &mut self.curve,
+            &mut self.curve_r,
+            &mut self.curve_g,
+            &mut self.curve_b,
+        ] {
+            for p in pts.iter_mut() {
+                p[1] = p[0] + (p[1] - p[0]) * a;
+            }
+        }
+        for p in self.hue_hue.iter_mut() {
+            p[1] = p[0] + (p[1] - p[0]) * a;
+        }
+        for pts in [
+            &mut self.hue_sat,
+            &mut self.hue_lum,
+            &mut self.lum_sat,
+            &mut self.sat_sat,
+        ] {
+            for p in pts.iter_mut() {
+                p[1] = 1.0 + (p[1] - 1.0) * a;
+            }
+        }
+        for sl in &mut self.color_slice {
+            sl[0] *= a;
+            sl[1] *= a;
+            sl[2] *= a;
+        }
+        for w in &mut self.warper {
+            w[2] *= a;
+            w[3] *= a;
+        }
+        // embedded/file LUT contribution
+        self.lut_amount *= a;
+        // local adjustments: scale the deltas, keep the mask geometry
+        for w in &mut self.windows {
+            w.ev *= a;
+            w.sat *= a;
+            w.temp *= a;
+            w.contrast *= a;
+            w.clarity *= a;
+            w.dehaze *= a;
+            w.tint *= a;
+            w.hi *= a;
+            w.sh *= a;
+            w.wh *= a;
+            w.bl *= a;
+            w.texture *= a;
+        }
+        for b in &mut self.brushes {
+            b.opacity *= a;
+            b.ev *= a;
+            b.sat *= a;
+            b.temp *= a;
+            b.contrast *= a;
+            b.clarity *= a;
+            b.dehaze *= a;
+            b.tint *= a;
+            b.hi *= a;
+            b.sh *= a;
+            b.wh *= a;
+            b.bl *= a;
+            b.texture *= a;
+        }
+    }
 }
 
 /// A named snapshot of a recipe (DaVinci "grade version" / still).
