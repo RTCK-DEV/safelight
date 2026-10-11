@@ -139,6 +139,10 @@ pub struct Params {
     /// atmospheric light estimate A (min-channel p99.5, >= 0.05)
     pub dehaze_a: f32,
     pub ca_fix: f32,
+    /// measured lateral-CA radial scale for R and B (auto mode; filled in
+    /// by the pipeline, not from the recipe)
+    pub ca_r: f32,
+    pub ca_b: f32,
     pub deband: f32,
     pub glow: f32,
     /// lens flare [cx, cy, strength, hue] in dst-normalized coords
@@ -1322,6 +1326,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             .unwrap_or(1.0)
             .max(0.05),
         ca_fix: r.ca_fix.clamp(-0.5, 0.5),
+        ca_r: 0.0,
+        ca_b: 0.0,
         deband: r.deband.clamp(0.0, 1.0),
         glow: r.glow.clamp(0.0, 1.0),
         flare: [
@@ -3431,6 +3437,15 @@ fn finish_linear(
     if pc.dehaze > 0.0 {
         pc.dehaze_a = atmosphere(&lin, w, h);
     }
+    // LR "auto" lateral CA: measure it instead of applying a fixed shift —
+    // a hardcoded amount adds fringing to CA-free images. ca_fix>0 = auto
+    // strength (0.3 ≈ full), <0 = the legacy manual radial warp.
+    if pc.ca_fix > 0.0 {
+        let s = (pc.ca_fix / 0.3).clamp(0.0, 1.0);
+        let (kr, kb) = estimate_ca_px(&lin, w, h);
+        pc.ca_r = kr * s;
+        pc.ca_b = kb * s;
+    }
     heal_lin(&mut lin, w, h, &pc.spots, pc.n_spots, flip);
     clone_lin(&mut lin, w, h, &pc.clones, pc.n_clones, flip);
     if pc.noise_luma > 0.0 {
@@ -3533,9 +3548,14 @@ fn finish_linear(
             let mut col = if p.ca_fix != 0.0 {
                 let wcx = w as f32 * 0.5;
                 let wcy = h as f32 * 0.5;
-                let rn = ((sx - wcx).hypot(sy - wcy) / w.max(h) as f32) * 2.0;
-                let fr = 1.0 - p.ca_fix * 0.05 * rn;
-                let fb = 1.0 + p.ca_fix * 0.05 * rn;
+                let (fr, fb) = if p.ca_fix > 0.0 {
+                    // auto: measured constant radial scale per channel
+                    (1.0 - p.ca_r, 1.0 - p.ca_b)
+                } else {
+                    // manual: legacy quadratic radial warp
+                    let rn = ((sx - wcx).hypot(sy - wcy) / w.max(h) as f32) * 2.0;
+                    (1.0 - p.ca_fix * 0.05 * rn, 1.0 + p.ca_fix * 0.05 * rn)
+                };
                 [
                     bilin_ch(&lin, w, h, wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0),
                     bilin_ch(&lin, w, h, sx, sy, 1),
@@ -4408,6 +4428,118 @@ fn bilin_ch(lin: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize) -
     a * (1.0 - ty) + b * ty
 }
 
+/// Measure lateral chromatic aberration on a linear RGB buffer: for each
+/// strong radial edge, find where the R / B edge sits along the radial
+/// direction relative to G (centroid of the radial derivative profile).
+/// Returns per-channel scale factors k_r, k_b such that sampling channel C
+/// at radius r·(1−k_C) removes the measured displacement — ~0 on CA-free
+/// images, so this never *adds* fringing the way a fixed correction does.
+fn estimate_ca_px(lin: &[[f32; 3]], w: usize, h: usize) -> (f32, f32) {
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let half = w.max(h) as f32 * 0.5;
+    let step = (w.max(h) / 700).max(2);
+    // (r_px, delta_px) per channel 0=R 1=B
+    let mut obs = [Vec::<(f32, f32)>::new(), Vec::<(f32, f32)>::new()];
+    for y in (6..h.saturating_sub(6)).step_by(step) {
+        for x in (6..w.saturating_sub(6)).step_by(step) {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let r_px = dx.hypot(dy);
+            if r_px < half * 0.25 {
+                continue; // CA vanishes toward the optical centre
+            }
+            let (ux, uy) = (dx / r_px, dy / r_px);
+            let at =
+                |ch: usize, o: f32| bilin_ch(lin, w, h, x as f32 + ux * o, y as f32 + uy * o, ch);
+            // weak-edge gate on green first (cheap)
+            if (at(1, 1.0) - at(1, -1.0)).abs() < 0.015 {
+                continue;
+            }
+            // centroid of |d/dr| over s in [-3,3]
+            let centroid = |ch: usize| {
+                let (mut num, mut den) = (0.0f32, 0.0f32);
+                let mut s = -2.5f32;
+                while s <= 3.0 {
+                    let d = (at(ch, s + 0.5) - at(ch, s - 0.5)).abs();
+                    num += s * d;
+                    den += d;
+                    s += 0.5;
+                }
+                if den < 0.02 {
+                    None
+                } else {
+                    Some((num / den, den))
+                }
+            };
+            let Some((pg, dg)) = centroid(1) else {
+                continue;
+            };
+            for (ch, slot) in [(0usize, 0usize), (2usize, 1usize)] {
+                if let Some((pc, dc)) = centroid(ch) {
+                    let d = pc - pg;
+                    // edge must be sharp in both channels and the offset sane
+                    if d.abs() < 2.5 && dc > dg * 0.15 {
+                        obs[slot].push((r_px, d));
+                    }
+                }
+            }
+        }
+    }
+    let fit = |v: &mut Vec<(f32, f32)>| -> f32 {
+        if v.len() < 100 {
+            return 0.0;
+        }
+        // bin by radius, median per bin, then slope through origin
+        let mut bins: [Vec<f32>; 8] = Default::default();
+        let mut rmax = 1.0f32;
+        for &(r, _) in v.iter() {
+            rmax = rmax.max(r);
+        }
+        for &(r, d) in v.iter() {
+            bins[((r / rmax) * 7.999) as usize].push(d);
+        }
+        let (mut num, mut den, mut nb) = (0.0f64, 0.0f64, 0usize);
+        for (i, b) in bins.iter_mut().enumerate() {
+            if b.len() < 5 {
+                continue;
+            }
+            b.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = b[b.len() / 2];
+            let rm = (i as f32 + 0.5) / 8.0 * rmax;
+            num += (med * rm) as f64 * b.len() as f64;
+            den += (rm * rm) as f64 * b.len() as f64;
+            nb += 1;
+        }
+        if nb < 3 || den == 0.0 {
+            return 0.0;
+        }
+        ((num / den) as f32).clamp(-0.02, 0.02)
+    };
+    let (kr, kb) = (fit(&mut obs[0]), fit(&mut obs[1]));
+    (kr, kb)
+}
+
+/// CA estimate for the mosaic path (GPU): cheap sparse demosaic via
+/// `demosaic_pixel`, then the shared edge estimator.
+pub fn estimate_ca_mosaic(m: &Mosaic) -> (f32, f32) {
+    let norm = norm_factors(m);
+    // ~1MP measurement grid, keeping CFA phase alignment
+    let stride = ((m.w.max(m.h) as f32 / 1000.0).ceil() as usize).max(1) * m.cfa.h.max(1);
+    let vw = m.w / stride;
+    let vh = m.h / stride;
+    if vw < 16 || vh < 16 {
+        return (0.0, 0.0);
+    }
+    let mut lin = vec![[0.0f32; 3]; vw * vh];
+    for vy in 0..vh {
+        for vx in 0..vw {
+            lin[vy * vw + vx] = demosaic_pixel(m, vx, vy, stride, &norm);
+        }
+    }
+    estimate_ca_px(&lin, vw, vh)
+}
+
 /// beauty (skin-masked smoothing) + deband (flat-gradient smoothing)
 fn beauty_deband(lin: &[[f32; 3]], w: usize, h: usize, beauty: f32, deband: f32) -> Vec<[f32; 3]> {
     let chans: Vec<Vec<f32>> = (0..3).map(|c| lin.iter().map(|p| p[c]).collect()).collect();
@@ -4767,6 +4899,34 @@ fn sharpen_clarity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Auto CA: a channel magnified radially by (1+k) reads back as k.
+    /// Concentric-ring edges give radial gradient everywhere; R displaced
+    /// outward by k·r_px must yield ca_r ≈ k, and a clean image ≈ 0.
+    #[test]
+    fn estimate_ca_recovers_known_shift() {
+        let (w, h) = (400usize, 300usize);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        // square wave: flat plateaus with impulsive radial edges every 12px
+        let ring = |r: f32| -> f32 {
+            if (r / 24.0).fract() < 0.5 {
+                0.2
+            } else {
+                0.9
+            }
+        };
+        let mut lin = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let r = (x as f32 - cx).hypot(y as f32 - cy);
+                // R sampled at a slightly smaller radius = magnified outward
+                lin[y * w + x] = [ring(r * 0.994), ring(r), ring(r)];
+            }
+        }
+        let (kr, kb) = estimate_ca_px(&lin, w, h);
+        assert!((kr - 0.006).abs() < 0.002, "kr={kr}");
+        assert!(kb.abs() < 0.002, "kb={kb}");
+    }
 
     /// LR person-part masks (kind "part", flag 64): the subject matte is
     /// gated by a soft ellipse prior — full matte → mask ≈ ellipse, zero

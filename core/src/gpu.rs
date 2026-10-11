@@ -156,6 +156,8 @@ struct Uni {
     lb1: [f32; 4],
     /// LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
     gb0: [f32; 4],
+    /// measured auto-CA radial scales: [k_r, k_b, 0, 0]
+    ca0: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -255,6 +257,8 @@ struct Uni {
     lb1: vec4<f32>,
     // LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
     gb0: vec4<f32>,
+    // measured auto-CA radial scales [k_r, k_b]
+    ca0: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -2339,9 +2343,15 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     if (pg.fx0.x != 0.0) {
         let wcx = f32(sw) * 0.5;
         let wcy = f32(sh) * 0.5;
-        let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
-        let fr = 1.0 - pg.fx0.x * 0.05 * rn;
-        let fb = 1.0 + pg.fx0.x * 0.05 * rn;
+        var fr = 1.0; var fb = 1.0;
+        if (pg.fx0.x > 0.0) {
+            fr = 1.0 - pg.ca0.x;
+            fb = 1.0 - pg.ca0.y;
+        } else {
+            let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
+            fr = 1.0 - pg.fx0.x * 0.05 * rn;
+            fb = 1.0 + pg.fx0.x * 0.05 * rn;
+        }
         col = vec3<f32>(
             bil_ch(wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0u),
             bil_ch(sx, sy, 1u),
@@ -3031,6 +3041,7 @@ impl Gpu {
                 p.lens_blur_opts2[2],
             ],
             gb0: [p.grade_balance, p.grade_blend, 0.0, 0.0],
+            ca0: [p.ca_r, p.ca_b, 0.0, 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
@@ -3237,7 +3248,14 @@ impl Gpu {
             None
         };
 
-        let p = build_params(m, r, stats.as_ref());
+        let mut p = build_params(m, r, stats.as_ref());
+        // auto lateral CA: measure on a cheap CPU demosaic of the mosaic
+        if p.ca_fix > 0.0 {
+            let s = (p.ca_fix / 0.3).clamp(0.0, 1.0);
+            let (kr, kb) = crate::develop::estimate_ca_mosaic(m);
+            p.ca_r = kr * s;
+            p.ca_b = kb * s;
+        }
         // packed lut buffer: master | chan r,g,b | hue hh,hs,hl,ls,ss
         let mut lut_buf = vec![0.0f32; LUT_N as usize];
         lut_buf[..256].copy_from_slice(&p.lut);
