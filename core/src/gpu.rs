@@ -1918,19 +1918,42 @@ fn lbl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     let my = i / mw;
     let r = max(2.0, pg.csn.w * 10.0);
     let r2 = r * r;
-    // lb0 = [highlight_boost, highlight_thresh, aspect, shape]; lb1.x = sa
+    // lb0 = [highlight_boost, highlight_thresh, aspect, shape];
+    // lb1 = [sa, cat_eye, cat_scale, rotation]; tex0.y = shape_detail
     let boost = pg.lb0.x;
     let thr = pg.lb0.y;
     let aspect = clamp(pg.lb0.z, -0.8, 0.8);
     let shape = pg.lb0.w;
     let sa = pg.lb1.x;
+    let cat = pg.lb1.y;
+    let cat_scale = pg.lb1.z;
+    let rot = pg.lb1.w;
+    let ring_w = 0.15 / (1.0 + pg.tex0.y * 2.0);
+    let rc = cos(rot * 3.14159);
+    let rs = sin(rot * 3.14159);
+    // cat-eye: radial squash toward frame edges
+    let cx = (f32(mx) + 0.5) / f32(mw) - 0.5;
+    let cy = (f32(my) + 0.5) / f32(mh) - 0.5;
+    let rd = sqrt(cx * cx + cy * cy) * 1.4142;
+    let edge = sstep(max(0.05, 1.0 - cat_scale * 0.9), 1.0, rd);
+    let q = max(0.15, 1.0 - cat * edge * 0.85);
+    var dir_c = 1.0;
+    var dir_s = 0.0;
+    if (rd > 1e-4) {
+        dir_c = cx / (rd / 1.4142);
+        dir_s = cy / (rd / 1.4142);
+    }
     var acc = vec3<f32>(0.0);
     var wsum = 0.0;
     let ri = i32(ceil(r));
     for (var dy = -ri; dy <= ri; dy = dy + 1) {
         for (var dx = -ri; dx <= ri; dx = dx + 1) {
-            let dyy = f32(dy) * (1.0 + aspect);
-            let d2 = f32(dx * dx) + dyy * dyy;
+            let rx = f32(dx) * rc - f32(dy) * rs;
+            let ry0 = f32(dx) * rs + f32(dy) * rc;
+            let ry = ry0 * (1.0 + aspect);
+            let d_rad = rx * dir_c + ry * dir_s;
+            let d_tan = -rx * dir_s + ry * dir_c;
+            let d2 = d_rad * d_rad / (q * q) + d_tan * d_tan;
             if (d2 > r2) { continue; }
             let nx2 = i32(mx) + dx;
             let ny2 = i32(my) + dy;
@@ -1940,7 +1963,7 @@ fn lbl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
             var wg = exp(-d2 / (0.45 * r2));
             if (shape > 0.5) {
                 let dr = sqrt(d2);
-                let dd = (dr - 0.72 * r) / (0.15 * r);
+                let dd = (dr - 0.72 * r) / (ring_w * r);
                 wg = exp(-dd * dd);
             } else if (sa > 0.0) {
                 wg = wg * (1.0 + sa * 1.5 * sstep(0.55, 0.95, d2 / r2));
@@ -3011,14 +3034,19 @@ impl Gpu {
             cal0: [p.calib[0], p.calib[1], p.calib[2], p.calib[9]],
             cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
             cal2: [p.calib[6], p.calib[7], p.calib[8], 0.0],
-            tex0: [p.texture, 0.0, 0.0, 0.0],
+            tex0: [p.texture, p.lens_blur_opts2[3], 0.0, 0.0],
             lb0: [
                 p.lens_blur_opts[0],
                 p.lens_blur_opts[1],
                 p.lens_blur_opts[2],
                 p.lens_blur_opts[3],
             ],
-            lb1: [p.lens_blur_opts[4], 0.0, 0.0, 0.0],
+            lb1: [
+                p.lens_blur_opts[4],
+                p.lens_blur_opts2[0],
+                p.lens_blur_opts2[1],
+                p.lens_blur_opts2[2],
+            ],
             gb0: [p.grade_balance, p.grade_blend, 0.0, 0.0],
         };
 

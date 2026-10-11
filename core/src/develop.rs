@@ -193,6 +193,8 @@ pub struct Params {
     pub lens_blur: f32,
     /// [highlight_boost, highlight_thresh, aspect, shape, spherical_ab]
     pub lens_blur_opts: [f32; 5],
+    /// [cat_eye, cat_eye_scale, rotation, shape_detail]
+    pub lens_blur_opts2: [f32; 4],
 }
 
 /// statistics gathered by the sparse sampling pass (auto WB / exposure / contrast)
@@ -1359,6 +1361,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         calib: calib_matrix(&r.calib),
         lens_blur: r.lens_blur.clamp(0.0, 1.0),
         lens_blur_opts: r.lens_blur_opts,
+        lens_blur_opts2: r.lens_blur_opts2,
     };
     // heuristic look adjustments are skipped when the named look was
     // upgraded to a real .dcp (the profile IS the look now)
@@ -3440,7 +3443,14 @@ fn finish_linear(
     // (1 - subject matte) — the matte is the focus proxy (LR uses a depth
     // map; "keep the subject sharp, blur the rest" approximates it)
     let lbl = if p.lens_blur > 0.001 {
-        Some(lens_blur_img(&lin, w, h, p.lens_blur, p.lens_blur_opts))
+        Some(lens_blur_img(
+            &lin,
+            w,
+            h,
+            p.lens_blur,
+            p.lens_blur_opts,
+            p.lens_blur_opts2,
+        ))
     } else {
         None
     };
@@ -4207,22 +4217,48 @@ fn lens_blur_img(
     h: usize,
     amt: f32,
     o: [f32; 5],
+    o2: [f32; 4],
 ) -> (Vec<[f32; 3]>, usize, usize) {
     let (boost, thr, aspect, shape, sa) = (o[0], o[1], o[2], o[3], o[4]);
+    let (cat, cat_scale, rot, shape_detail) = (o2[0], o2[1], o2[2], o2[3]);
+    let ang = rot * std::f32::consts::PI;
+    let (rc, rs) = (ang.cos(), ang.sin());
     let mw = w.min(192).max(2);
     let mh = h.min(192).max(2);
     let r = (amt * 10.0).max(2.0);
     let r2 = r * r;
     let ri = r.ceil() as i32;
+    // cat-eye: discs squash radially toward the frame edges; the scale
+    // sets where the squash starts (LR CatEyeScale 0..100 → 0..1)
+    let cat_start = (1.0 - cat_scale * 0.9).max(0.05);
+    let ring_w = 0.15 / (1.0 + shape_detail * 2.0);
     let mut out = vec![[0.0f32; 3]; mw * mh];
     for my in 0..mh {
         for mx in 0..mw {
+            let (cx, cy) = (
+                (mx as f32 + 0.5) / mw as f32 - 0.5,
+                (my as f32 + 0.5) / mh as f32 - 0.5,
+            );
+            let rd = (cx * cx + cy * cy).sqrt() * 1.4142;
+            let edge = sstep(cat_start, 1.0, rd);
+            let q = (1.0 - cat * edge * 0.85).max(0.15);
+            let (dir_c, dir_s) = if rd > 1e-4 {
+                (cx / (rd / 1.4142), cy / (rd / 1.4142))
+            } else {
+                (1.0f32, 0.0f32)
+            };
             let mut acc = [0.0f32; 3];
             let mut wsum = 0.0f32;
             for dy in -ri..=ri {
                 for dx in -ri..=ri {
-                    let dyy = dy as f32 * (1.0 + aspect.clamp(-0.8, 0.8));
-                    let d2 = dx as f32 * dx as f32 + dyy * dyy;
+                    // rotate the kernel, then squash y by bokeh aspect
+                    let rx = dx as f32 * rc - dy as f32 * rs;
+                    let ry = dx as f32 * rs + dy as f32 * rc;
+                    let ry = ry * (1.0 + aspect.clamp(-0.8, 0.8));
+                    // cat-eye: compress the radial component
+                    let d_rad = rx * dir_c + ry * dir_s;
+                    let d_tan = -rx * dir_s + ry * dir_c;
+                    let d2 = d_rad * d_rad / (q * q) + d_tan * d_tan;
                     if d2 > r2 {
                         continue;
                     }
@@ -4233,9 +4269,9 @@ fn lens_blur_img(
                     }
                     let mut wg = (-d2 / (0.45 * r2)).exp();
                     if shape > 0.5 {
-                        // ring bokeh: band at ~0.72r
+                        // ring bokeh: band at ~0.72r, width from shape detail
                         let dr = d2.sqrt();
-                        let dd = (dr - 0.72 * r) / (0.15 * r);
+                        let dd = (dr - 0.72 * r) / (ring_w * r);
                         wg = (-dd * dd).exp();
                     } else if sa > 0.0 {
                         // hard-edged "bubble" discs: boost the rim

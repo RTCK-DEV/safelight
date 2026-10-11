@@ -205,13 +205,18 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     // Lens Blur (LR12+): child element, not an attribute
     if r.lens_blur > 0.001 {
         let o = r.lens_blur_opts;
+        let o2 = r.lens_blur_opts2;
         a.push_str(&format!(
-            "   <crs:LensBlur crs:Version=\"1\" crs:Active=\"true\" crs:FocalRange=\"0 0 100 100\" crs:BlurAmount=\"{:.0}\" crs:BokehShape=\"{:.0}\" crs:BokehShapeDetail=\"0\" crs:HighlightsThreshold=\"{:.0}\" crs:HighlightsBoost=\"{:.0}\" crs:CatEyeAmount=\"0\" crs:CatEyeScale=\"100\" crs:BokehAspect=\"{:.0}\" crs:BokehRotation=\"0\" crs:SphericalAberration=\"{:.0}\"/>\n",
+            "   <crs:LensBlur crs:Version=\"1\" crs:Active=\"true\" crs:FocalRange=\"0 0 100 100\" crs:BlurAmount=\"{:.0}\" crs:BokehShape=\"{:.0}\" crs:BokehShapeDetail=\"{:.0}\" crs:HighlightsThreshold=\"{:.0}\" crs:HighlightsBoost=\"{:.0}\" crs:CatEyeAmount=\"{:.0}\" crs:CatEyeScale=\"{:.0}\" crs:BokehAspect=\"{:.0}\" crs:BokehRotation=\"{:.0}\" crs:SphericalAberration=\"{:.0}\"/>\n",
             r.lens_blur * 100.0,
             o[3],
+            o2[3] * 100.0,
             o[1] * 100.0,
             o[0] * 100.0,
+            o2[0] * 100.0,
+            o2[1] * 100.0,
             o[2] * 100.0,
+            o2[2] * 100.0,
             o[4] * 100.0
         ));
     }
@@ -674,6 +679,12 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                         0.0
                     },
                     (attr(lb, "crs:SphericalAberration").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+                ];
+                r.lens_blur_opts2 = [
+                    (attr(lb, "crs:CatEyeAmount").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+                    (attr(lb, "crs:CatEyeScale").unwrap_or(100.0) / 100.0).clamp(0.0, 1.0),
+                    (attr(lb, "crs:BokehRotation").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+                    (attr(lb, "crs:BokehShapeDetail").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
                 ];
             }
         }
@@ -1762,6 +1773,17 @@ mod tests {
         assert_eq!(r2.windows.len(), 2);
         assert_eq!(r2.windows[1].kind, "crange");
         assert!((r2.windows[1].p[0] - 0.562975).abs() < 1e-5);
+    }
+
+    #[test]
+    fn lens_blur_full_attrs_parse() {
+        // real "Adaptive - Blur Background/Bubble Swirl" attribute set
+        let xmp = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"><crs:LensBlur crs:Version="1" crs:Active="true" crs:BlurAmount="70" crs:BokehShape="0" crs:BokehShapeDetail="0" crs:HighlightsThreshold="50" crs:HighlightsBoost="50" crs:CatEyeAmount="80" crs:CatEyeScale="100" crs:BokehAspect="0" crs:BokehRotation="50" crs:SphericalAberration="0"/></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let r = crs_to_recipe(xmp);
+        assert!((r.lens_blur - 0.7).abs() < 1e-5);
+        assert!((r.lens_blur_opts2[0] - 0.8).abs() < 1e-5, "cat eye");
+        assert!((r.lens_blur_opts2[1] - 1.0).abs() < 1e-5, "cat eye scale");
+        assert!((r.lens_blur_opts2[2] - 0.5).abs() < 1e-5, "rotation");
     }
 
     #[test]

@@ -185,6 +185,10 @@ pub struct Recipe {
     /// aspect(-1..1 squash), shape(0=disc,1=ring), spherical_aberration]
     #[serde(default)]
     pub lens_blur_opts: [f32; 5],
+    /// LR Lens Blur bokeh options 2: [cat-eye amount, cat-eye scale,
+    /// bokeh rotation, bokeh shape detail] — all 0..1
+    #[serde(default)]
+    pub lens_blur_opts2: [f32; 4],
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -613,6 +617,7 @@ impl Default for Recipe {
             texture: 0.0,
             lens_blur: 0.0,
             lens_blur_opts: [0.0; 5],
+            lens_blur_opts2: [0.0; 4],
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),
