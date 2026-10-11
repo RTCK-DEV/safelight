@@ -2466,17 +2466,38 @@ fn correct_plane_adobe(
 /// lens-correction stage for this frame: external profile (lensfun / Adobe
 /// LCP) merged with any DNG-embedded opcode corrections (GainMap +
 /// WarpRectilinear). Returns None when nothing applies.
-fn lens_stage(m: &Mosaic, r: &Recipe) -> Option<crate::lensdb::Correction> {
+pub(crate) fn lens_stage(m: &Mosaic, r: &Recipe) -> Option<crate::lensdb::Correction> {
     if r.lens_corr <= 0.001 {
         return None;
     }
-    let mut c = crate::lensdb::correction_for(
-        &m.info.lens,
-        &m.info.make,
-        &m.info.model,
-        m.info.focal,
-        m.info.aperture,
-    )
+    // a preset may pin a specific lens profile (crs:LensProfileName);
+    // try it first, fall back to the EXIF lens.
+    let mut c = if !r.lens_name.is_empty() {
+        crate::lensdb::correction_for(
+            &r.lens_name,
+            &m.info.make,
+            &m.info.model,
+            m.info.focal,
+            m.info.aperture,
+        )
+        .or_else(|| {
+            crate::lensdb::correction_for(
+                &m.info.lens,
+                &m.info.make,
+                &m.info.model,
+                m.info.focal,
+                m.info.aperture,
+            )
+        })
+    } else {
+        crate::lensdb::correction_for(
+            &m.info.lens,
+            &m.info.make,
+            &m.info.model,
+            m.info.focal,
+            m.info.aperture,
+        )
+    }
     .unwrap_or_else(crate::lensdb::Correction::none);
     c.dng = m.dng_ops.clone();
     crate::dngops::env_filter(&mut c.dng);

@@ -704,6 +704,20 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(v) = attr(&body, "crs:LensProfileEnable") {
             r.lens_corr = v.clamp(0.0, 1.0);
         }
+        // a preset can pin a specific lens profile (LR writes e.g.
+        // "Adobe (SIGMA 45mm F2.8 DG DN C019, Sony)") — takes priority
+        // over the EXIF lens when matching the lens db.
+        if let Some(n) = attr_str(&body, "crs:LensProfileName") {
+            if let Some(l) = n.strip_prefix("Adobe (").and_then(|s| s.strip_suffix(')')) {
+                // "lens, make" — keep just the lens model
+                r.lens_name = l
+                    .rsplit_once(',')
+                    .map(|(l, _)| l.trim().to_string())
+                    .unwrap_or_else(|| l.trim().to_string());
+            } else {
+                r.lens_name = n;
+            }
+        }
         if let Some(v) = attr(&body, "crs:AutoLateralCA") {
             r.ca_fix = if v >= 0.5 { 0.3 } else { 0.0 };
         }

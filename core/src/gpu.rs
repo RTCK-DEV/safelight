@@ -2742,27 +2742,10 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        // lens profile correction: same lookup as the CPU path, plus any
-        // DNG-embedded opcode corrections merged underneath
-        let corr = if r.lens_corr > 0.001 {
-            let mut c = crate::lensdb::correction_for(
-                &m.info.lens,
-                &m.info.make,
-                &m.info.model,
-                m.info.focal,
-                m.info.aperture,
-            )
-            .unwrap_or_else(crate::lensdb::Correction::none);
-            c.dng = m.dng_ops.clone();
-            crate::dngops::env_filter(&mut c.dng);
-            if c.is_empty() && c.dng.is_none() {
-                None
-            } else {
-                Some(c)
-            }
-        } else {
-            None
-        };
+        // lens profile correction: same lookup as the CPU path (preset
+        // crs:LensProfileName first, then EXIF), plus any DNG-embedded
+        // opcode corrections merged underneath
+        let corr = crate::develop::lens_stage(m, r);
         let lens_amt = r.lens_corr.min(1.0);
         let dng = corr.as_ref().and_then(|c| c.dng.as_ref());
         let dng_warp_en = dng.and_then(|d| d.warp.as_ref()).is_some();

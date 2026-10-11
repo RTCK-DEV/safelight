@@ -242,6 +242,10 @@ pub struct Recipe {
     /// distortion, lateral CA and vignetting at that strength.
     #[serde(default = "default_one")]
     pub lens_corr: f32,
+    /// crs:LensProfileName — a preset's explicit lens profile choice,
+    /// overriding the EXIF lens when matching the lens db.
+    #[serde(default)]
+    pub lens_name: String,
     /// adjustment-brush layers (LR-style): each layer carries its own
     /// ev/sat/temp + opacity and a list of painted strokes, applied
     /// inside the stroked mask. Up to 4 layers are honoured.
@@ -641,6 +645,7 @@ impl Default for Recipe {
             key_v: 0.0,
             key_h: 0.0,
             lens_corr: 1.0,
+            lens_name: String::new(),
             brushes: Vec::new(),
             ai_denoise: 0.0,
             stages: Vec::new(),
