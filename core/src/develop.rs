@@ -850,7 +850,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                         .collect::<Vec<_>>(),
                 );
             }
-            profile_baseline_ev = prof.baseline_exposure;
+            // BaselineExposureOffset (0xC7A5) is the profile's own EV
+            // correction — it sits on top of the file's BaselineExposure
+            // per the DNG spec (e.g. DJI ships file +1.8, profile −1.0).
+            profile_baseline_ev = prof.baseline_exposure + prof.baseline_exposure_offset;
         }
         // XMP LookTable (dng_look_table) replaces the DCP look
         if let Some(lt) = &r.look_table {
@@ -869,9 +872,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         l
     };
     // auto exposure: steer scene mean luma toward 18% gray, cap ±3EV.
-    // BaselineExposure from a .dcp folds in here — the profile's expected
-    // gain is part of the conversion, not a user edit.
-    let mut exposure_mul = (2.0f32).powf(r.exposure + profile_baseline_ev);
+    // BaselineExposure folds in here — from the .dcp (profile's expected
+    // gain) and from the file itself (DNG 0xC62A — e.g. DJI writes +1.8
+    // because its raws are intentionally exposed dark).
+    let dng_baseline_ev = m.dng_ops.as_ref().map(|o| o.baseline_ev).unwrap_or(0.0);
+    let mut exposure_mul = (2.0f32).powf(r.exposure + profile_baseline_ev + dng_baseline_ev);
     if r.auto_exposure {
         if let Some(s) = stats {
             let l = post_mean_luma(s);

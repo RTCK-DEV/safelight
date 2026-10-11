@@ -11,6 +11,7 @@
 //! that first and treats crs: only as a fallback for foreign files.
 
 use crate::recipe::{Recipe, Sidecar};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub fn xmp_path_for(asset: &Path) -> PathBuf {
@@ -486,9 +487,13 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                 _ => p,
             };
         }
-        // <crs:Look><rdf:Description crs:Name="Adobe Landscape" …/> —
+        // <crs:Look><rdf:Description crs:Name="Adobe Color" …/> —
         // the modern profile picker (enhanced .xmp profiles live under
-        // Settings/**/Profiles). CameraProfile wins when both are set.
+        // Settings/**/Profiles). When both are present the Look name is
+        // the *effective* profile: LR keeps crs:CameraProfile pointing at
+        // the base DCP the look sits on. If the name fails to resolve to
+        // an enhanced profile, the DCP path still finds it (or we fall
+        // back to CameraProfile below).
         let look_span = body.find("<crs:Look>").map(|ls| {
             let le = body[ls..]
                 .find("</crs:Look>")
@@ -498,7 +503,7 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         });
         if let Some((ls, le)) = look_span {
             if let Some(n) = attr_str(&body[ls..le], "crs:Name") {
-                if r.profile.is_empty() {
+                if r.profile.is_empty() || find_xmp_profile(&n).is_some() {
                     r.profile = n;
                 }
             }
@@ -1068,10 +1073,29 @@ fn land_prior(name: &str) -> (f32, f32, f32, f32) {
 /// ~/.safelight/profiles) for a matching filename stem, preferring paths
 /// under a "Profiles" folder.
 pub fn find_xmp_profile(name: &str) -> Option<std::path::PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::path::PathBuf>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let norm = name.trim().to_lowercase();
     if norm.is_empty() {
         return None;
     }
+    if let Ok(c) = cache.lock() {
+        if let Some(hit) = c.get(&norm) {
+            return hit.clone();
+        }
+    }
+    let found = find_xmp_profile_uncached(&norm);
+    if let Ok(mut c) = cache.lock() {
+        if c.len() > 256 {
+            c.clear();
+        }
+        c.insert(norm, found.clone());
+    }
+    found
+}
+
+fn find_xmp_profile_uncached(norm: &str) -> Option<std::path::PathBuf> {
     let mut fallback = None;
     for dir in crate::dcp::profile_dirs() {
         let mut stack = vec![dir];
@@ -1101,7 +1125,7 @@ pub fn find_xmp_profile(name: &str) -> Option<std::path::PathBuf> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                if stem == norm {
+                if stem == *norm {
                     if p.to_string_lossy().to_lowercase().contains("profile") {
                         return Some(p);
                     }
@@ -2062,9 +2086,24 @@ mod tests {
 
     #[test]
     fn look_name_falls_back_to_camera_profile() {
-        let xmp = r#"<rdf:Description rdf:about="" crs:CameraProfile="Adobe Standard"><crs:Look><rdf:Description crs:Name="Adobe Landscape"/></crs:Look></rdf:Description>"#;
+        // a Look name that resolves to no enhanced .xmp profile leaves the
+        // base CameraProfile (the DCP the look sits on) in place
+        let xmp = r#"<rdf:Description rdf:about="" crs:CameraProfile="Adobe Standard"><crs:Look><rdf:Description crs:Name="No Such Profile Zz9"/></crs:Look></rdf:Description>"#;
         let r = crs_to_recipe(xmp);
-        // explicit CameraProfile wins over the Look name
         assert_eq!(r.profile, "Adobe Standard");
+    }
+
+    #[test]
+    fn look_name_overrides_when_profile_resolves() {
+        // LR semantics: crs:Look.Name is the effective profile;
+        // crs:CameraProfile is just the base DCP. When the name resolves to
+        // an enhanced .xmp profile on disk it wins. Adobe Color ships with
+        // Lightroom; if absent this test degrades to the fallback case.
+        if find_xmp_profile("Adobe Color").is_none() {
+            return;
+        }
+        let xmp = r#"<rdf:Description rdf:about="" crs:CameraProfile="Adobe Standard"><crs:Look><rdf:Description crs:Name="Adobe Color"/></crs:Look></rdf:Description>"#;
+        let r = crs_to_recipe(xmp);
+        assert_eq!(r.profile, "Adobe Color");
     }
 }

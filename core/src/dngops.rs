@@ -44,6 +44,9 @@ pub struct WarpRect {
 pub struct DngOps {
     pub warp: Option<WarpRect>,
     pub gain: Option<GainMap>,
+    /// DNG BaselineExposure (0xC62A): EV the file wants added by default —
+    /// e.g. DJI drones write +1.8 because the raw is intentionally dark.
+    pub baseline_ev: f32,
 }
 
 impl GainMap {
@@ -96,6 +99,12 @@ impl<'a> Rd<'a> {
         } else {
             u32::from_be_bytes([b[0], b[1], b[2], b[3]])
         }
+    }
+    fn i32(&self, o: usize) -> i32 {
+        self.u32(o) as i32
+    }
+    fn i16(&self, o: usize) -> i16 {
+        self.u16(o) as i16
     }
     fn tag(&self, ifd: usize, want: u16) -> Option<(u16, u32, usize)> {
         let n = self.u16(ifd) as usize;
@@ -227,6 +236,7 @@ fn parse_opcodes(d: &[u8]) -> DngOps {
     let mut ops = DngOps {
         warp: None,
         gain: None,
+        baseline_ev: 0.0,
     };
     if d.len() < 4 {
         return ops;
@@ -348,7 +358,31 @@ pub fn parse(path: &Path) -> Option<DngOps> {
     let mut merged = DngOps {
         warp: None,
         gain: None,
+        baseline_ev: 0.0,
     };
+    for ifd in r.ifds() {
+        if let Some((typ, _, off)) = r.tag(ifd, 0xC62A) {
+            let v = match typ {
+                5 => Some(r.u32(off) as f64 / r.u32(off + 4).max(1) as f64),
+                10 => {
+                    let d = r.i32(off + 4) as f64;
+                    Some(if d.abs() < 1e-9 {
+                        0.0
+                    } else {
+                        r.i32(off) as f64 / d
+                    })
+                }
+                11 => Some(f32::from_bits(r.u32(off)) as f64),
+                8 => Some(r.i16(off) as f64),
+                3 => Some(r.u16(off) as f64),
+                _ => None,
+            };
+            if let Some(v) = v {
+                merged.baseline_ev = v as f32;
+            }
+            break;
+        }
+    }
     for ifd in r.ifds() {
         for tag in [0xC740u16, 0xC741, 0xC74E] {
             if let Some((_, cnt, off)) = r.tag(ifd, tag) {
@@ -366,7 +400,7 @@ pub fn parse(path: &Path) -> Option<DngOps> {
             }
         }
     }
-    if merged.warp.is_none() && merged.gain.is_none() {
+    if merged.warp.is_none() && merged.gain.is_none() && merged.baseline_ev == 0.0 {
         None
     } else {
         Some(merged)
@@ -384,6 +418,8 @@ mod tests {
             return;
         }
         let ops = parse(p).expect("dji dng has opcodes");
+        // DJI Action 4 ships BaselineExposure=+1.8 in the raw IFD
+        assert!((ops.baseline_ev - 1.8).abs() < 0.01, "ev={}", ops.baseline_ev);
         let w = ops.warp.expect("warp rectilinear");
         eprintln!("warp center={:?}", w.center);
         for ch in 0..3 {

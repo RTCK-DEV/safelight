@@ -158,6 +158,9 @@ pub struct DcpProfile {
     pub tone_curve: Vec<(f32, f32)>,
     /// EV the profile expects applied to the raw data
     pub baseline_exposure: f32,
+    /// DNG 1.7 BaselineExposureOffset (0xC7A5): profile-specific EV added
+    /// to the file's BaselineExposure for the default render.
+    pub baseline_exposure_offset: f32,
     /// camera model the profile is calibrated for (UniqueCameraModel)
     pub unique_model: String,
 }
@@ -373,6 +376,10 @@ impl DcpProfile {
             .unwrap_or(0) as u16;
         p.baseline_exposure = t
             .num_list(T_BASEEXP)
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0.0);
+        p.baseline_exposure_offset = t
+            .num_list(0xC7A5)
             .and_then(|v| v.first().copied())
             .unwrap_or(0.0);
 
