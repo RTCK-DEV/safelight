@@ -2389,6 +2389,7 @@ fn correct_plane_adobe(
     w: usize,
     h: usize,
     a: &crate::lensdb::AdobeCor,
+    dng: Option<&crate::dngops::DngOps>,
     amount: f32,
 ) -> Vec<[f32; 3]> {
     let dmax = w.max(h) as f32;
@@ -2402,6 +2403,9 @@ fn correct_plane_adobe(
     let vfy = a.vig_foc[1].max(1e-3) * dmax;
     let has_vig = a.vig_a != [0.0; 3];
     let (k1, k2, k3, ty, tx) = (a.k[0], a.k[1], a.k[2], a.k[3], a.k[4]);
+    let halfd = ((w as f32 * 0.5).powi(2) + (h as f32 * 0.5).powi(2))
+        .sqrt()
+        .max(1.0);
     let mut out = vec![[0.0f32; 3]; w * h];
     for y in 0..h {
         for x in 0..w {
@@ -2435,9 +2439,33 @@ fn correct_plane_adobe(
                     }
                     None => (xg, yg),
                 };
-                let sx = x0 + xc * fx;
-                let sy = y0 + yc * fy;
-                px[ch] = bilinear3(plane, w, h, sx, sy, ch);
+                let mut sx = x0 + xc * fx;
+                let mut sy = y0 + yc * fy;
+                if let Some(ops) = dng {
+                    if let Some(wr) = &ops.warp {
+                        // WarpRectilinear: halfdiag-normalised about the
+                        // embedded centre, per-channel kr
+                        let wx = wr.center[0] * w as f32;
+                        let wy = wr.center[1] * h as f32;
+                        let ox = (sx - wx) / halfd;
+                        let oy = (sy - wy) / halfd;
+                        let r2 = ox * ox + oy * oy;
+                        let k = &wr.kr[ch.min(2)];
+                        let f = k[0]
+                            + r2 * (k[1] + r2 * (k[2] + r2 * (k[3] + r2 * (k[4] + r2 * k[5]))));
+                        let f = 1.0 + (f - 1.0) * amount;
+                        sx = wx + ox * f * halfd;
+                        sy = wy + oy * f * halfd;
+                    }
+                    let mut v = bilinear3(plane, w, h, sx, sy, ch);
+                    if let Some(gm) = &ops.gain {
+                        let gg = gm.at(sx as f64, sy as f64, ch, w, h) as f32;
+                        v *= 1.0 + (gg - 1.0) * amount;
+                    }
+                    px[ch] = v;
+                } else {
+                    px[ch] = bilinear3(plane, w, h, sx, sy, ch);
+                }
             }
             if has_vig {
                 // residual illumination on the distorted source position,
@@ -2531,7 +2559,7 @@ pub fn correct_plane(
     amount: f32,
 ) -> Vec<[f32; 3]> {
     if let Some(a) = &c.adobe {
-        return correct_plane_adobe(plane, w, h, a, amount);
+        return correct_plane_adobe(plane, w, h, a, c.dng.as_ref(), amount);
     }
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
