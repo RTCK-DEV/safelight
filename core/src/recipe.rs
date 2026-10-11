@@ -119,6 +119,12 @@ pub struct Recipe {
     /// 3-way midtone tint: hue (0..1) + amount
     pub midtone_hue: f32,
     pub midtone_sat: f32,
+    /// LR SplitToningBalance -1..1: shifts the shadow↔highlight crossover
+    #[serde(default)]
+    pub grade_balance: f32,
+    /// LR ColorGradeBlending 0..1 (LR 0..100): range overlap width (0.5=LR50)
+    #[serde(default = "grade_blend_default")]
+    pub grade_blend: f32,
     /// per-channel custom curves (same [[x,y]] format as `curve`)
     pub curve_r: Vec<[f32; 2]>,
     pub curve_g: Vec<[f32; 2]>,
@@ -466,6 +472,9 @@ fn neg_one() -> f32 {
 fn neg_two() -> f32 {
     -2.0
 }
+fn grade_blend_default() -> f32 {
+    0.5
+}
 
 impl Default for PowerWindow {
     fn default() -> Self {
@@ -539,6 +548,8 @@ impl Default for Recipe {
             offset: [0.0; 3],
             midtone_hue: 0.33,
             midtone_sat: 0.0,
+            grade_balance: 0.0,
+            grade_blend: 0.5,
             curve_r: Vec::new(),
             curve_g: Vec::new(),
             curve_b: Vec::new(),

@@ -63,6 +63,10 @@ pub struct Params {
     pub shadow_sat: f32,
     pub high_col: [f32; 3],
     pub high_sat: f32,
+    /// LR SplitToningBalance -1..1 (shadow↔highlight crossover shift)
+    pub grade_balance: f32,
+    /// LR ColorGradeBlending 0..1 — range overlap width (0.5 = LR 50)
+    pub grade_blend: f32,
     /// auto-contrast remap points (identity when 0,1)
     pub black_pt: f32,
     pub white_pt: f32,
@@ -1173,6 +1177,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         shadow_sat: r.shadow_sat.clamp(0.0, 1.0),
         high_col: hue_to_rgb(r.highlight_hue),
         high_sat: r.highlight_sat.clamp(0.0, 1.0),
+        grade_balance: r.grade_balance.clamp(-1.0, 1.0),
+        grade_blend: r.grade_blend.clamp(0.0, 1.0),
         black_pt,
         white_pt,
         spots,
@@ -1585,9 +1591,13 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     // split toning: pull shadows/midtones/highlights toward their tint colors
     if p.shadow_sat > 0.0 || p.high_sat > 0.0 || p.mid_sat > 0.0 {
         let luma = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
-        let ws = (1.0 - sstep(0.0, 0.55, luma)) * p.shadow_sat;
-        let wh = sstep(0.45, 1.0, luma) * p.high_sat;
-        let wm = (1.0 - (luma - 0.5).abs() * 2.0).max(0.0) * p.mid_sat;
+        // LR SplitToningBalance shifts the shadow↔highlight crossover;
+        // ColorGradeBlending widens/narrows the overlap (0.5 = LR 50)
+        let sp = 0.5 + p.grade_balance * 0.2;
+        let bw = 0.7 + p.grade_blend * 0.6;
+        let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, luma)) * p.shadow_sat;
+        let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, luma) * p.high_sat;
+        let wm = (1.0 - (luma - sp).abs() * 2.0 / bw).max(0.0) * p.mid_sat;
         for c in 0..3 {
             x[c] += ws * (p.shadow_col[c] - luma) * 0.5
                 + wh * (p.high_col[c] - luma) * 0.5

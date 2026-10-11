@@ -182,6 +182,19 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             r.calib[6] * 100.0
         ));
     }
+    if r.shadow_sat > 0.0 || r.highlight_sat > 0.0 || r.midtone_sat > 0.0 {
+        a.push_str(&format!(
+            "   crs:ColorGradeShadowHue=\"{:.0}\" crs:ColorGradeShadowSat=\"{:.0}\" crs:ColorGradeMidtoneHue=\"{:.0}\" crs:ColorGradeMidtoneSat=\"{:.0}\" crs:ColorGradeHighlightHue=\"{:.0}\" crs:ColorGradeHighlightSat=\"{:.0}\" crs:SplitToningBalance=\"{:.0}\" crs:ColorGradeBlending=\"{:.0}\"\n",
+            r.shadow_hue * 360.0,
+            r.shadow_sat * 100.0,
+            r.midtone_hue * 360.0,
+            r.midtone_sat * 100.0,
+            r.highlight_hue * 360.0,
+            r.highlight_sat * 100.0,
+            r.grade_balance * 100.0,
+            r.grade_blend * 100.0
+        ));
+    }
     if sc.rating != 0 {
         a.push_str(&format!("   xmp:Rating=\"{}\"\n", sc.rating.clamp(-1, 5)));
     }
@@ -649,6 +662,12 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         if let Some(v) = attr(&body, "crs:ColorGradeMidtoneSat") {
             r.midtone_sat = (v / 100.0).clamp(0.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:SplitToningBalance") {
+            r.grade_balance = (v / 100.0).clamp(-1.0, 1.0);
+        }
+        if let Some(v) = attr(&body, "crs:ColorGradeBlending") {
+            r.grade_blend = (v / 100.0).clamp(0.0, 1.0);
         }
         // PV2012 parametric tone curve -> sampled into our point curve
         if let Some(curve_pts) = parametric_curve(&body) {

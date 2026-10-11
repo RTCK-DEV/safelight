@@ -147,6 +147,8 @@ struct Uni {
     lb0: [f32; 4],
     /// [spherical_aberration, 0, 0, 0]
     lb1: [f32; 4],
+    /// LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
+    gb0: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -240,6 +242,8 @@ struct Uni {
     lb0: vec4<f32>,
     // [spherical_aberration, 0, 0, 0]
     lb1: vec4<f32>,
+    // LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
+    gb0: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1438,9 +1442,13 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     // split toning (shadow / midtone / highlight)
     if (pg.st0.w > 0.0 || pg.st1.w > 0.0 || pg.mt0.w > 0.0) {
         let lum = luma(x);
-        let ws = (1.0 - sstep(0.0, 0.55, lum)) * pg.st0.w;
-        let wh = sstep(0.45, 1.0, lum) * pg.st1.w;
-        let wm = max(1.0 - abs(lum - 0.5) * 2.0, 0.0) * pg.mt0.w;
+        // LR SplitToningBalance shifts the crossover; ColorGradeBlending
+        // widens/narrows the overlap — mirrors develop.rs
+        let sp = 0.5 + pg.gb0.x * 0.2;
+        let bw = 0.7 + pg.gb0.y * 0.6;
+        let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, lum)) * pg.st0.w;
+        let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, lum) * pg.st1.w;
+        let wm = max(1.0 - abs(lum - sp) * 2.0 / bw, 0.0) * pg.mt0.w;
         x = x + ws * (pg.st0.xyz - vec3<f32>(lum)) * 0.5
             + wh * (pg.st1.xyz - vec3<f32>(lum)) * 0.5
             + wm * (pg.mt0.xyz - vec3<f32>(lum)) * 0.5;
@@ -2746,6 +2754,7 @@ impl Gpu {
                 p.lens_blur_opts[3],
             ],
             lb1: [p.lens_blur_opts[4], 0.0, 0.0, 0.0],
+            gb0: [p.grade_balance, p.grade_blend, 0.0, 0.0],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
