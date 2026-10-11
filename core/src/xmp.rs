@@ -57,6 +57,7 @@ fn lr(v: f32, scale: f32) -> String {
 pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     let r = &sc.recipe;
     let mut a = String::with_capacity(4096);
+    let mut look_block = None;
     a.push_str("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
     a.push_str("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"safelight\">\n");
     a.push_str(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
@@ -85,7 +86,18 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         ));
     }
     if !r.profile.is_empty() {
-        a.push_str(&format!("   crs:CameraProfile=\"{}\"\n", esc(&r.profile)));
+        // names that resolve to an enhanced .xmp profile round-trip as
+        // <crs:Look> (how LR serializes the modern profile picker);
+        // ordinary camera profiles stay crs:CameraProfile.
+        if find_xmp_profile(&r.profile).is_some() {
+            look_block = Some(format!(
+                " <crs:Look>\n  <rdf:Description\n   crs:Name=\"{}\"\n   crs:Amount=\"{:.2}\"\n   crs:Stubbed=\"true\">\n  </rdf:Description>\n </crs:Look>\n",
+                esc(&r.profile),
+                r.profile_amount
+            ));
+        } else {
+            a.push_str(&format!("   crs:CameraProfile=\"{}\"\n", esc(&r.profile)));
+        }
     }
     a.push_str(&format!(
         "   crs:Exposure2012=\"{:+.2}\" crs:Contrast2012=\"{}\"\n",
@@ -202,6 +214,9 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         a.push_str(&format!("   xmp:Label=\"{}\"\n", esc(&sc.label)));
     }
     a.push_str("   ara:Format=\"1\">\n");
+    if let Some(lb) = look_block {
+        a.push_str(&lb);
+    }
     // Lens Blur (LR12+): child element, not an attribute
     if r.lens_blur > 0.001 {
         let o = r.lens_blur_opts;
