@@ -174,6 +174,8 @@ pub struct Params {
     pub warper: Vec<[f32; 5]>,
     /// LR Point Color swatches (see Recipe::point_colors for layout)
     pub point_colors: Vec<[f32; 19]>,
+    /// per-swatch Color Variance (-1..1), index-aligned with point_colors
+    pub point_color_vars: Vec<f32>,
     // ---- .dcp camera profile (Adobe colour pipeline) ----
     /// hue/sat/val shift table applied in WB-scaled camera space,
     /// BEFORE the cam->XYZ matrix (DNG ProfileHueSatMap)
@@ -1350,6 +1352,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         has_cs: r.color_slice.iter().any(|s| s[3] > 0.5),
         warper: r.warper.iter().take(8).cloned().collect(),
         point_colors: r.point_colors.clone(),
+        point_color_vars: r.point_color_vars.clone(),
         profile_hsm,
         profile_look,
         profile_tone_lut,
@@ -1651,7 +1654,12 @@ fn range_scale(r: [f32; 4], k: f32) -> [f32; 4] {
 /// on the picked hue (src maps to 0.5 — LR's range defaults are constant
 /// regardless of SrcHue, so the range cannot be absolute), while the
 /// sat/lum ranges are absolute axis values.
-pub fn pc_apply(x: [f32; 3], sw: &PcSwatch) -> [f32; 3] {
+///
+/// `var` is the LR Color Variance (-1..1): after applying the swatch's
+/// HSL shift, colours are pushed away from (var>0) or pulled toward
+/// (var<0) the shifted swatch colour — LR pushes/pulls around the
+/// "after" side of the swatch.
+pub fn pc_apply(x: [f32; 3], sw: &PcSwatch, var: f32) -> [f32; 3] {
     let (h, s, v) = rgb_to_hsv(x);
     let l = v;
     let k = (sw.amt * 2.0).max(0.0);
@@ -1664,11 +1672,32 @@ pub fn pc_apply(x: [f32; 3], sw: &PcSwatch) -> [f32; 3] {
     if w <= 1e-4 {
         return x;
     }
-    hsv_to_rgb(
-        (h + sw.shift[0] * w * 0.5).rem_euclid(1.0),
-        (s * (1.0 + sw.shift[1] * w)).clamp(0.0, 1.0),
-        (v * (1.0 + sw.shift[2] * w)).max(0.0),
-    )
+    // full-strength shifted colour (the selection weight blends it in)
+    let xs = hsv_to_rgb(
+        (h + sw.shift[0] * 0.5).rem_euclid(1.0),
+        (s * (1.0 + sw.shift[1])).clamp(0.0, 1.0),
+        (v * (1.0 + sw.shift[2])).max(0.0),
+    );
+    let tgt = if var.abs() > 1e-4 {
+        // "after" colour: the swatch source with its shifts applied
+        let a = hsv_to_rgb(
+            (sw.src[0] + sw.shift[0] * 0.5).rem_euclid(1.0),
+            (sw.src[1] * (1.0 + sw.shift[1])).clamp(0.0, 1.0),
+            (sw.src[2] * (1.0 + sw.shift[2])).max(0.0),
+        );
+        [
+            a[0] + (xs[0] - a[0]) * (1.0 + var),
+            a[1] + (xs[1] - a[1]) * (1.0 + var),
+            a[2] + (xs[2] - a[2]) * (1.0 + var),
+        ]
+    } else {
+        xs
+    };
+    [
+        x[0] + (tgt[0] - x[0]) * w,
+        x[1] + (tgt[1] - x[1]) * w,
+        x[2] + (tgt[2] - x[2]) * w,
+    ]
 }
 
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
@@ -1916,9 +1945,9 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     }
     // LR Point Color swatches: feathered trapezoid selection over
     // hue/sat/lum applied as weighted hue/sat/lum shifts.
-    for v19 in &p.point_colors {
+    for (i, v19) in p.point_colors.iter().enumerate() {
         if let Some(sw) = pc_normalize(v19) {
-            x = pc_apply(x, &sw);
+            x = pc_apply(x, &sw, p.point_color_vars.get(i).copied().unwrap_or(0.0));
         }
     }
     // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask.
@@ -3752,10 +3781,6 @@ fn local_ops(
         let lp = &p.lpcs[wi];
         for s in 0..(lp[0] as usize).min(2) {
             let o = 1 + s * 20;
-            let t = (mask * lp[o + 19]).clamp(0.0, 1.0);
-            if t <= 0.001 {
-                continue;
-            }
             let sw = PcSwatch {
                 src: [lp[o], lp[o + 1], lp[o + 2]],
                 shift: [lp[o + 3], lp[o + 4], lp[o + 5]],
@@ -3764,9 +3789,9 @@ fn local_ops(
                 sr: [lp[o + 11], lp[o + 12], lp[o + 13], lp[o + 14]],
                 lr: [lp[o + 15], lp[o + 16], lp[o + 17], lp[o + 18]],
             };
-            let tgt = pc_apply(*adj, &sw);
+            let tgt = pc_apply(*adj, &sw, lp[o + 19]);
             for c in 0..3 {
-                adj[c] += (tgt[c] - adj[c]) * t;
+                adj[c] += (tgt[c] - adj[c]) * mask;
             }
         }
     }
@@ -4713,11 +4738,12 @@ mod tests {
                 amt: 0.5,
                 ..sw
             },
+            0.0,
         );
         let (h2, s2, _) = rgb_to_hsv(near);
         assert!(s2 > 0.9, "s2 {s2}");
         let _ = h2;
-        let grey = pc_apply([0.5, 0.5, 0.5], &sw);
+        let grey = pc_apply([0.5, 0.5, 0.5], &sw, 0.0);
         assert!((grey[0] - 0.5).abs() < 1e-4);
         // sentinel row
         assert!(pc_normalize(&[-1.0; 19]).is_none());
@@ -4750,6 +4776,31 @@ mod tests {
         // src colour sits inside its own sat/lum full zones
         assert!(sw3.sr[1] <= sw3.src[1] && sw3.src[1] <= sw3.sr[3]);
         assert!(sw3.lr[1] <= sw3.src[2] && sw3.src[2] <= sw3.lr[3]);
+        // Color Variance: var<0 pulls in-range colours toward the "after"
+        // swatch colour, var>0 pushes them away; var=0 is a plain shift.
+        let swv = PcSwatch {
+            src: [0.1, 0.8, 0.6],
+            shift: [0.0, 0.0, 0.0],
+            amt: 0.5,
+            hr: [0.0, 0.0, 1.0, 1.0],
+            sr: [0.0, 0.0, 1.0, 1.0],
+            lr: [0.0, 0.0, 1.0, 1.0],
+        };
+        let px = hsv_to_rgb(0.2, 0.8, 0.6); // in-range, off the swatch src
+        let a = hsv_to_rgb(0.1, 0.8, 0.6); // the "after" colour (no shift)
+        let out_neg = pc_apply(px, &swv, -0.5);
+        let out_pos = pc_apply(px, &swv, 0.5);
+        for c in 0..3 {
+            let d_src = (px[c] - a[c]).abs();
+            assert!(
+                (out_neg[c] - a[c]).abs() < d_src + 1e-6,
+                "var<0 should pull toward the after colour"
+            );
+            assert!(
+                (out_pos[c] - a[c]).abs() > d_src - 1e-6,
+                "var>0 should push away from the after colour"
+            );
+        }
     }
 
     #[test]

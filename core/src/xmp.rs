@@ -319,6 +319,13 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         }
         a.push_str("   </rdf:Seq></crs:PointColors>\n");
     }
+    if !r.point_color_vars.is_empty() {
+        a.push_str("   <crs:ColorVariance><rdf:Seq>\n");
+        for v in &r.point_color_vars {
+            a.push_str(&format!("    <rdf:li>{v:.6}</rdf:li>\n"));
+        }
+        a.push_str("   </rdf:Seq></crs:ColorVariance>\n");
+    }
     // full-fidelity recipe for our own round-trip
     if let Ok(js) = serde_json::to_string(&sc.recipe) {
         a.push_str(&format!("   <ara:Recipe>{}</ara:Recipe>\n", esc(&js)));
@@ -777,6 +784,19 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
             }
             if n == 19 {
                 r.point_colors.push(row);
+            }
+        }
+        // per-swatch Color Variance (-100..100 UI → -1..1), index-aligned
+        for li in seq_items(&body, "crs:ColorVariance") {
+            if let Some(v) = li_floats(&li).and_then(|v| v.into_iter().next()) {
+                r.point_color_vars
+                    .push(if v.abs() > 1.5 { v / 100.0 } else { v });
+            }
+        }
+        if r.point_color_vars.is_empty() {
+            if let Some(v) = field(&body, "crs:ColorVariance") {
+                r.point_color_vars
+                    .push(if v.abs() > 1.5 { v / 100.0 } else { v });
             }
         }
         // flat-attribute form: crs:PointColors="f, f, ..." (one swatch)
@@ -1238,10 +1258,9 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             let vars: Vec<f32> = seq_items(&item, "crs:LocalColorVariance")
                 .iter()
                 .filter_map(|li| {
-                    let (Some(gt), Some(lt)) = (li.find('>'), li.rfind('<')) else {
-                        return None;
-                    };
-                    li[gt + 1..lt].trim().parse().ok()
+                    let v = li_floats(li)?.into_iter().next()?;
+                    // UI -100..100 → -1..1
+                    Some(if v.abs() > 1.5 { v / 100.0 } else { v })
                 })
                 .collect();
             let mut pcs: Vec<([f32; 19], f32)> = Vec::new();

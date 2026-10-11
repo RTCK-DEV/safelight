@@ -1470,7 +1470,7 @@ fn pc_apply(x: vec3<f32>) -> vec3<f32> {
     if (n == 0u) { return x; }
     var out = x;
     for (var i = 0u; i < n; i = i + 1u) {
-        let b = pb + 1u + i * 19u;
+        let b = pb + 1u + i * 20u;
         let hsv = rgb_to_hsv(out);
         let lum = hsv.z; // LR "lum" ≈ brightness (see pc_apply)
         let k = max(lookbuf[b + 6u] * 2.0, 0.0);
@@ -1489,10 +1489,22 @@ fn pc_apply(x: vec3<f32>) -> vec3<f32> {
         let w = wh * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
             * trap01(lum, lr.x, lr.y, lr.z, lr.w);
         if (w > 1e-4) {
-            out = hsv_to_rgb(
-                fract(hsv.x + lookbuf[b + 3u] * w * 0.5 + 1.0),
-                clamp(hsv.y * (1.0 + lookbuf[b + 4u] * w), 0.0, 1.0),
-                max(hsv.z * (1.0 + lookbuf[b + 5u] * w), 0.0));
+            // full-strength shift, blended by the selection weight
+            let xs = hsv_to_rgb(
+                fract(hsv.x + lookbuf[b + 3u] * 0.5 + 1.0),
+                clamp(hsv.y * (1.0 + lookbuf[b + 4u]), 0.0, 1.0),
+                max(hsv.z * (1.0 + lookbuf[b + 5u]), 0.0));
+            let vrr = lookbuf[b + 19u];
+            var tgt = xs;
+            if (abs(vrr) > 1e-4) {
+                // push away from / pull toward the "after" swatch colour
+                let a = hsv_to_rgb(
+                    fract(lookbuf[b + 0u] + lookbuf[b + 3u] * 0.5 + 1.0),
+                    clamp(lookbuf[b + 1u] * (1.0 + lookbuf[b + 4u]), 0.0, 1.0),
+                    max(lookbuf[b + 2u] * (1.0 + lookbuf[b + 5u]), 0.0));
+                tgt = a + (xs - a) * (1.0 + vrr);
+            }
+            out = out + (tgt - out) * w;
         }
     }
     return out;
@@ -2115,8 +2127,6 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             for (var s = 0u; s < nlp; s = s + 1u) {
                 let d = wi * 11u + 1u + s * 5u;
                 let v0 = pg.lpcs[d];
-                let t = clamp(mask * v0.w, 0.0, 1.0);
-                if (t <= 0.001) { continue; }
                 let v1 = pg.lpcs[d + 1u];
                 var hr = pg.lpcs[d + 2u];
                 var sr = pg.lpcs[d + 3u];
@@ -2134,11 +2144,19 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
                     * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
                     * trap01(hsv.z, lr.x, lr.y, lr.z, lr.w);
                 if (w > 1e-4) {
-                    let tgt = hsv_to_rgb(
-                        fract(hsv.x + v1.x * w * 0.5 + 1.0),
-                        clamp(hsv.y * (1.0 + v1.y * w), 0.0, 1.0),
-                        max(hsv.z * (1.0 + v1.z * w), 0.0));
-                    adj = adj + (tgt - adj) * t;
+                    let xs = hsv_to_rgb(
+                        fract(hsv.x + v1.x * 0.5 + 1.0),
+                        clamp(hsv.y * (1.0 + v1.y), 0.0, 1.0),
+                        max(hsv.z * (1.0 + v1.z), 0.0));
+                    var tgt = xs;
+                    if (abs(v0.w) > 1e-4) {
+                        let a = hsv_to_rgb(
+                            fract(v0.x + v1.x * 0.5 + 1.0),
+                            clamp(v0.y * (1.0 + v1.y), 0.0, 1.0),
+                            max(v0.z * (1.0 + v1.z), 0.0));
+                        tgt = a + (xs - a) * (1.0 + v0.w);
+                    }
+                    adj = adj + (tgt - adj) * (w * mask);
                 }
             }
         }
@@ -3086,21 +3104,24 @@ impl Gpu {
             }
             push_map(&mut v, &p0.profile_hsm);
             // LR Point Color swatches, normalized on CPU so the shader sees a
-            // fixed layout: [src_h01,s,l][dh,ds,dl][amt][hr4][sr4][lr4] = 19
-            let pcs: Vec<crate::develop::PcSwatch> = p0
-                .point_colors
-                .iter()
-                .filter_map(crate::develop::pc_normalize)
-                .collect();
-            v.push(pcs.len() as f32);
-            for sw in &pcs {
-                v.extend(sw.src);
-                v.extend(sw.shift);
-                v.push(sw.amt);
-                v.extend(sw.hr);
-                v.extend(sw.sr);
-                v.extend(sw.lr);
+            // fixed layout: [src_h01,s,l][dh,ds,dl][amt][hr4][sr4][lr4][var]
+            // = 20 (var = per-swatch ColorVariance, index-aligned)
+            let mut n_pc = 0usize;
+            let mut tail = Vec::new();
+            for (i, raw) in p0.point_colors.iter().enumerate() {
+                if let Some(sw) = crate::develop::pc_normalize(raw) {
+                    tail.extend(sw.src);
+                    tail.extend(sw.shift);
+                    tail.push(sw.amt);
+                    tail.extend(sw.hr);
+                    tail.extend(sw.sr);
+                    tail.extend(sw.lr);
+                    tail.push(p0.point_color_vars.get(i).copied().unwrap_or(0.0));
+                    n_pc += 1;
+                }
             }
+            v.push(n_pc as f32);
+            v.extend(tail);
             v
         };
         let look_b = mk_buf("lookbuf", bytemuck::cast_slice(&look32), storage_in);
