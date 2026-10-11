@@ -487,6 +487,10 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                     r.profile = n;
                 }
             }
+            // the Look's own Amount is LR's profile-strength slider
+            if let Some(a) = attr(&body[ls..le], "crs:Amount") {
+                r.profile_amount = a.clamp(0.0, 1.0);
+            }
         }
         // enhanced/Look profiles embed their grade as encoded tables:
         // crs:LookTable → dng_look_table (HSV map, applied where a DCP's
@@ -1111,7 +1115,15 @@ pub fn merge_profile_under(dst: &mut Recipe, pr: &Recipe, amt: f32) {
     s(&mut dst.noise_chroma, pr.noise_chroma);
     s(&mut dst.vignette, pr.vignette);
     if dst.look_table.is_none() {
-        dst.look_table = pr.look_table.clone();
+        // scale each cell toward identity (hue shift 0, scales 1) by amt
+        dst.look_table = pr.look_table.clone().map(|mut m| {
+            for c in &mut m.data {
+                c[0] *= amt;
+                c[1] = 1.0 + (c[1] - 1.0) * amt;
+                c[2] = 1.0 + (c[2] - 1.0) * amt;
+            }
+            m
+        });
     }
     if dst.rgb_lut.is_none() {
         dst.rgb_lut = pr.rgb_lut.clone();
@@ -1999,8 +2011,10 @@ mod tests {
         let lt = r.look_table.expect("look table decoded");
         assert_eq!(lt.dims, [4, 2, 2]);
         assert!((lt.data[0][0] - 12.5).abs() < 1e-4);
-        // the Look's own crs:Amount must NOT be treated as preset
-        // strength — nothing was set, so nothing should be scaled.
+        // the Look's own crs:Amount becomes the profile-strength slider…
+        assert!((r.profile_amount - 0.5).abs() < 1e-4);
+        // …and must NOT be treated as preset strength — nothing was set,
+        // so nothing should be scaled.
         assert!(r.exposure.abs() < 1e-6 && r.contrast.abs() < 1e-6);
     }
 

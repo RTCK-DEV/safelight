@@ -749,7 +749,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     if prof.is_none() && !r.profile.is_empty() {
         if let Some((pr, amt)) = crate::xmp::load_xmp_profile(&r.profile) {
             let mut rr = r.clone();
-            crate::xmp::merge_profile_under(&mut rr, &pr, amt);
+            crate::xmp::merge_profile_under(&mut rr, &pr, amt * r.profile_amount);
             if !pr.profile.is_empty() {
                 rr.profile = pr.profile.clone();
             }

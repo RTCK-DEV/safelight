@@ -282,6 +282,10 @@ pub struct Recipe {
     /// ~/.safelight/profiles and (when installed) Lightroom's CameraProfiles.
     #[serde(default)]
     pub profile: String,
+    /// LR profile Amount slider (crs:Amount inside <crs:Look>) — scales the
+    /// resolved profile's baked-in grade; 1 = full.
+    #[serde(default = "default_one")]
+    pub profile_amount: f32,
     /// absolute white balance in kelvin (Lightroom crs:Temperature).
     /// 0 = unset; when >0 it replaces the as-shot/auto/pick multipliers
     /// entirely (the camera-neutral is derived from the illuminant's
@@ -645,6 +649,7 @@ impl Default for Recipe {
             point_colors: Vec::new(),
             point_color_vars: Vec::new(),
             profile: String::new(),
+            profile_amount: 1.0,
             temp_abs: 0.0,
             tint_abs: 0.0,
             linear_output: false,
