@@ -456,12 +456,128 @@ fn corr_li(t: &[(String, Lua)]) -> String {
     format!("<rdf:li><rdf:Description{a}>{elems}</rdf:Description></rdf:li>")
 }
 
+/// first matching key's numeric value
+fn get_num(t: &[(String, Lua)], keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| {
+        t.iter().find_map(|(ik, v)| {
+            if ik == k {
+                if let Lua::Num(n) = v {
+                    Some(*n)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    })
+}
+fn get_str<'a>(t: &'a [(String, Lua)], keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| {
+        t.iter().find_map(|(ik, v)| {
+            if ik == k {
+                if let Lua::Str(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// RetouchAreas item → the flat `<rdf:li crs:What="Retouch" crs:SpotX …>`
+/// form our XMP reader understands.  The catalog stores the spot inside a
+/// `Masks` sub-table (ellipse or paint dabs) plus lowercase duplicates of
+/// center/radius/source at the item top level.
+fn retouch_li(t: &[(String, Lua)]) -> String {
+    let mut sx = get_num(t, &["centerX", "SpotX"]);
+    let mut sy = get_num(t, &["centerY", "SpotY"]);
+    let mut rad = get_num(t, &["radius"]);
+    for (k, v) in t {
+        if k != "Masks" {
+            continue;
+        }
+        let Lua::Table(ms) = v else { continue };
+        for (_, m) in ms {
+            let Lua::Table(mi) = m else { continue };
+            match get_str(mi, &["What"]) {
+                Some("Mask/Ellipse") => {
+                    if sx.is_none() {
+                        sx = get_num(mi, &["X"]);
+                        sy = get_num(mi, &["Y"]);
+                    }
+                    if rad.is_none() {
+                        rad = get_num(mi, &["SizeX"]);
+                    }
+                }
+                Some("Mask/Paint") => {
+                    if rad.is_none() {
+                        rad = get_num(mi, &["Radius"]);
+                    }
+                    if sx.is_none() {
+                        // centroid of the dab centers
+                        let mut n = 0;
+                        let (mut ax, mut ay) = (0.0, 0.0);
+                        for (mk, mv) in mi {
+                            if mk != "Dabs" {
+                                continue;
+                            }
+                            let Lua::Table(ds) = mv else { continue };
+                            for (_, d) in ds {
+                                let Lua::Str(d) = d else { continue };
+                                let mut it = d.split_whitespace();
+                                if it.next() != Some("d") {
+                                    continue;
+                                }
+                                let x: f64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let y: f64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                ax += x;
+                                ay += y;
+                                n += 1;
+                            }
+                        }
+                        if n > 0 {
+                            sx = Some(ax / n as f64);
+                            sy = Some(ay / n as f64);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let (dx, dy) = (sx.unwrap_or(0.5), sy.unwrap_or(0.5));
+    let diam = (rad.unwrap_or(0.02) * 2.0).clamp(0.004, 1.0);
+    // source: lowercase dup fields, else SourceX + OffsetY
+    let mut srcx = get_num(t, &["sourceX", "SourceX"]).unwrap_or(dx);
+    let mut srcy = get_num(t, &["sourceY", "SourceY", "OffsetY"]).unwrap_or(dy);
+    if (srcx == 0.0 && srcy == 0.0) || (srcx == dx && srcy == dy) {
+        // patchmatch/auto-computed source — the real patch offset lives in an
+        // opaque digest; approximate a heal by cloning from a few diameters
+        // sideways (dust spots sit in uniform areas, so any neighbor works)
+        srcx = if dx > 0.8 {
+            dx - 3.0 * diam
+        } else {
+            dx + 3.0 * diam
+        };
+        srcy = dy;
+    }
+    let method = get_str(t, &["Method"]).unwrap_or("clone");
+    format!(
+        "<rdf:li crs:What=\"Retouch\" crs:Method=\"{}\" crs:SpotX=\"{:.6}\" crs:SpotY=\"{:.6}\" crs:SpotDiam=\"{:.6}\" crs:SourceX=\"{:.6}\" crs:SourceY=\"{:.6}\"/>",
+        esc(method),
+        dx, dy, diam, srcx, srcy
+    )
+}
+
 const CORR_LISTS: &[&str] = &[
     "MaskGroupBasedCorrections",
     "GradientBasedCorrections",
     "CircularGradientBasedCorrections",
     "PaintBasedCorrections",
-    "RetouchAreas",
 ];
 const ROW_SEQS: &[&str] = &["PointColors", "ColorVariance"];
 
@@ -478,6 +594,7 @@ pub fn lua_to_xmp(text: &str) -> String {
         .chain([
             "Look",
             "LensBlur",
+            "RetouchAreas",
             "ToneCurvePV2012",
             "ToneCurvePV2012Red",
             "ToneCurvePV2012Green",
@@ -495,6 +612,15 @@ pub fn lua_to_xmp(text: &str) -> String {
             }
             "LensBlur" => {
                 elems += &format!("<crs:LensBlur{}/>", attrs(&t, &[]));
+            }
+            "RetouchAreas" => {
+                elems += "<crs:RetouchAreas><rdf:Seq>";
+                for (_, it) in &t {
+                    if let Lua::Table(ci) = it {
+                        elems += &retouch_li(ci);
+                    }
+                }
+                elems += "</rdf:Seq></crs:RetouchAreas>";
             }
             k if CORR_LISTS.contains(&k) => {
                 elems += &format!("<crs:{k}><rdf:Seq>");
@@ -592,5 +718,31 @@ mod tests {
         assert_eq!(r.brushes.len(), 1);
         assert!((r.brushes[0].ev - 1.0).abs() < 1e-4);
         assert_eq!(r.brushes[0].strokes[0].pts.len(), 2);
+    }
+
+    #[test]
+    fn lua_retouch_ellipse_and_paint() {
+        // real catalog shape: spot inside Masks{}, source via lowercase dups
+        let r = crate::xmp::crs_to_recipe(&lua_to_xmp(
+            "s = { RetouchAreas = { { Method = \"gaussian\", \
+             sourceX = 0.59, sourceY = 0.32, \
+             Masks = { { What = \"Mask/Ellipse\", X = 0.82, Y = 0.51, \
+             SizeX = 0.018, SizeY = 0.018 } } }, \
+             { Method = \"poisson\", \
+             Masks = { { What = \"Mask/Paint\", Radius = 0.002, \
+             Dabs = { \"d 0.1 0.5\", \"d 0.3 0.5\" } } } } } }",
+        ));
+        assert_eq!(r.clones.len(), 2);
+        let c = r.clones[0];
+        assert!((c[0] - 0.59).abs() < 1e-4); // source
+        assert!((c[1] - 0.32).abs() < 1e-4);
+        assert!((c[2] - 0.82).abs() < 1e-4); // spot
+        assert!((c[3] - 0.51).abs() < 1e-4);
+        assert!((c[4] - 0.018).abs() < 1e-3); // radius
+                                              // paint dab centroid 0.2,0.5 — no source → auto-heal offset
+        let c = r.clones[1];
+        assert!((c[2] - 0.2).abs() < 1e-4);
+        assert!((c[0] - 0.212).abs() < 1e-3); // +3 diameters
+        assert!((c[1] - c[3]).abs() < 1e-4);
     }
 }
