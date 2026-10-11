@@ -965,6 +965,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             if !what.contains("Correction") {
                 continue;
             }
+            let n_win0 = r.windows.len();
             if let Some(a) = field_str(&item, "crs:CorrectionActive") {
                 if a == "false" || a == "False" || a == "0" {
                     continue;
@@ -1043,6 +1044,7 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 wh,
                 bl,
                 texture: tex,
+                refine: [0.0; 6],
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -1117,6 +1119,72 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                                 .push(win("nsky", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
                         }
                     }
+                }
+            }
+            // LR11+ range-mask components (color/luminance range). Add-mode
+            // components become standalone windows; subtract/intersect
+            // fold into the previous window's single refine slot.
+            for mb in mask_blocks(&item, "RangeMask") {
+                let mode = field(&mb, "crs:MaskBlendMode").unwrap_or(0.0) as i32;
+                let Some(rmi) = mb.find("<crs:CorrectionRangeMask") else {
+                    continue;
+                };
+                let rm = &mb[rmi..];
+                let ty = field(rm, "crs:Type").unwrap_or(1.0) as i32;
+                if !(1..=2).contains(&ty) {
+                    continue; // depth range masks — no depth map available
+                }
+                let inv = truthy(field_str(&mb, "crs:MaskInverted"))
+                    || truthy(field_str(rm, "crs:Invert"));
+                let (kind, p0, p1, p2) = if ty == 2 {
+                    // luminance range
+                    (
+                        2,
+                        field(rm, "crs:LumMin").unwrap_or(0.0).clamp(0.0, 1.0),
+                        field(rm, "crs:LumMax").unwrap_or(1.0).clamp(0.0, 1.0),
+                        field(rm, "crs:LumFeather").unwrap_or(0.1).clamp(0.0, 1.0),
+                    )
+                } else {
+                    // color range: PointModels rows are [h01, s, luma, x, y, flag];
+                    // take the primary sample (first)
+                    let mut hh = 0.5;
+                    let mut ss = 0.5;
+                    for pm in seq_items(rm, "crs:PointModels") {
+                        if let (Some(gt), Some(lt)) = (pm.find('>'), pm.rfind('<')) {
+                            let v: Vec<f32> = pm[gt + 1..lt]
+                                .split(|c: char| c == ',' || c.is_whitespace())
+                                .filter_map(|t| t.parse().ok())
+                                .collect();
+                            if v.len() >= 2 {
+                                hh = v[0].clamp(0.0, 1.0);
+                                ss = v[1].clamp(0.0, 1.0);
+                            }
+                        }
+                        break;
+                    }
+                    (
+                        1,
+                        hh,
+                        ss,
+                        field(rm, "crs:ColorAmount").unwrap_or(0.5).clamp(0.0, 1.0),
+                    )
+                };
+                if mode >= 1 && r.windows.len() > n_win0 {
+                    r.windows.last_mut().unwrap().refine = [
+                        mode.min(2) as f32,
+                        kind as f32,
+                        p0,
+                        p1,
+                        p2,
+                        if inv { 1.0 } else { 0.0 },
+                    ];
+                } else if mode == 0 {
+                    let (kn, pp) = if kind == 2 {
+                        ("lum", [p0, p1, p2, p2, 0.0, 0.0])
+                    } else {
+                        ("crange", [p0, p1, p2, 0.0, 0.0, 0.0])
+                    };
+                    r.windows.push(win(kn, pp, 0.0, inv));
                 }
             }
             // brush: dab list + radius/flow → stroke(s) in one layer.
@@ -1354,6 +1422,7 @@ mod tests {
             wh: 0.0,
             bl: 0.0,
             texture: 0.0,
+            refine: [0.0; 6],
         }];
         sc.rating = 4;
         sc.label = "Red".into();
@@ -1602,5 +1671,29 @@ mod tests {
         let r2 = crs_to_recipe(&std::fs::read_to_string(xmp_path_for(&asset)).unwrap());
         assert_eq!(r2.point_colors.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn range_mask_components_parse() {
+        // real LR11+ structure: AI sky mask + color-range refinement
+        let xmp = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"><crs:MaskGroupBasedCorrections><rdf:Seq><rdf:li><rdf:Description crs:What="Correction" crs:CorrectionAmount="1" crs:CorrectionActive="true" crs:LocalExposure2012="-0.4395"><crs:CorrectionMasks><rdf:Seq>
+        <rdf:li crs:What="Mask/Image" crs:MaskName="Sky 1" crs:MaskBlendMode="0" crs:MaskSubType="2" crs:MaskValue="1"/>
+        <rdf:li><rdf:Description crs:What="Mask/RangeMask" crs:MaskName="Color Range 1" crs:MaskBlendMode="2" crs:MaskInverted="false" crs:MaskValue="1"><crs:CorrectionRangeMask><rdf:Description crs:Version="3" crs:Type="1" crs:ColorAmount="0.494949" crs:Invert="false" crs:SampleType="0"><crs:PointModels><rdf:Seq><rdf:li>0.562975 0.388881 0.064111 0.663744 0.266272 0</rdf:li></rdf:Seq></crs:PointModels></rdf:Description></crs:CorrectionRangeMask></rdf:Description></rdf:li>
+        </rdf:Seq></crs:CorrectionMasks></rdf:Description></rdf:li></rdf:Seq></crs:MaskGroupBasedCorrections></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let r = crs_to_recipe(xmp);
+        assert_eq!(r.windows.len(), 1);
+        assert_eq!(r.windows[0].kind, "sky");
+        let rf = r.windows[0].refine;
+        assert_eq!(rf[0] as i32, 2, "intersect mode");
+        assert_eq!(rf[1] as i32, 1, "color kind");
+        assert!((rf[2] - 0.562975).abs() < 1e-5);
+        assert!((rf[3] - 0.388881).abs() < 1e-5);
+        assert!((rf[4] - 0.494949).abs() < 1e-5);
+        // standalone color-range component (add mode)
+        let xmp2 = xmp.replace("MaskBlendMode=\"2\"", "MaskBlendMode=\"0\"");
+        let r2 = crs_to_recipe(&xmp2);
+        assert_eq!(r2.windows.len(), 2);
+        assert_eq!(r2.windows[1].kind, "crange");
+        assert!((r2.windows[1].p[0] - 0.562975).abs() < 1e-5);
     }
 }

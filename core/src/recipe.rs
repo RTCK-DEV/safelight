@@ -468,6 +468,12 @@ pub struct PowerWindow {
     /// LR LocalTexture: fine-detail midtone contrast, -1..1
     #[serde(default)]
     pub texture: f32,
+    /// LR range-mask refinement folded into this window (one slot —
+    /// additional components keep their own windows in add mode).
+    /// [mode, kind, p0..p3]: mode 1=subtract, 2=intersect; kind 1=color
+    /// (h01, sat, tol, inv), kind 2=lum (lo, hi, feather, inv).
+    #[serde(default)]
+    pub refine: [f32; 6],
 }
 
 fn defringe_pu_default() -> [f32; 3] {
@@ -514,6 +520,7 @@ impl Default for PowerWindow {
             wh: 0.0,
             bl: 0.0,
             texture: 0.0,
+            refine: [0.0; 6],
         }
     }
 }

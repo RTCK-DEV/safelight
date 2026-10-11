@@ -94,6 +94,9 @@ struct Uni {
     defr_gr: [f32; 4],
     /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
     wins: [[f32; 4]; 96],
+    /// per-window LR range refine: 2 vec4 per window
+    /// [mode,kind,p0,p1] / [p2,p3,0,0] — kind 1=color(h,s,tol,inv), 2=lum
+    refines: [[f32; 4]; 32],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
@@ -201,6 +204,7 @@ struct Uni {
     defr_pu: vec4<f32>,
     defr_gr: vec4<f32>,
     wins: array<vec4<f32>, 96>,
+    refines: array<vec4<f32>, 32>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
     ze0: vec4<f32>,
@@ -1975,7 +1979,16 @@ fn ellm(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32) -> f32 {
 }
 
 // shared power-window mask eval (used by local_ops and the stage key).
-fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
+// LR color-range matte (mirrors develop.rs color_matte)
+fn color_matte(col: vec3<f32>, h: f32, s: f32, tol: f32) -> f32 {
+    let hsv = rgb_to_hsv(col);
+    let dh = hue_dist(hsv.x, h);
+    let d = sqrt(dh * dh + (hsv.y - s) * (hsv.y - s));
+    let t = 0.04 + clamp(tol, 0.0, 1.0) * 0.26;
+    return 1.0 - sstep(t, t + 0.08, d);
+}
+
+fn win_mask(wi: u32, w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
     let mid_in = w2.w;
     let kb = u32(w2.y);
     let kind = kb & 1u;
@@ -2005,6 +2018,8 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
             * (1.0 - select(0.0, sky_bil(nx, ny), skybuf[0] > 0u));
     } else if ((kb & 32u) != 0u) {
         mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
+    } else if ((kb & 512u) != 0u) {
+        mask = color_matte(col, w0.x, w0.y, w0.z);
     } else if ((kb & 4u) != 0u) {
         let l = luma(col);
         let lf = max(w0.z, 0.005);
@@ -2029,6 +2044,21 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         let r0 = max(rmid - soft * 0.5, 0.0);
         let r1 = min(rmid + soft * 0.5, 1.0);
         mask = 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
+    }
+    // LR range-mask refinement: mode 1 = subtract, 2 = intersect
+    let rf0 = pg.refines[wi * 2u];
+    let rf1 = pg.refines[wi * 2u + 1u];
+    if (rf0.x > 0.5 && mask > 0.0) {
+        var rm = 0.0;
+        if (u32(rf0.y) == 2u) {
+            let l = luma(col);
+            let f = max(rf1.x, 0.005);
+            rm = sstep(rf0.z - f, rf0.z + f, l) * (1.0 - sstep(rf0.w - f, rf0.w + f, l));
+        } else {
+            rm = color_matte(col, rf0.z, rf0.w, rf1.x);
+        }
+        if (rf1.y > 0.5) { rm = 1.0 - rm; }
+        if (rf0.x > 1.5) { mask = mask * rm; } else { mask = mask * (1.0 - rm); }
     }
     if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
     if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
@@ -2061,7 +2091,7 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
     for (var wi = 0u; wi < nw; wi = wi + 1u) {
         let w1 = pg.wins[wi * 6u + 1u];
         let w2 = pg.wins[wi * 6u + 2u];
-        let mask = win_mask(pg.wins[wi * 6u], w1, w2, nx, ny, col);
+        let mask = win_mask(wi, pg.wins[wi * 6u], w1, w2, nx, ny, col);
         if (mask > 0.001) {
             let evg = pow(2.0, w1.z * mask);
             let l = luma(adj);
@@ -2276,7 +2306,7 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         if (snw > 0u) {
             var wu = 0.0;
             for (var wi = 0u; wi < snw; wi = wi + 1u) {
-                wu = max(wu, win_mask(pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny, col));
+                wu = max(wu, win_mask(wi, pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny, col));
             }
             key = key * wu;
         }
@@ -2788,6 +2818,14 @@ impl Gpu {
                     a[i * 6 + 3] = [w[12], w[13], w[14], w[15]];
                     a[i * 6 + 4] = [w[16], w[17], w[18], w[19]];
                     a[i * 6 + 5] = [w[20], 0.0, 0.0, 0.0];
+                }
+                a
+            },
+            refines: {
+                let mut a = [[0.0f32; 4]; 32];
+                for (i, rf) in p.refines.iter().take(16).enumerate() {
+                    a[i * 2] = [rf[0], rf[1], rf[2], rf[3]];
+                    a[i * 2 + 1] = [rf[4], rf[5], 0.0, 0.0];
                 }
                 a
             },

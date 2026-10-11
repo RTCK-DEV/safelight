@@ -101,6 +101,9 @@ pub struct Params {
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
     pub wins: [[f32; 24]; 16],
+    /// per-window LR range refinement: [mode, kind, p0..p3]; mode 0=none,
+    /// 1=subtract, 2=intersect; kind 1=color(h,s,tol,inv), 2=lum(lo,hi,f,inv)
+    pub refines: [[f32; 6]; 16],
     pub n_wins: u32,
     /// adjustment brushes: flattened segments [x1,y1,x2,y2] in
     /// dst-normalized coords, then per-stroke records of 3 entries:
@@ -923,7 +926,9 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let sw = (1.0 - r.crop[0] - r.crop[2]).max(0.01);
     let sh = (1.0 - r.crop[1] - r.crop[3]).max(0.01);
     let mut wins = [[0.0; 24]; 16];
+    let mut refines = [[0.0; 6]; 16];
     for (i, w) in r.windows.iter().take(16).enumerate() {
+        refines[i] = w.refine;
         let grad = w.kind == "gradient";
         let (p0, p1, p2, p3) = if grad {
             // [x1,y1,x2,y2]: both endpoints move through the same map
@@ -948,6 +953,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         let part = w.kind == "part";
         let vegw = w.kind == "veg";
         let nsky = w.kind == "nsky";
+        let cran = w.kind == "crange";
         wins[i] = [
             (if grad { 1.0 } else { 0.0 })
                 + (if w.invert { 2.0 } else { 0.0 })
@@ -957,11 +963,28 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 + (if skyw { 32.0 } else { 0.0 })
                 + (if part { 64.0 } else { 0.0 })
                 + (if vegw { 128.0 } else { 0.0 })
-                + (if nsky { 256.0 } else { 0.0 }),
-            if lum { w.p[0].clamp(0.0, 1.0) } else { p0 },
-            if lum { w.p[1].clamp(0.0, 1.0) } else { p1 },
-            if lum { w.p[2].clamp(0.0, 1.0) } else { p2 },
-            if lum { w.p[3].clamp(0.0, 1.0) } else { p3 },
+                + (if nsky { 256.0 } else { 0.0 })
+                + (if cran { 512.0 } else { 0.0 }),
+            if lum || cran {
+                w.p[0].clamp(0.0, 1.0)
+            } else {
+                p0
+            },
+            if lum || cran {
+                w.p[1].clamp(0.0, 1.0)
+            } else {
+                p1
+            },
+            if lum || cran {
+                w.p[2].clamp(0.0, 1.0)
+            } else {
+                p2
+            },
+            if lum || cran {
+                w.p[3].clamp(0.0, 1.0)
+            } else {
+                p3
+            },
             w.p[4],
             w.p[5],
             w.ev.clamp(-4.0, 4.0),
@@ -1238,6 +1261,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
+        refines,
         n_wins: r.windows.len().min(16) as u32,
         zones: [
             zone_pack(r.z_dark),
@@ -3413,9 +3437,10 @@ fn finish_linear(
                 }
                 if sp.n_wins > 0 {
                     let mut wu = 0.0f32;
-                    for win in sp.wins.iter().take(sp.n_wins as usize) {
+                    for (wi, win) in sp.wins.iter().take(sp.n_wins as usize).enumerate() {
                         let mut m2 = window_mask(
                             win,
+                            &sp.refines[wi],
                             nx,
                             ny,
                             col,
@@ -3670,9 +3695,10 @@ fn local_ops(
         adj[2] *= 1.0 + l[3] * f * 0.5;
     }
     // power windows: local ev/sat/temp inside the mask
-    for win in p.wins.iter().take(p.n_wins as usize) {
+    for (wi, win) in p.wins.iter().take(p.n_wins as usize).enumerate() {
         let mut mask = window_mask(
             win,
+            &p.refines[wi],
             nx,
             ny,
             col,
@@ -3865,8 +3891,42 @@ fn ell_mask(w: &[f32], nx: f32, ny: f32) -> f32 {
     1.0 - sstep(r0, r1.max(r0 + 0.01), d)
 }
 
+/// LR color-range matte: feathered distance in hue/sat space around a
+/// sampled colour, tolerance driven by ColorAmount (0..1).
+fn color_matte(col: [f32; 3], h: f32, s: f32, tol: f32) -> f32 {
+    let (ph, ps, _) = rgb_to_hsv(col);
+    let dh = hue_dist(ph, h);
+    let d = (dh * dh + (ps - s) * (ps - s)).sqrt();
+    let t = 0.04 + tol.clamp(0.0, 1.0) * 0.26;
+    1.0 - sstep(t, t + 0.08, d)
+}
+
+/// LR range-mask refinement folded into a window:
+/// [mode, kind, p0..p3]; mode 1=subtract / 2=intersect, kind 1=color
+/// (h,s,tol,inv) / 2=lum (lo,hi,feather,inv). Applied to the base mask.
+fn refine_mul(ref_: &[f32; 6], mask: f32, col: [f32; 3]) -> f32 {
+    let mode = ref_[0] as i32;
+    if mode == 0 || mask <= 0.0 {
+        return mask;
+    }
+    let m = if ref_[1] as i32 == 2 {
+        let l = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+        let f = ref_[4].max(0.005);
+        sstep(ref_[2] - f, ref_[2] + f, l) * (1.0 - sstep(ref_[3] - f, ref_[3] + f, l))
+    } else {
+        color_matte(col, ref_[2], ref_[3], ref_[4])
+    };
+    let m = if ref_[5] > 0.5 { 1.0 - m } else { m };
+    if mode == 2 {
+        mask * m
+    } else {
+        mask * (1.0 - m)
+    }
+}
+
 fn window_mask(
     w: &[f32],
+    ref_: &[f32; 6],
     nx: f32,
     ny: f32,
     col: [f32; 3],
@@ -3906,6 +3966,9 @@ fn window_mask(
     } else if base & 32 != 0 {
         // heuristic sky matte (LR sky AI masks)
         sky.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
+    } else if base & 512 != 0 {
+        // standalone LR color-range mask component
+        color_matte(col, w[1], w[2], w[3])
     } else if lum {
         // luminance range: p=[lo,hi,lo_feather,hi_feather] over display luma
         let l = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
@@ -3944,6 +4007,7 @@ fn window_mask(
         let r1 = (mid + soft * 0.5).min(1.0);
         1.0 - sstep(r0, r1.max(r0 + 0.01), d)
     };
+    let mask = refine_mul(ref_, mask, col);
     if inv {
         1.0 - mask
     } else {
@@ -4551,12 +4615,12 @@ mod tests {
         w[6] = 0.4;
         w[10] = 1.0;
         // centre of the prior → mask ≈ 1
-        assert!(window_mask(&w, 0.5, 0.3, [0.5; 3], Some(&m), None, None, &[]) > 0.9);
+        assert!(window_mask(&w, &[0.0; 6], 0.5, 0.3, [0.5; 3], Some(&m), None, None, &[]) > 0.9);
         // far outside the ellipse → ≈ 0
-        assert!(window_mask(&w, 0.5, 0.8, [0.5; 3], Some(&m), None, None, &[]) < 0.05);
+        assert!(window_mask(&w, &[0.0; 6], 0.5, 0.8, [0.5; 3], Some(&m), None, None, &[]) < 0.05);
         // no subject matte → no mask at all
         assert_eq!(
-            window_mask(&w, 0.5, 0.3, [0.5; 3], None, None, None, &[]),
+            window_mask(&w, &[0.0; 6], 0.5, 0.3, [0.5; 3], None, None, None, &[]),
             0.0
         );
     }
