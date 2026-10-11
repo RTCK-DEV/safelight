@@ -166,6 +166,8 @@ pub struct Params {
     pub has_cs: bool,
     /// ColorWarper control points [h, s, dh, ds, radius], max 8 honoured
     pub warper: Vec<[f32; 5]>,
+    /// LR Point Color swatches (see Recipe::point_colors for layout)
+    pub point_colors: Vec<[f32; 19]>,
     // ---- .dcp camera profile (Adobe colour pipeline) ----
     /// hue/sat/val shift table applied in WB-scaled camera space,
     /// BEFORE the cam->XYZ matrix (DNG ProfileHueSatMap)
@@ -1303,6 +1305,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         cs: r.color_slice,
         has_cs: r.color_slice.iter().any(|s| s[3] > 0.5),
         warper: r.warper.iter().take(8).cloned().collect(),
+        point_colors: r.point_colors.clone(),
         profile_hsm,
         profile_look,
         profile_tone_lut,
@@ -1474,6 +1477,150 @@ fn calib_matrix(c: &[f32; 7]) -> [f32; 12] {
     }
     out[9] = c[0].clamp(-1.0, 1.0);
     out
+}
+
+// ---- LR Point Color (crs:PointColors) ------------------------------------
+//
+// A swatch is a feathered trapezoid selection over hue/sat/lum: each axis
+// has [LowerNone, LowerFull, UpperFull, UpperNone] bounds (full weight
+// between the inner pair, feathering to zero at the outer pair), and the
+// mask is the product of the three axis weights. RangeAmount scales each
+// range's width about its centre (LR "Range" slider: 0.5 = as-stored).
+// Selected pixels get weighted hue/sat/lum shifts.
+
+/// normalized swatch: src = [h01, sat, lum], shift = [dh_cyc, ds, dl],
+/// ranges = [LN, LF, UF, UN] per axis
+pub struct PcSwatch {
+    pub src: [f32; 3],
+    pub shift: [f32; 3],
+    pub amt: f32,
+    pub hr: [f32; 4],
+    pub sr: [f32; 4],
+    pub lr: [f32; 4],
+}
+
+/// standard trapezoid: 0 below ln, ramp to 1 at lf, flat to uf, 0 past un
+fn trap01(x: f32, ln: f32, lf: f32, uf: f32, un: f32) -> f32 {
+    let up = if lf > ln + 1e-6 {
+        ((x - ln) / (lf - ln)).clamp(0.0, 1.0)
+    } else {
+        if x >= lf {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let dn = if un > uf + 1e-6 {
+        ((un - x) / (un - uf)).clamp(0.0, 1.0)
+    } else {
+        if x <= uf {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    up.min(dn)
+}
+
+/// detect the 19-float layout. Two hypotheses:
+///   A (alphabetical, matches the LrDevelopController swatch dump):
+///     [HR(LF,LN,UF,UN), HueShift, LR(LF,LN,UF,UN), LumScale, RangeAmount,
+///      SR(LF,LN,UF,UN), SatScale, SrcHue, SrcLum, SrcSat]
+///   B (logical src-first):
+///     [SrcHue, SrcSat, SrcLum, HueShift, SatScale, LumScale, RangeAmount,
+///      HR, SR, LR] with natural [LN,LF,UF,UN] ranges.
+/// Returns the normalized swatch, or None for the all-(-1) sentinel /
+/// inconsistent rows.
+pub fn pc_normalize(v: &[f32; 19]) -> Option<PcSwatch> {
+    if v.iter().all(|x| *x < 0.0) {
+        return None;
+    }
+    let in01 = |x: f32| (0.0..=1.0 + 1e-4).contains(&x);
+    // layout A: range blocks [LF,LN,UF,UN] at 0,5,11; shifts at 4,9,15;
+    // amount at 10; src at 16..19 (hue 0..6, lum, sat)
+    let a_ok = in01(v[10])
+        && (0.0..=6.0).contains(&v[16])
+        && in01(v[17])
+        && in01(v[18])
+        && [0usize, 5, 11].iter().all(|&i| {
+            v[i] >= v[i + 1] - 1e-4        // LF >= LN
+                && v[i + 1] <= v[i + 2] + 1e-4 // LN <= UF
+                && v[i] <= v[i + 2] + 1e-4   // LF <= UF
+                && v[i + 2] <= v[i + 3] + 1e-4 // UF <= UN
+        });
+    if a_ok {
+        return Some(PcSwatch {
+            src: [v[16] / 6.0, v[18], v[17]],
+            shift: [v[4], v[15], v[9]],
+            amt: v[10],
+            hr: [v[1], v[0], v[2], v[3]],
+            lr: [v[6], v[5], v[7], v[8]],
+            sr: [v[12], v[11], v[13], v[14]],
+        });
+    }
+    // layout B: src at 0..3 (hue 0..6), shifts at 3..6, amount at 6,
+    // natural-order ranges at 7,11,15
+    let b_ok = (0.0..=6.0).contains(&v[0])
+        && in01(v[1])
+        && in01(v[2])
+        && in01(v[6])
+        && [7usize, 11, 15].iter().all(|&i| {
+            v[i] <= v[i + 1] + 1e-4 && v[i + 1] <= v[i + 2] + 1e-4 && v[i + 2] <= v[i + 3] + 1e-4
+        });
+    if b_ok {
+        return Some(PcSwatch {
+            src: [v[0] / 6.0, v[1], v[2]],
+            shift: [v[3], v[4], v[5]],
+            amt: v[6],
+            hr: [v[7], v[8], v[9], v[10]],
+            sr: [v[11], v[12], v[13], v[14]],
+            lr: [v[15], v[16], v[17], v[18]],
+        });
+    }
+    None
+}
+
+/// scale trapezoid bounds about their centre by k (RangeAmount*2)
+fn range_scale(r: [f32; 4], k: f32) -> [f32; 4] {
+    let c = (r[0] + r[3]) * 0.5;
+    let mut o = [0.0f32; 4];
+    for (i, b) in r.iter().enumerate() {
+        o[i] = (c + (*b - c) * k).clamp(0.0, 1.0);
+    }
+    // keep ordering after clamping
+    for i in 1..4 {
+        if o[i] < o[i - 1] {
+            o[i] = o[i - 1];
+        }
+    }
+    o
+}
+
+/// apply one swatch: w = w_h*w_s*w_l over (hue, sat, brightness); the lum
+/// axis uses the HSV value channel — that is the metric LR's sampled
+/// SrcLum most closely matches, and it places the picked colour inside
+/// its own ranges by construction. The hue range is a strip recentered
+/// on the picked hue (src maps to 0.5 — LR's range defaults are constant
+/// regardless of SrcHue, so the range cannot be absolute), while the
+/// sat/lum ranges are absolute axis values.
+pub fn pc_apply(x: [f32; 3], sw: &PcSwatch) -> [f32; 3] {
+    let (h, s, v) = rgb_to_hsv(x);
+    let l = v;
+    let k = (sw.amt * 2.0).max(0.0);
+    let hr = range_scale(sw.hr, k);
+    let sr = range_scale(sw.sr, k);
+    let lr = range_scale(sw.lr, k);
+    let hpos = (h - sw.src[0] + 0.5).rem_euclid(1.0);
+    let wh = trap01(hpos, hr[0], hr[1], hr[2], hr[3]);
+    let w = wh * trap01(s, sr[0], sr[1], sr[2], sr[3]) * trap01(l, lr[0], lr[1], lr[2], lr[3]);
+    if w <= 1e-4 {
+        return x;
+    }
+    hsv_to_rgb(
+        (h + sw.shift[0] * w * 0.5).rem_euclid(1.0),
+        (s * (1.0 + sw.shift[1] * w)).clamp(0.0, 1.0),
+        (v * (1.0 + sw.shift[2] * w)).max(0.0),
+    )
 }
 
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
@@ -1717,6 +1864,13 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
                 (s * (1.0 + ds)).clamp(0.0, 1.5),
                 (v * (1.0 + dl)).clamp(0.0, 8.0),
             );
+        }
+    }
+    // LR Point Color swatches: feathered trapezoid selection over
+    // hue/sat/lum applied as weighted hue/sat/lum shifts.
+    for v19 in &p.point_colors {
+        if let Some(sw) = pc_normalize(v19) {
+            x = pc_apply(x, &sw);
         }
     }
     // HSL qualifier: soft windows on hue/sat/lum, adjust inside the mask.
@@ -4405,5 +4559,82 @@ mod tests {
             window_mask(&w, 0.5, 0.3, [0.5; 3], None, None, None, &[]),
             0.0
         );
+    }
+
+    /// LR Point Colors: 19-float rows decode in the alphabetical layout
+    /// (the LrDevelopController swatch dump), sentinel rows are skipped,
+    /// and the trapezoid mask weights the shift by proximity to the
+    /// sampled colour.
+    #[test]
+    fn point_color_normalize_and_apply() {
+        // the community-dumped swatch: SrcHue=4.12705 (0..6), SrcSat=.92,
+        // SrcLum=.84, amount .5, ranges around the sample
+        let mut v = [-1.0f32; 19];
+        v[0] = 0.333;
+        v[1] = 0.0;
+        v[2] = 0.667;
+        v[3] = 1.0; // HueRange LF,LN,UF,UN
+        v[4] = 0.0; // HueShift
+        v[5] = 0.745889;
+        v[6] = 0.195889;
+        v[7] = 1.0;
+        v[8] = 1.0; // LumRange
+        v[9] = 0.0; // LumScale
+        v[10] = 0.5; // RangeAmount
+        v[11] = 0.740754;
+        v[12] = 0.190754;
+        v[13] = 1.0;
+        v[14] = 1.0; // SatRange
+        v[15] = 0.5; // SatScale
+        v[16] = 4.12705;
+        v[17] = 0.839618;
+        v[18] = 0.920754;
+        let sw = pc_normalize(&v).unwrap();
+        assert!((sw.src[0] - 4.12705 / 6.0).abs() < 1e-5);
+        assert!((sw.src[1] - 0.920754).abs() < 1e-5);
+        assert!((sw.src[2] - 0.839618).abs() < 1e-5);
+        assert!((sw.amt - 0.5).abs() < 1e-6);
+        // apply: a saturated pixel near the sample gets its saturation
+        // scaled; a desaturated pixel is untouched
+        let near = pc_apply(
+            hsv_to_rgb(0.69, 0.9, 0.85),
+            &PcSwatch {
+                shift: [0.0, 0.5, 0.0],
+                amt: 0.5,
+                ..sw
+            },
+        );
+        let (h2, s2, _) = rgb_to_hsv(near);
+        assert!(s2 > 0.9, "s2 {s2}");
+        let _ = h2;
+        let grey = pc_apply([0.5, 0.5, 0.5], &sw);
+        assert!((grey[0] - 0.5).abs() < 1e-4);
+        // sentinel row
+        assert!(pc_normalize(&[-1.0; 19]).is_none());
+        // logical-order row (src first, natural ranges) also decodes
+        let mut b = [-1.0f32; 19];
+        b[0] = 3.0;
+        b[1] = 0.5;
+        b[2] = 0.5;
+        b[6] = 0.5;
+        for i in [7usize, 11, 15] {
+            b[i] = 0.0;
+            b[i + 1] = 0.25;
+            b[i + 2] = 0.75;
+            b[i + 3] = 1.0;
+        }
+        let sw2 = pc_normalize(&b).unwrap();
+        assert!((sw2.src[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trap01_shape() {
+        assert_eq!(trap01(0.0, 0.2, 0.4, 0.6, 0.8), 0.0);
+        assert_eq!(trap01(0.5, 0.2, 0.4, 0.6, 0.8), 1.0);
+        assert!((trap01(0.3, 0.2, 0.4, 0.6, 0.8) - 0.5).abs() < 1e-6);
+        assert!((trap01(0.7, 0.2, 0.4, 0.6, 0.8) - 0.5).abs() < 1e-6);
+        // degenerate: zero-width outer edge = step
+        assert_eq!(trap01(0.3, 0.4, 0.4, 0.6, 0.6), 0.0);
+        assert_eq!(trap01(0.5, 0.4, 0.4, 0.6, 0.6), 1.0);
     }
 }

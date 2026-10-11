@@ -261,6 +261,13 @@ pub struct Recipe {
     /// max 8 honoured.
     #[serde(default)]
     pub warper: Vec<[f32; 5]>,
+    /// LR Point Color swatches: raw 19-float rows as serialized in
+    /// `crs:PointColors` (alphabetical layout:
+    /// [HueRange(LF,LN,UF,UN), HueShift, LumRange(...), LumScale,
+    /// RangeAmount, SatRange(...), SatScale, SrcHue(0..6), SrcLum, SrcSat]).
+    /// Entries of all -1 are LR's "empty swatch" sentinel.
+    #[serde(default)]
+    pub point_colors: Vec<[f32; 19]>,
     /// camera profile: "Adobe Standard", "Camera Standard", a .dcp path,
     /// or "" for the built-in libraw matrix. Resolved against
     /// ~/.safelight/profiles and (when installed) Lightroom's CameraProfiles.
@@ -613,6 +620,7 @@ impl Default for Recipe {
             stages: Vec::new(),
             color_slice: [[0.0; 4]; 7],
             warper: Vec::new(),
+            point_colors: Vec::new(),
             profile: String::new(),
             temp_abs: 0.0,
             tint_abs: 0.0,

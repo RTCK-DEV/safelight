@@ -1435,6 +1435,58 @@ fn hsm_apply(x: vec3<f32>) -> vec3<f32> {
     return map_apply(base, x);
 }
 
+// ---- LR Point Color (crs:PointColors) — mirrors pc_apply in develop.rs ---
+fn trap01(x: f32, ln: f32, lf: f32, uf: f32, un: f32) -> f32 {
+    var up = 0.0;
+    if (lf > ln + 1e-6) { up = clamp((x - ln) / (lf - ln), 0.0, 1.0); }
+    else if (x >= lf) { up = 1.0; }
+    var dn = 0.0;
+    if (un > uf + 1e-6) { dn = clamp((un - x) / (un - uf), 0.0, 1.0); }
+    else if (x <= uf) { dn = 1.0; }
+    return min(up, dn);
+}
+
+fn pc_base() -> u32 {
+    let lk = u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]);
+    let hb = 3u + lk * 3u + 256u;
+    let hm = u32(lookbuf[hb]) * u32(lookbuf[hb + 1u]) * u32(lookbuf[hb + 2u]);
+    return hb + 3u + hm * 3u;
+}
+
+fn pc_apply(x: vec3<f32>) -> vec3<f32> {
+    let pb = pc_base();
+    let n = min(u32(lookbuf[pb]), 8u);
+    if (n == 0u) { return x; }
+    var out = x;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let b = pb + 1u + i * 19u;
+        let hsv = rgb_to_hsv(out);
+        let lum = hsv.z; // LR "lum" ≈ brightness (see pc_apply)
+        let k = max(lookbuf[b + 6u] * 2.0, 0.0);
+        // scale each trapezoid about its centre (RangeAmount semantics)
+        var hr = vec4<f32>(lookbuf[b + 7u], lookbuf[b + 8u], lookbuf[b + 9u], lookbuf[b + 10u]);
+        var sr = vec4<f32>(lookbuf[b + 11u], lookbuf[b + 12u], lookbuf[b + 13u], lookbuf[b + 14u]);
+        var lr = vec4<f32>(lookbuf[b + 15u], lookbuf[b + 16u], lookbuf[b + 17u], lookbuf[b + 18u]);
+        let hc = (hr.x + hr.w) * 0.5;
+        let sc = (sr.x + sr.w) * 0.5;
+        let lc = (lr.x + lr.w) * 0.5;
+        hr = clamp(hc + (hr - vec4<f32>(hc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        sr = clamp(sc + (sr - vec4<f32>(sc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        lr = clamp(lc + (lr - vec4<f32>(lc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        let hpos = fract(hsv.x - lookbuf[b + 0u] + 0.5);
+        let wh = trap01(hpos, hr.x, hr.y, hr.z, hr.w);
+        let w = wh * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
+            * trap01(lum, lr.x, lr.y, lr.z, lr.w);
+        if (w > 1e-4) {
+            out = hsv_to_rgb(
+                fract(hsv.x + lookbuf[b + 3u] * w * 0.5 + 1.0),
+                clamp(hsv.y * (1.0 + lookbuf[b + 4u] * w), 0.0, 1.0),
+                max(hsv.z * (1.0 + lookbuf[b + 5u] * w), 0.0));
+        }
+    }
+    return out;
+}
+
 fn adjust(px: vec3<f32>) -> vec3<f32> {
     // camera calibration: primary hue/sat matrix + shadow green/magenta
     var x = px;
@@ -1630,6 +1682,7 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
                 clamp(hsv.z * (1.0 + dl), 0.0, 8.0));
         }
     }
+    x = pc_apply(x);
     // HSL qualifier (also runs for highlight-only preview when pg.qf2.w is set)
     if (pg.qf.x > 0.5 || pg.qf2.w > 0.5) {
         let hsv = rgb_to_hsv(x);
@@ -2939,6 +2992,22 @@ impl Gpu {
                 v.extend_from_slice(&p0.profile_tone_lut);
             }
             push_map(&mut v, &p0.profile_hsm);
+            // LR Point Color swatches, normalized on CPU so the shader sees a
+            // fixed layout: [src_h01,s,l][dh,ds,dl][amt][hr4][sr4][lr4] = 19
+            let pcs: Vec<crate::develop::PcSwatch> = p0
+                .point_colors
+                .iter()
+                .filter_map(crate::develop::pc_normalize)
+                .collect();
+            v.push(pcs.len() as f32);
+            for sw in &pcs {
+                v.extend(sw.src);
+                v.extend(sw.shift);
+                v.push(sw.amt);
+                v.extend(sw.hr);
+                v.extend(sw.sr);
+                v.extend(sw.lr);
+            }
             v
         };
         let look_b = mk_buf("lookbuf", bytemuck::cast_slice(&look32), storage_in);

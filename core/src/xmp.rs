@@ -311,6 +311,14 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         }
         a.push_str("   </rdf:Seq></crs:RetouchAreas>\n");
     }
+    if !r.point_colors.is_empty() {
+        a.push_str("   <crs:PointColors><rdf:Seq>\n");
+        for v in &r.point_colors {
+            let nums: Vec<String> = v.iter().map(|f| format!("{f:.6}")).collect();
+            a.push_str(&format!("    <rdf:li>{}</rdf:li>\n", nums.join(", ")));
+        }
+        a.push_str("   </rdf:Seq></crs:PointColors>\n");
+    }
     // full-fidelity recipe for our own round-trip
     if let Ok(js) = serde_json::to_string(&sc.recipe) {
         a.push_str(&format!("   <ara:Recipe>{}</ara:Recipe>\n", esc(&js)));
@@ -745,6 +753,51 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         }
         // HSL: 8 adobe bands -> hue_hue / hue_sat / hue_lum point curves
         hsl_adjustments(&body, r);
+        // Point Color swatches: <crs:PointColors><rdf:Seq><rdf:li>19 floats
+        for item in seq_items(&body, "crs:PointColors") {
+            // li_blocks returns the whole element — keep only its text body
+            let inner = match (item.find('>'), item.rfind('<')) {
+                (Some(a), Some(b)) if b > a => &item[a + 1..b],
+                _ => &item[..],
+            };
+            let mut row = [0.0f32; 19];
+            let mut n = 0usize;
+            for t in inner.split([',', ' ', '\n', '\r', '\t']) {
+                let t = t.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if n >= 19 {
+                    break;
+                }
+                if let Ok(f) = t.parse::<f32>() {
+                    row[n] = f;
+                    n += 1;
+                }
+            }
+            if n == 19 {
+                r.point_colors.push(row);
+            }
+        }
+        // flat-attribute form: crs:PointColors="f, f, ..." (one swatch)
+        if r.point_colors.is_empty() {
+            if let Some(s) = attr_str(&body, "crs:PointColors") {
+                let mut row = [0.0f32; 19];
+                let mut n = 0usize;
+                for t in s.split(',') {
+                    if n >= 19 {
+                        break;
+                    }
+                    if let Ok(f) = t.trim().parse::<f32>() {
+                        row[n] = f;
+                        n += 1;
+                    }
+                }
+                if n == 19 {
+                    r.point_colors.push(row);
+                }
+            }
+        }
         // grayscale mixer
         if attr_str(&body, "crs:ConvertToGrayscale").as_deref() == Some("True")
             || attr_str(&body, "crs:ConvertToGrayscale").as_deref() == Some("true")
@@ -1525,6 +1578,29 @@ mod tests {
         assert!(xml.contains("crs:CircularGradientBasedCorrections"));
         assert!(xml.contains("crs:What=\"Mask/CircularGradient\""));
         assert!(xml.contains("crs:Flipped=\"true\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn point_colors_seq_parse() {
+        // real LR serialization: rdf:Seq of <rdf:li>float rows (element text)
+        let xmp = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:ProcessVersion="15.4"><crs:PointColors><rdf:Seq><rdf:li>0.333333, 0.000000, 0.666667, 1.000000, 0.000000, 0.745889, 0.195889, 1.000000, 1.000000, 0.000000, 0.500000, 0.740754, 0.190754, 1.000000, 1.000000, 0.000000, 4.127050, 0.839618, 0.920754</rdf:li><rdf:li>-1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000, -1.000000</rdf:li></rdf:Seq></crs:PointColors></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let r = crs_to_recipe(xmp);
+        assert_eq!(r.point_colors.len(), 2);
+        assert!((r.point_colors[0][16] - 4.12705).abs() < 1e-5);
+        assert!(r.point_colors[1].iter().all(|x| *x < 0.0));
+        // write_xmp round-trips the rows
+        let dir = std::env::temp_dir().join(format!("xmp_test_pc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = dir.join("a.nef");
+        std::fs::write(&asset, b"fake").unwrap();
+        let sc = Sidecar {
+            recipe: r,
+            ..Default::default()
+        };
+        write_xmp(&asset, &sc).unwrap();
+        let r2 = crs_to_recipe(&std::fs::read_to_string(xmp_path_for(&asset)).unwrap());
+        assert_eq!(r2.point_colors.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
