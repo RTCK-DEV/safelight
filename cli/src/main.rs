@@ -13,6 +13,7 @@ fn main() -> Result<()> {
   safelight-cli thumb <raw> <out.png> [max_px]
   safelight-cli reference <raw> <out.png>
   safelight-cli scan <folder>
+  safelight-cli lrcat <catalog.lrcat> [--apply]
   safelight-cli meta <file>
   safelight-cli auto <file>
   safelight-cli rate <file> <0-5>"
@@ -110,6 +111,58 @@ fn main() -> Result<()> {
                 img.height,
                 image::ColorType::Rgba8,
             )?;
+        }
+        // import a Lightroom Classic catalog: Lua develop settings → crs
+        // recipes, plus rating/flag/label, written as .safelight.json
+        // sidecars next to each image that exists on disk.
+        "lrcat" => {
+            let apply = args.iter().any(|a| a == "--apply");
+            let limit: Option<usize> = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--limit="))
+                .and_then(|v| v.parse().ok());
+            let grep = args.iter().find_map(|a| a.strip_prefix("--grep="));
+            let mut list = safelight_core::lrcat::entries(Path::new(&args[2]))?;
+            if let Some(g) = grep {
+                list.retain(|e| e.path.to_string_lossy().contains(g));
+            }
+            if let Some(n) = limit {
+                list.truncate(n);
+            }
+            let mut n_disk = 0usize;
+            let mut n_edits = 0usize;
+            let mut n_write = 0usize;
+            for e in &list {
+                if !e.path.exists() {
+                    continue;
+                }
+                n_disk += 1;
+                let importable = e.has_edits
+                    || e.sidecar.rating != 0
+                    || e.sidecar.flag != 0
+                    || !e.sidecar.label.is_empty();
+                if !importable {
+                    continue;
+                }
+                n_edits += 1;
+                if apply {
+                    let sp = safelight_core::recipe::sidecar_path_for(&e.path);
+                    std::fs::write(&sp, serde_json::to_string_pretty(&e.sidecar)?)
+                        .with_context(|| format!("write {}", sp.display()))?;
+                    n_write += 1;
+                }
+            }
+            println!(
+                "{} catalog images, {} on disk, {} with edits — {}",
+                list.len(),
+                n_disk,
+                n_edits,
+                if apply {
+                    format!("{n_write} sidecars written")
+                } else {
+                    "dry run — pass --apply".into()
+                }
+            );
         }
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;

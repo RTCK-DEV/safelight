@@ -959,16 +959,21 @@ fn li_blocks(seq: &str) -> Vec<String> {
     let mut depth = 0i32;
     let mut start = 0usize;
     let mut i = 0usize;
-    while i < seq.len() {
-        let rest = &seq[i..];
-        if rest.starts_with("</rdf:li>") {
+    let bytes = seq.as_bytes();
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"</rdf:li>") {
             depth -= 1;
             i += 9;
             if depth == 0 {
                 items.push(seq[start..i].to_string());
             }
-        } else if rest.starts_with("<rdf:li") {
-            let gt = rest.find('>').map(|x| x + i).unwrap_or(seq.len() - 1);
+        } else if rest.starts_with(b"<rdf:li") {
+            let gt = rest
+                .iter()
+                .position(|&b| b == b'>')
+                .map(|x| x + i)
+                .unwrap_or(seq.len() - 1);
             let selfclose = seq[..gt].ends_with('/');
             if depth == 0 && selfclose {
                 items.push(seq[i..=gt].to_string());
@@ -987,19 +992,27 @@ fn li_blocks(seq: &str) -> Vec<String> {
 }
 
 /// top-level `<rdf:li>` items inside `<tag>…</tag>` — li_blocks itself is
-/// depth-aware, so the whole element body can be scanned directly.
+/// depth-aware, so the whole element body can be scanned directly. LR
+/// catalog-derived XMP can carry the same element twice (duplicate keys in
+/// the Lua settings blob), so every occurrence is scanned.
 fn seq_items(body: &str, tag: &str) -> Vec<String> {
-    let Some(ti) = body.find(&format!("<{tag}")) else {
-        return Vec::new();
-    };
-    let Some(gt) = body[ti..].find('>') else {
-        return Vec::new();
-    };
-    let si = ti + gt + 1;
-    let Some(ei) = body[si..].find(&format!("</{tag}>")) else {
-        return Vec::new();
-    };
-    li_blocks(&body[si..si + ei])
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(&open) {
+        let ti = from + rel;
+        let Some(gt) = body[ti..].find('>') else {
+            break;
+        };
+        let si = ti + gt + 1;
+        let Some(rel_e) = body[si..].find(&close) else {
+            break;
+        };
+        out.extend(li_blocks(&body[si..si + rel_e]));
+        from = si + rel_e + close.len();
+    }
+    out
 }
 
 /// every `<rdf:li>` in `item` carrying `crs:What="Mask/{what}"`.

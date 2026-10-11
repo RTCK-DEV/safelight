@@ -16,6 +16,7 @@ pub mod ffi;
 pub mod gpu;
 pub mod lcp;
 pub mod lensdb;
+pub mod lrcat;
 pub mod lut;
 pub mod merge;
 pub mod nef_he;
