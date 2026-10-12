@@ -158,6 +158,10 @@ struct Uni {
     gb0: [f32; 4],
     /// measured auto-CA radial scales: [k_r, k_b, 0, 0]
     ca0: [f32; 4],
+    /// post-profile working-space exit matrix (ProPhoto->sRGB / identity)
+    pp0: [f32; 4],
+    pp1: [f32; 4],
+    pp2: [f32; 4],
 }
 
 const WGSL: &str = r#"
@@ -259,6 +263,9 @@ struct Uni {
     gb0: vec4<f32>,
     // measured auto-CA radial scales [k_r, k_b]
     ca0: vec4<f32>,
+    pp0: vec4<f32>,
+    pp1: vec4<f32>,
+    pp2: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -1402,7 +1409,8 @@ fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
     let vd = u32(lookbuf[base + 2u]);
     if (hd < 1u || sd < 1u || vd < 1u) { return x; }
     let hsv = rgb_to_hsv(x);
-    if (hsv.y <= 1e-6) { return x; }
+    // no neutral early-out: the map's val scale applies to neutrals too
+    // (mirrors dcp.rs HsMap::apply — Adobe Standard lifts shadows ~1.2x)
     let hf = fract(hsv.x) * f32(hd);
     let h0 = min(u32(hf), hd - 1u);
     let h1 = (h0 + 1u) % hd;
@@ -1531,7 +1539,10 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let l = luma(x);
         x = vec3<f32>(x.x, x.y - pg.cal0.w * (1.0 - sstep(0.0, 0.4, l)) * 0.05, x.z);
     }
-    // profile look table (DCP/XMP) before exposure — mirrors develop.rs
+    // exposure — scene-linear gain before the profile's nonlinear ops
+    // (ACR pushes hot data into the tone shoulder, mirrors develop.rs)
+    x = x * pg.a1.x;
+    // profile look table (DCP/XMP)
     x = look_apply(x);
     // DCP ProfileToneCurve — appended to lookbuf after the look cells
     if (pg.bmisc.w > 0.5) {
@@ -1541,7 +1552,12 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
             lookbuf[pto + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
             lookbuf[pto + u32(clamp(x.z, 0.0, 1.0) * 255.0)]);
     }
-    x = x * pg.a1.x;
+    // exit the profile working space (ProPhoto -> sRGB; identity when
+    // no profile resolved) — mirrors develop.rs post_profile
+    x = vec3<f32>(
+        dot(pg.pp0.xyz, x),
+        dot(pg.pp1.xyz, x),
+        dot(pg.pp2.xyz, x));
     // auto-contrast percentile remap
     if (pg.misc.y - pg.misc.x < 0.999 || pg.misc.x > 0.001) {
         x = (x - vec3<f32>(pg.misc.x)) / max(pg.misc.y - pg.misc.x, 0.02);
@@ -3042,6 +3058,24 @@ impl Gpu {
             ],
             gb0: [p.grade_balance, p.grade_blend, 0.0, 0.0],
             ca0: [p.ca_r, p.ca_b, 0.0, 0.0],
+            pp0: [
+                p.post_profile[0][0],
+                p.post_profile[0][1],
+                p.post_profile[0][2],
+                0.0,
+            ],
+            pp1: [
+                p.post_profile[1][0],
+                p.post_profile[1][1],
+                p.post_profile[1][2],
+                0.0,
+            ],
+            pp2: [
+                p.post_profile[2][0],
+                p.post_profile[2][1],
+                p.post_profile[2][2],
+                0.0,
+            ],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so

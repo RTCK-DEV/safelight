@@ -419,7 +419,11 @@ mod tests {
         }
         let ops = parse(p).expect("dji dng has opcodes");
         // DJI Action 4 ships BaselineExposure=+1.8 in the raw IFD
-        assert!((ops.baseline_ev - 1.8).abs() < 0.01, "ev={}", ops.baseline_ev);
+        assert!(
+            (ops.baseline_ev - 1.8).abs() < 0.01,
+            "ev={}",
+            ops.baseline_ev
+        );
         let w = ops.warp.expect("warp rectilinear");
         eprintln!("warp center={:?}", w.center);
         for ch in 0..3 {

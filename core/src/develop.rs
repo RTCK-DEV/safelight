@@ -190,6 +190,9 @@ pub struct Params {
     /// profile tone curve as a 256-entry LUT on each channel 0..1,
     /// applied at the start of adjust() (empty = identity)
     pub profile_tone_lut: Vec<f32>,
+    /// working-space exit transform applied after the profile ops
+    /// (ProPhoto -> sRGB when a DCP resolved, else identity)
+    pub post_profile: [[f32; 3]; 3],
     /// LR camera calibration: 3x3 chroma-rotation matrix (row-major 9)
     /// + shadow green/magenta tint [9..12]
     pub calib: [f32; 12],
@@ -810,6 +813,17 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         wb[2] *= 1.0 - t * 0.35 + ti * 0.12;
     }
 
+    // ProPhoto (D50, linear) — ACR's working space for the profile stage
+    const XYZ_D50_TO_PROPHOTO: crate::dcp::Mat3 = [
+        [1.3459433, -0.2556075, -0.0511118],
+        [-0.5445989, 1.5081673, 0.0205351],
+        [0.0, 0.0, 1.2118128],
+    ];
+    const PROPHOTO_TO_SRGB: crate::dcp::Mat3 = [
+        [1.7157984, -0.4799412, -0.2358566],
+        [-0.5101695, 1.3918325, 0.0303034],
+        [0.0925821, -0.0428812, 0.9497079],
+    ];
     // cam -> sRGB: use libraw's precomputed rgb_cam (cam->sRGB, row-normalized).
     // WB is applied separately with a post-WB clip so blown highlights stay
     // white instead of shifting magenta.
@@ -829,6 +843,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut profile_look = None;
     let mut profile_tone_lut: Vec<f32> = Vec::new();
     let mut profile_baseline_ev = 0.0f32;
+    let mut cam2prof: Option<crate::dcp::Mat3> = None;
     {
         let wb_neutral = [
             1.0 / wb[0].max(1e-4),
@@ -838,18 +853,32 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         if let Some(prof) = &prof {
             if let Some(mtx) = prof.cam_to_xyz_d50(wb_neutral) {
                 cam2srgb = crate::dcp::mat_mul(crate::dcp::xyz_d50_to_srgb(), mtx);
+                // ACR runs its profile stage (look table + tone curve) in
+                // the profile working space — ProPhoto for DCPs. Render the
+                // demosaic there and convert back after the profile ops:
+                // per-channel curves in ProPhoto keep saturated colors
+                // (e.g. the blue edge of a sunset) where an sRGB-space
+                // curve would crush them.
+                cam2prof = Some(crate::dcp::mat_mul(XYZ_D50_TO_PROPHOTO, mtx));
             }
             profile_hsm = prof.hue_sat_map(wb_neutral).cloned();
             profile_look = prof.look_table.clone();
-            if prof.tone_curve.len() >= 2 {
-                profile_tone_lut = catmull_lut(
-                    &prof
-                        .tone_curve
-                        .iter()
-                        .map(|(x, y)| [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])
-                        .collect::<Vec<_>>(),
-                );
-            }
+            // ACR semantics: a profile with no ProfileToneCurve renders
+            // through the app's built-in default curve (the filmic ~+1EV
+            // midtone lift) — without it every Adobe Standard render
+            // comes out a stop+ darker than Lightroom's.
+            let curve_src: Vec<[f32; 2]> = if prof.tone_curve.len() >= 2 {
+                prof.tone_curve
+                    .iter()
+                    .map(|&(x, y)| [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])
+                    .collect()
+            } else {
+                crate::dcp::ACR_DEFAULT_CURVE
+                    .iter()
+                    .map(|&(x, y)| [x, y])
+                    .collect()
+            };
+            profile_tone_lut = catmull_lut(&curve_src);
             // BaselineExposureOffset (0xC7A5) is the profile's own EV
             // correction — it sits on top of the file's BaselineExposure
             // per the DNG spec (e.g. DJI ships file +1.8, profile −1.0).
@@ -1185,9 +1214,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         *c = c.clamp(-2.0, 2.0);
     }
 
+    // profile resolved to a matrix → demosaic into ProPhoto and convert
+    // back to sRGB after the profile ops; otherwise stay in sRGB.
+    let (work_m, post_profile) = match cam2prof {
+        Some(mm) => (mm, PROPHOTO_TO_SRGB),
+        None => (
+            cam2srgb,
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        ),
+    };
     let mut p = Params {
         wb,
-        m: cam2srgb,
+        m: work_m,
         lut: if r.linear_output {
             catmull_lut(&r.curve)
         } else if r.curve.is_empty() {
@@ -1386,6 +1424,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         profile_hsm,
         profile_look,
         profile_tone_lut,
+        post_profile,
         calib: calib_matrix(&r.calib),
         lens_blur: r.lens_blur.clamp(0.0, 1.0),
         lens_blur_opts: r.lens_blur_opts,
@@ -1750,6 +1789,12 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         let l = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
         x[1] -= p.calib[9] * (1.0 - sstep(0.0, 0.4, l)) * 0.05;
     }
+    // exposure — a scene-linear gain (baseline + user EV) so it must
+    // precede the profile's nonlinear ops: ACR pushes hot data into the
+    // tone curve's shoulder rather than scaling the mapped output.
+    for c in &mut x {
+        *c *= p.exposure_mul;
+    }
     // .dcp profile "look": ProfileLookTable (HSV shift in working space)
     // then ProfileToneCurve — the profile's base rendering, applied before
     // user edits (dcpsim order: matrix -> looktable -> tonecurve -> user).
@@ -1761,9 +1806,14 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             *c = lut_at(&p.profile_tone_lut, c.clamp(0.0, 1.0));
         }
     }
-    // exposure
-    for c in &mut x {
-        *c *= p.exposure_mul;
+    // exit the profile working space (ProPhoto -> sRGB when a DCP was
+    // resolved; identity otherwise) — everything below is output-referred.
+    if p.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+        x = [
+            p.post_profile[0][0] * x[0] + p.post_profile[0][1] * x[1] + p.post_profile[0][2] * x[2],
+            p.post_profile[1][0] * x[0] + p.post_profile[1][1] * x[1] + p.post_profile[1][2] * x[2],
+            p.post_profile[2][0] * x[0] + p.post_profile[2][1] * x[1] + p.post_profile[2][2] * x[2],
+        ];
     }
     // auto-contrast percentile remap
     if p.white_pt - p.black_pt < 0.999 || p.black_pt > 0.001 {

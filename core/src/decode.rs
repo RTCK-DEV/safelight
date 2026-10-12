@@ -663,6 +663,121 @@ pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
 }
 
 #[cfg(test)]
+mod rawstats {
+    use super::*;
+    #[test]
+    fn parse_dcp() {
+        let p = Path::new(
+            r"C:\Program Files\Adobe\Adobe Lightroom Classic\Resources\CameraProfiles\Adobe Standard\Sony ILCE-7RM3 Adobe Standard.dcp",
+        );
+        // diagnostic: needs a local Lightroom install; skip elsewhere
+        let Ok(d) = std::fs::read(p) else { return };
+        let prof = crate::dcp::DcpProfile::parse(&d).unwrap();
+        eprintln!(
+            "name={:?} hsm1={} hsm2={} tone={}pts look={} fwd={:?}",
+            prof.name,
+            prof.hsm1.is_some(),
+            prof.hsm2.is_some(),
+            prof.tone_curve.len(),
+            prof.look_table.is_some(),
+            (
+                prof.forward_matrix1.is_some(),
+                prof.forward_matrix2.is_some()
+            )
+        );
+        if let Some(h) = &prof.hsm1 {
+            let vm: f32 = h.data.iter().map(|c| c[2]).sum::<f32>() / h.data.len() as f32;
+            eprintln!("hsm dims={:?} vscale_mean={vm:.3}", h.dims);
+        }
+    }
+    #[test]
+    fn print_sony() {
+        let p = Path::new(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW");
+        // diagnostic: needs the local RAW collection; skip elsewhere
+        if !p.exists() {
+            return;
+        }
+        match decode(p) {
+            Ok(Decoded::Mosaic(m)) => {
+                eprintln!(
+                    "black={:?} max={} cam_mul={:?} pre_mul={:?}",
+                    m.black, m.maximum, m.cam_mul, m.pre_mul
+                );
+                // raw DN histogram on the CFA plane (sample every 4th px)
+                let mut h = [0u64; 16];
+                let mut at_black = 0u64;
+                let mut n = 0u64;
+                let max = m.maximum.max(1) as f32;
+                for i in (0..m.data.len()).step_by(4) {
+                    let v = m.data[i] as f32 / max;
+                    h[(v * 15.999) as usize] += 1;
+                    if m.data[i] as f32 <= m.black[0].max(m.black[1]).max(m.black[2]) {
+                        at_black += 1;
+                    }
+                    n += 1;
+                }
+                eprintln!("hist/16 {:?}", h);
+                eprintln!("at_or_below_black {:.3}", at_black as f32 / n as f32);
+                // masked-margin pixels = the true optical black level
+                eprintln!(
+                    "raw {}x{} margins l={} t={}",
+                    m.raw_w, m.raw_h, m.left, m.top
+                );
+                for band in [
+                    (0usize, m.raw_h, 0usize, m.left.min(64)),
+                    (0usize, m.top.min(64), 0usize, m.raw_w),
+                ] {
+                    let (y0, y1, x0, x1) = band;
+                    let mut v = Vec::new();
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            v.push(m.data[y * m.raw_w + x]);
+                        }
+                    }
+                    if !v.is_empty() {
+                        v.sort_unstable();
+                        eprintln!(
+                            "  band {:?}: n={} p10={} p50={} p90={}",
+                            band,
+                            v.len(),
+                            v[v.len() / 10],
+                            v[v.len() / 2],
+                            v[v.len() * 9 / 10]
+                        );
+                    }
+                }
+                // try lower black levels: if the true black is below 512,
+                // subtracting 512 crushes real shadow signal
+                for blk in [512.0f32, 384.0, 256.0, 128.0, 0.0] {
+                    let mut m2 = match decode(p) {
+                        Ok(Decoded::Mosaic(mm)) => mm,
+                        _ => continue,
+                    };
+                    m2.black = [blk; 4];
+                    let r = crate::recipe::Recipe::default();
+                    let img = crate::develop::develop_cpu(&Decoded::Mosaic(m2), &r, 1024);
+                    let buf = &img.data;
+                    let (mut n0, mut sum) = (0u64, 0u64);
+                    for px in buf.chunks(4) {
+                        if px[0].max(px[1]).max(px[2]) == 0 {
+                            n0 += 1;
+                        }
+                        sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
+                    }
+                    let np = (buf.len() / 4) as u64;
+                    eprintln!(
+                        "black={blk}: zero={:.3} mean={:.3}",
+                        n0 as f32 / np as f32,
+                        sum as f32 / (np as f32 * 3.0) / 255.0
+                    );
+                }
+            }
+            _ => eprintln!("not mosaic"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod heinfo {
     use super::*;
     #[test]

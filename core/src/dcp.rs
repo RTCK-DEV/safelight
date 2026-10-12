@@ -122,9 +122,8 @@ impl HsMap {
     /// apply the map: input rgb -> shifted/scaled rgb
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
         let [h, s, v] = Self::hsv(rgb);
-        if s <= 1e-6 {
-            return rgb; // neutrals pass through
-        }
+        // note: neutrals (s≈0) must NOT early-out — the map's val scale
+        // still applies to them (Adobe Standard lifts shadows ~1.2×)
         let d = self.lookup(h, s, v);
         let h2 = h + d[0] / 360.0;
         let s2 = (s * d[1]).clamp(0.0, 1.0);
@@ -323,6 +322,145 @@ fn mat3(v: Option<Vec<f32>>) -> Option<Mat3> {
 // DNG tag ids — two numberings exist: modern DNG 1.4 and the older
 // Adobe draft layout that Lightroom's shipped .dcp files still use
 // (profile-related tags shifted by 2). Resolve by tag type.
+/// ACR's built-in "default" tone curve — the curve Lightroom applies when
+/// the resolved camera profile has no ProfileToneCurve of its own (e.g.
+/// every modern `Adobe Standard.dcp`). Extracted verbatim from the
+/// `Camera Standard` DCPs Adobe ships for current cameras (tag 0xC6FC) —
+/// it is the PV2012+ render tone scale: strong midtone lift with a
+/// filmic shadow toe and long highlight shoulder. (Older Adobe Standard
+/// DCPs embed a weaker legacy curve directly; those parse through
+/// ProfileToneCurve and never reach this fallback.)
+pub const ACR_DEFAULT_CURVE: &[(f32, f32)] = &[
+    (0.0000, 0.0000),
+    (0.0006, 0.0014),
+    (0.0012, 0.0015),
+    (0.0018, 0.0021),
+    (0.0024, 0.0028),
+    (0.0030, 0.0032),
+    (0.0037, 0.0036),
+    (0.0044, 0.0042),
+    (0.0052, 0.0048),
+    (0.0061, 0.0055),
+    (0.0070, 0.0066),
+    (0.0081, 0.0081),
+    (0.0092, 0.0093),
+    (0.0104, 0.0107),
+    (0.0117, 0.0127),
+    (0.0131, 0.0147),
+    (0.0145, 0.0168),
+    (0.0161, 0.0192),
+    (0.0178, 0.0215),
+    (0.0195, 0.0254),
+    (0.0214, 0.0285),
+    (0.0233, 0.0325),
+    (0.0254, 0.0374),
+    (0.0275, 0.0424),
+    (0.0298, 0.0471),
+    (0.0321, 0.0520),
+    (0.0346, 0.0572),
+    (0.0372, 0.0636),
+    (0.0398, 0.0720),
+    (0.0426, 0.0806),
+    (0.0455, 0.0885),
+    (0.0485, 0.0965),
+    (0.0517, 0.1066),
+    (0.0549, 0.1181),
+    (0.0583, 0.1293),
+    (0.0617, 0.1406),
+    (0.0653, 0.1527),
+    (0.0690, 0.1641),
+    (0.0728, 0.1777),
+    (0.0768, 0.1891),
+    (0.0809, 0.2004),
+    (0.0851, 0.2132),
+    (0.0894, 0.2273),
+    (0.0938, 0.2402),
+    (0.0984, 0.2525),
+    (0.1031, 0.2665),
+    (0.1079, 0.2812),
+    (0.1129, 0.2959),
+    (0.1179, 0.3104),
+    (0.1232, 0.3278),
+    (0.1285, 0.3433),
+    (0.1340, 0.3591),
+    (0.1396, 0.3755),
+    (0.1453, 0.3912),
+    (0.1512, 0.4062),
+    (0.1572, 0.4236),
+    (0.1634, 0.4371),
+    (0.1697, 0.4547),
+    (0.1761, 0.4706),
+    (0.1827, 0.4849),
+    (0.1894, 0.5008),
+    (0.1963, 0.5153),
+    (0.2033, 0.5306),
+    (0.2104, 0.5444),
+    (0.2177, 0.5596),
+    (0.2251, 0.5706),
+    (0.2327, 0.5843),
+    (0.2404, 0.5958),
+    (0.2483, 0.6094),
+    (0.2563, 0.6228),
+    (0.2645, 0.6346),
+    (0.2728, 0.6471),
+    (0.2813, 0.6623),
+    (0.2899, 0.6738),
+    (0.2987, 0.6862),
+    (0.3076, 0.7014),
+    (0.3167, 0.7131),
+    (0.3259, 0.7264),
+    (0.3353, 0.7391),
+    (0.3449, 0.7472),
+    (0.3546, 0.7584),
+    (0.3645, 0.7678),
+    (0.3745, 0.7770),
+    (0.3847, 0.7868),
+    (0.3950, 0.7944),
+    (0.4055, 0.8043),
+    (0.4162, 0.8123),
+    (0.4270, 0.8206),
+    (0.4380, 0.8304),
+    (0.4491, 0.8393),
+    (0.4604, 0.8478),
+    (0.4719, 0.8536),
+    (0.4835, 0.8609),
+    (0.4953, 0.8660),
+    (0.5073, 0.8726),
+    (0.5195, 0.8765),
+    (0.5318, 0.8820),
+    (0.5442, 0.8866),
+    (0.5569, 0.8906),
+    (0.5697, 0.8943),
+    (0.5827, 0.8988),
+    (0.5959, 0.9028),
+    (0.6092, 0.9069),
+    (0.6227, 0.9107),
+    (0.6364, 0.9149),
+    (0.6502, 0.9190),
+    (0.6642, 0.9221),
+    (0.6784, 0.9256),
+    (0.6928, 0.9294),
+    (0.7073, 0.9326),
+    (0.7221, 0.9365),
+    (0.7370, 0.9393),
+    (0.7520, 0.9436),
+    (0.7673, 0.9478),
+    (0.7827, 0.9511),
+    (0.7984, 0.9542),
+    (0.8142, 0.9573),
+    (0.8301, 0.9611),
+    (0.8463, 0.9649),
+    (0.8626, 0.9682),
+    (0.8792, 0.9720),
+    (0.8959, 0.9755),
+    (0.9128, 0.9797),
+    (0.9298, 0.9835),
+    (0.9471, 0.9878),
+    (0.9645, 0.9922),
+    (0.9822, 0.9962),
+    (1.0000, 1.0000),
+];
+
 const T_UNIQ_MODEL: u16 = 0xC614;
 const T_COLMAT1: u16 = 0xC621;
 const T_COLMAT2: u16 = 0xC622;
@@ -387,7 +525,13 @@ impl DcpProfile {
             let dims = t.u32_tag(dims_tag).unwrap_or_default();
             let mut a = None;
             let mut b = None;
-            if dims.len() >= 3 {
+            // dims must be a real (hue,sat,val) triple — a data tag read as
+            // dims yields zeros/tiny values and a degenerate map that would
+            // block the correct fallback layout
+            let plausible = dims.len() >= 3
+                && dims.iter().all(|&d| (1..=512).contains(&d))
+                && dims[0] * dims[1] * dims[2] * 3 >= 3;
+            if plausible {
                 let want = (dims[0] * dims[1] * dims[2] * 3) as usize;
                 for (tag, slot) in [(d1, &mut a), (d2, &mut b)] {
                     if let Some(vals) = t.num_list(tag) {
@@ -432,16 +576,27 @@ impl DcpProfile {
                 }
             }
         }
-        // ProfileToneCurve (0xC6FE): only when it's numeric — old files use
-        // that slot for copyright ASCII. FLOAT pairs or rational pairs.
-        if t.tags
-            .get(&0xC6FE)
-            .map(|(ty, _, _)| *ty != 2)
-            .unwrap_or(false)
-        {
-            if let Some(vals) = t.num_list(0xC6FE) {
-                for c in vals.chunks_exact(2) {
-                    p.tone_curve.push((c[0], c[1]));
+        // ProfileToneCurve: old files use 0xC6FE (copyright ASCII when it
+        // isn't numeric); modern Adobe profiles carry it at 0xC6FC — but
+        // that slot is also HSM data1 in the pre-1.2 layout, so only take
+        // it when the 0xC6FB dims tag is absent and the count is small
+        // (curves are a few dozen pairs; HSM data runs into the thousands).
+        for tag in [0xC6FEu16, 0xC6FC] {
+            let Some(&(ty, cnt, _)) = t.tags.get(&tag) else {
+                continue;
+            };
+            if ty == 2 || cnt > 2048 {
+                continue;
+            }
+            if tag == 0xC6FC && t.tags.contains_key(&0xC6FB) {
+                continue;
+            }
+            if let Some(vals) = t.num_list(tag) {
+                if vals.len() >= 4 {
+                    for c in vals.chunks_exact(2) {
+                        p.tone_curve.push((c[0], c[1]));
+                    }
+                    break;
                 }
             }
         }
