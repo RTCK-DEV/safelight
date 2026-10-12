@@ -691,6 +691,7 @@ mod rawstats {
         }
     }
     #[test]
+    #[ignore = "slow diagnostic: decodes an 86MB raw several times"]
     fn print_sony() {
         let p = Path::new(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW");
         // diagnostic: needs the local RAW collection; skip elsewhere
@@ -718,6 +719,29 @@ mod rawstats {
                 }
                 eprintln!("hist/16 {:?}", h);
                 eprintln!("at_or_below_black {:.3}", at_black as f32 / n as f32);
+                // scene-linear stats after black subtraction, per CFA channel
+                let blk = m.black[0];
+                let mut sums = [0f64; 4];
+                let mut cnt = [0u64; 4];
+                // step 1: every CFA cell must be hit (a 2-step keeps parity)
+                for y in 0..m.raw_h.min(4000) {
+                    for x in 0..m.raw_w.min(4000) {
+                        let ch = m.cfa.color_at(x % m.cfa.w, y % m.cfa.h) as usize;
+                        let v = (m.data[y * m.raw_w + x] as f32 - blk).max(0.0) / (max - blk);
+                        sums[ch] += v as f64;
+                        cnt[ch] += 1;
+                    }
+                }
+                eprintln!(
+                    "cfa={:?}x{:?} cnt={:?} linear/ch R={:.5} G={:.5} B={:.5} G2={:.5}",
+                    m.cfa.w,
+                    m.cfa.cells,
+                    cnt,
+                    sums[0] / cnt[0].max(1) as f64,
+                    sums[1] / cnt[1].max(1) as f64,
+                    sums[2] / cnt[2].max(1) as f64,
+                    sums[3] / cnt[3].max(1) as f64
+                );
                 // masked-margin pixels = the true optical black level
                 eprintln!(
                     "raw {}x{} margins l={} t={}",
@@ -746,6 +770,23 @@ mod rawstats {
                         );
                     }
                 }
+                // stage isolation: mean of the post-colorize linear buffer
+                // (WB + profile matrix, pre-adjust) vs the display output
+                {
+                    let r = crate::recipe::Recipe::default();
+                    let dd = Decoded::Mosaic(m);
+                    match crate::develop::lin_base(&dd, &r) {
+                        Ok((lin, _w, _h)) => {
+                            let (mut s, mut n) = (0.0f64, 0u64);
+                            for px in lin.iter().step_by(97) {
+                                s += (px[0] + px[1] + px[2]) as f64;
+                                n += 1;
+                            }
+                            eprintln!("lin_base mean {:.5}", s / n.max(1) as f64 / 3.0);
+                        }
+                        Err(e) => eprintln!("lin_base: {e}"),
+                    }
+                }
                 // try lower black levels: if the true black is below 512,
                 // subtracting 512 crushes real shadow signal
                 for blk in [512.0f32, 384.0, 256.0, 128.0, 0.0] {
@@ -754,7 +795,9 @@ mod rawstats {
                         _ => continue,
                     };
                     m2.black = [blk; 4];
-                    let r = crate::recipe::Recipe::default();
+                    let mut r = crate::recipe::Recipe::default();
+                    r.profile = "Adobe Color".to_string();
+                    r.curve = vec![[0.0, 0.0], [1.0, 1.0]];
                     let img = crate::develop::develop_cpu(&Decoded::Mosaic(m2), &r, 1024);
                     let buf = &img.data;
                     let (mut n0, mut sum) = (0u64, 0u64);

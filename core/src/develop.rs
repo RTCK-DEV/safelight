@@ -5130,4 +5130,77 @@ mod tests {
         assert_eq!(trap01(0.3, 0.4, 0.4, 0.6, 0.6), 0.0);
         assert_eq!(trap01(0.5, 0.4, 0.4, 0.6, 0.6), 1.0);
     }
+
+    /// diagnostic (needs the local RAW collection): stage means through the
+    /// profile pipeline on a dark Sony file — lin (ProPhoto) -> adjust ->
+    /// srgb — so a stage that loses light is visible by name.
+    #[test]
+    #[ignore = "slow diagnostic: full-res demosaic of a local raw"]
+    fn stage_means_sony() {
+        let p = std::path::Path::new(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW");
+        if !p.exists() {
+            return;
+        }
+        let Ok(Decoded::Mosaic(m)) = crate::decode::decode(p) else {
+            return;
+        };
+        let mut r = crate::recipe::Recipe::default();
+        r.profile = "Adobe Color".to_string();
+        r.curve = vec![[0.0, 0.0], [1.0, 1.0]];
+        let prm = build_params(&m, &r, None);
+        let d = crate::decode::Decoded::Mosaic(m);
+        let (lin, _w, _h) = lin_base(&d, &r).expect("lin_base");
+        let (mut s_lin, mut s_adj, mut s_enc, mut n) = (0.0f64, 0.0f64, 0.0f64, 0u64);
+        let (mut s_pp, mut s_tone, mut s_look) = (0.0f64, 0.0f64, 0.0f64);
+        for px in lin.iter().step_by(613) {
+            let mean = |v: [f32; 3]| (v[0] + v[1] + v[2]) as f64 / 3.0;
+            s_lin += mean(*px);
+            let mut x = *px;
+            for c in &mut x {
+                *c *= prm.exposure_mul;
+            }
+            if let Some(lt) = &prm.profile_look {
+                x = lt.apply(x);
+            }
+            s_look += mean(x);
+            if !prm.profile_tone_lut.is_empty() {
+                for c in &mut x {
+                    *c = lut_at(&prm.profile_tone_lut, c.clamp(0.0, 1.0));
+                }
+            }
+            s_tone += mean(x);
+            if prm.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+                x = [
+                    prm.post_profile[0][0] * x[0]
+                        + prm.post_profile[0][1] * x[1]
+                        + prm.post_profile[0][2] * x[2],
+                    prm.post_profile[1][0] * x[0]
+                        + prm.post_profile[1][1] * x[1]
+                        + prm.post_profile[1][2] * x[2],
+                    prm.post_profile[2][0] * x[0]
+                        + prm.post_profile[2][1] * x[1]
+                        + prm.post_profile[2][2] * x[2],
+                ];
+            }
+            s_pp += mean(x);
+            let y = adjust(*px, &prm);
+            s_adj += mean(y);
+            s_enc += mean([
+                srgb_encode(y[0].clamp(0.0, 1.0)),
+                srgb_encode(y[1].clamp(0.0, 1.0)),
+                srgb_encode(y[2].clamp(0.0, 1.0)),
+            ]);
+            n += 1;
+        }
+        let n = n.max(1) as f64;
+        eprintln!(
+            "lin={:.5} look={:.5} tone={:.5} pp={:.5} adj={:.5} srgb={:.5}",
+            s_lin / n,
+            s_look / n,
+            s_tone / n,
+            s_pp / n,
+            s_adj / n,
+            s_enc / n
+        );
+    }
 }
