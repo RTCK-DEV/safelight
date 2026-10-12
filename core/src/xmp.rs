@@ -66,7 +66,19 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     a.push_str("   xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n");
     a.push_str("   xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n");
     a.push_str("   xmlns:sl=\"https://safelight.app/ns/1.0/\"\n");
-    a.push_str("   crs:Version=\"15.0\" crs:ProcessVersion=\"11.0\" crs:RawFileName=\"");
+    a.push_str(&format!(
+        "   crs:Version=\"15.0\" crs:ProcessVersion=\"{}\" crs:RawFileName=\"",
+        if r.process_version > 0.0 {
+            // keep the catalog's own version string (e.g. "15.4" vs "11.0")
+            if r.process_version.fract() == 0.0 {
+                format!("{:.1}", r.process_version)
+            } else {
+                r.process_version.to_string()
+            }
+        } else {
+            "11.0".to_string()
+        }
+    ));
     a.push_str(&esc(&asset
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -463,6 +475,9 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
     {
         let r = &mut sc.recipe;
         // white balance: absolute Kelvin/Tint or incremental shifts
+        if let Some(v) = attr(&body, "crs:ProcessVersion") {
+            r.process_version = v;
+        }
         match attr_str(&body, "crs:WhiteBalance").as_deref() {
             Some("As Shot") => r.wb_mode = crate::recipe::WbMode::AsShot,
             Some("Auto") => r.wb_mode = crate::recipe::WbMode::Auto,
@@ -1739,6 +1754,31 @@ mod tests {
         assert!((back.recipe.windows[0].ev - 0.8).abs() < 1e-6);
         assert_eq!(back.rating, 4);
         assert_eq!(back.label, "Red");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn process_version_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("xmp_test_pv_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // parse: the catalog's stored version string lands on the recipe
+        let r = crs_to_recipe(
+            r#"<rdf:Description rdf:about="" crs:ProcessVersion="15.4" crs:Exposure2012="+0.5"/>"#,
+        );
+        assert!((r.process_version - 15.4).abs() < 1e-6);
+        assert!((r.exposure - 0.5).abs() < 1e-6);
+        // write: a stored PV is emitted verbatim; unset stays "11.0"
+        let asset = dir.join("pv.arw");
+        std::fs::write(&asset, b"fake").unwrap();
+        let mut sc = Sidecar::default();
+        sc.recipe.process_version = 15.4;
+        write_xmp(&asset, &sc).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(xml.contains("crs:ProcessVersion=\"15.4\""));
+        sc.recipe.process_version = 0.0;
+        write_xmp(&asset, &sc).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(xml.contains("crs:ProcessVersion=\"11.0\""));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

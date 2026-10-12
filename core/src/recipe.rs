@@ -290,6 +290,12 @@ pub struct Recipe {
     /// resolved profile's baked-in grade; 1 = full.
     #[serde(default = "default_one")]
     pub profile_amount: f32,
+    /// Lightroom process version of the develop settings (crs:ProcessVersion,
+    /// catalog processVersion). 0 = unset/current. Matters because ACR's
+    /// base tone scale is version-dependent: PV11 (PV2012-era) uses an
+    /// image-adaptive tone mapping that PV15.x renders replaced.
+    #[serde(default)]
+    pub process_version: f32,
     /// absolute white balance in kelvin (Lightroom crs:Temperature).
     /// 0 = unset; when >0 it replaces the as-shot/auto/pick multipliers
     /// entirely (the camera-neutral is derived from the illuminant's
@@ -655,6 +661,7 @@ impl Default for Recipe {
             point_color_vars: Vec::new(),
             profile: String::new(),
             profile_amount: 1.0,
+            process_version: 0.0,
             temp_abs: 0.0,
             tint_abs: 0.0,
             linear_output: false,
