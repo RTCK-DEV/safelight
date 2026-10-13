@@ -84,16 +84,25 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()));
     a.push_str("\"\n");
-    // WB: LR stores absolute Kelvin/Tint for "As Shot", incremental for custom
+    // WB: LR stores absolute Kelvin/Tint for every mode ("As Shot" uses
+    // them as informational display values); incremental values only when
+    // no absolute pair is known. WhiteBalance names the active mode.
+    let wb_name = match r.wb_mode {
+        crate::recipe::WbMode::AsShot => "As Shot",
+        crate::recipe::WbMode::Auto => "Auto",
+        _ => "Custom",
+    };
     if r.temp_abs > 0.0 {
         a.push_str(&format!(
-            "   crs:WhiteBalance=\"Custom\" crs:Temperature=\"{:.0}\" crs:Tint=\"{:+.0}\"\n",
+            "   crs:WhiteBalance=\"{}\" crs:Temperature=\"{:.0}\" crs:Tint=\"{:+.0}\"\n",
+            wb_name,
             r.temp_abs,
             r.tint_abs.clamp(-150.0, 150.0)
         ));
     } else {
         a.push_str(&format!(
-            "   crs:WhiteBalance=\"Custom\" crs:IncrementalTemperature=\"{}\" crs:IncrementalTint=\"{}\"\n",
+            "   crs:WhiteBalance=\"{}\" crs:IncrementalTemperature=\"{}\" crs:IncrementalTint=\"{}\"\n",
+            wb_name,
             lr(r.temperature, 100.0),
             lr(r.tint, 100.0)
         ));
@@ -696,6 +705,9 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         match attr_str(&body, "crs:WhiteBalance").as_deref() {
             Some("As Shot") => r.wb_mode = crate::recipe::WbMode::AsShot,
             Some("Auto") => r.wb_mode = crate::recipe::WbMode::Auto,
+            // "Custom" and named presets (Daylight, Flash, ...) render
+            // through the absolute Temperature/Tint values
+            Some(_) => r.wb_mode = crate::recipe::WbMode::Manual,
             _ => {}
         }
         if let Some(v) = attr(&body, "crs:Temperature") {
