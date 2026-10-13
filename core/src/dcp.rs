@@ -989,6 +989,102 @@ pub fn find_profile(make: &str, model: &str, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Natural cubic spline slopes — a port of dng_sdk `dng_spline_solver::Solve`
+/// (dng_spline.cpp): C2-continuous with the second derivative pinned to zero
+/// at the endpoints. ACR evaluates ProfileToneCurve and the PV2012 point
+/// curve with this solver, not Catmull-Rom.
+pub fn spline_slopes(pts: &[[f32; 2]]) -> Vec<f64> {
+    let n = pts.len();
+    let x: Vec<f64> = pts.iter().map(|p| p[0] as f64).collect();
+    let y: Vec<f64> = pts.iter().map(|p| p[1] as f64).collect();
+    let mut s = vec![0.0f64; n];
+    let mut a = x[1] - x[0];
+    let mut b = (y[1] - y[0]) / a;
+    s[0] = b;
+    for j in 2..n {
+        let c = x[j] - x[j - 1];
+        let d = (y[j] - y[j - 1]) / c;
+        s[j - 1] = (b * c + d * a) / (a + c);
+        a = c;
+        b = d;
+    }
+    s[n - 1] = 2.0 * b - s[n - 2];
+    s[0] = 2.0 * s[0] - s[1];
+    if n > 2 {
+        let mut e = vec![0.0f64; n];
+        let mut f = vec![0.0f64; n];
+        let mut g = vec![0.0f64; n];
+        f[0] = 0.5;
+        e[n - 1] = 0.5;
+        g[0] = 0.75 * (s[0] + s[1]);
+        g[n - 1] = 0.75 * (s[n - 2] + s[n - 1]);
+        for j in 1..n - 1 {
+            let a = (x[j + 1] - x[j - 1]) * 2.0;
+            e[j] = (x[j + 1] - x[j]) / a;
+            f[j] = (x[j] - x[j - 1]) / a;
+            g[j] = 1.5 * s[j];
+        }
+        for j in 1..n {
+            let a = 1.0 - f[j - 1] * e[j];
+            if j != n - 1 {
+                f[j] /= a;
+            }
+            g[j] = (g[j] - g[j - 1] * e[j]) / a;
+        }
+        for j in (0..n - 1).rev() {
+            g[j] -= f[j] * g[j + 1];
+        }
+        s = g;
+    }
+    s
+}
+
+/// Evaluate the natural cubic at `x` — port of `dng_spline_solver::Evaluate`
+/// + `EvaluateSplineSegment` (clamped ends, binary-searched segment).
+pub fn spline_eval(pts: &[[f32; 2]], s: &[f64], x: f32) -> f32 {
+    let n = pts.len();
+    let xf = x as f64;
+    if xf <= pts[0][0] as f64 {
+        return pts[0][1];
+    }
+    if xf >= pts[n - 1][0] as f64 {
+        return pts[n - 1][1];
+    }
+    let mut lo = 1usize;
+    let mut hi = n - 1;
+    while hi > lo {
+        let mid = (lo + hi) >> 1;
+        let xm = pts[mid][0] as f64;
+        if xf == xm {
+            return pts[mid][1];
+        }
+        if xf > xm {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let j = lo;
+    let x0 = pts[j - 1][0] as f64;
+    let y0 = pts[j - 1][1] as f64;
+    let x1 = pts[j][0] as f64;
+    let y1 = pts[j][1] as f64;
+    let a = x1 - x0;
+    let b = (xf - x0) / a;
+    let c = (x1 - xf) / a;
+    ((y0 * (2.0 - c + b) + s[j - 1] * a * b) * (c * c)
+        + (y1 * (2.0 - b + c) - s[j] * a * c) * (b * b)) as f32
+}
+
+/// 256-entry LUT from a natural cubic through `pts` (sorted, endpoints
+/// included) — the DNG ProfileToneCurve evaluation path.
+pub fn spline_lut(pts: &[[f32; 2]]) -> Vec<f32> {
+    let slopes = spline_slopes(pts);
+    (0..256)
+        .map(|i| spline_eval(pts, &slopes, i as f32 / 255.0).clamp(0.0, 1.0))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

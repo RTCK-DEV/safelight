@@ -327,6 +327,12 @@ fn curve_lut(points: &[[f32; 2]], default: impl Fn(f32) -> f32, maxy: f32) -> Ve
     }
     pts.extend(mid);
     pts.push([1.0, default(1.0)]);
+    pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6);
+    if pts.len() < 2 {
+        return (0..256)
+            .map(|i| default(i as f32 / 255.0).clamp(0.0, maxy))
+            .collect();
+    }
     let n = pts.len();
     let mut lut = Vec::with_capacity(256);
     for i in 0..256 {
@@ -898,7 +904,12 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                     .map(|&(x, y)| [x, y])
                     .collect()
             };
-            profile_tone_lut = catmull_lut(&curve_src);
+            // DCP ProfileToneCurve is evaluated with the DNG natural
+            // cubic spline solver (dng_spline_solver), not Catmull-Rom
+            let mut sp_pts: Vec<[f32; 2]> = curve_src.iter().map(|p| [p[0], p[1]]).collect();
+            sp_pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+            sp_pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6);
+            profile_tone_lut = crate::dcp::spline_lut(&sp_pts);
             // BaselineExposureOffset (0xC7A5) is the profile's own EV
             // correction — it sits on top of the file's BaselineExposure
             // per the DNG spec (e.g. DJI ships file +1.8, profile −1.0).
