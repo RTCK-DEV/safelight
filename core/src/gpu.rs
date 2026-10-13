@@ -2501,11 +2501,7 @@ pub struct Gpu {
 }
 
 fn norm_factors(m: &Mosaic) -> [f32; 4] {
-    let mut n = [0.0f32; 4];
-    for c in 0..4 {
-        n[c] = 1.0 / (m.maximum as f32 - m.black[c]).max(1.0);
-    }
-    n
+    crate::develop::norm_factors(m)
 }
 
 impl Gpu {

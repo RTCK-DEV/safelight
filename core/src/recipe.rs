@@ -671,7 +671,15 @@ impl Default for Recipe {
 
 impl Recipe {
     pub fn from_json(s: &str) -> Option<Recipe> {
-        serde_json::from_str(s).ok()
+        // accept either a bare Recipe or a .safelight.json Sidecar wrapper —
+        // serde would otherwise "successfully" deserialize the wrapper into
+        // an all-defaults Recipe and silently drop every edit.
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        if let Some(r) = v.get("recipe") {
+            serde_json::from_value(r.clone()).ok()
+        } else {
+            serde_json::from_value(v).ok()
+        }
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()

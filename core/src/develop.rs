@@ -1435,6 +1435,16 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     if !(dcp_active && DCP_LOOK_NAMES.contains(&r.look.as_str())) {
         apply_look(&mut p, &r.look);
     }
+    // PV2012-era images (crs:ProcessVersion < 12, i.e. "11.0" in the catalog)
+    // render through ACR's adaptive default tone scale: the measured residual
+    // vs our pipeline is a strong shadow lift that converges to a mild
+    // highlight compression — fitted empirically from digest-matched
+    // Lightroom previews and composed on top of the recipe's tone LUT.
+    if r.process_version > 0.0 && r.process_version < 12.0 {
+        for v in &mut p.lut {
+            *v = pv2012_tone(*v);
+        }
+    }
     // serial stages: each stage is a full Recipe evaluated with the same
     // mosaic+stats context. Nested stages are stripped to bound the work.
     p.stages = r
@@ -1520,6 +1530,48 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
         }
     }
     out
+}
+
+/// ACR PV2012 default tone-scale compensation (empirical, linear domain).
+/// Measured as the mean ours→Lightroom transfer across digest-matched
+/// preview renders of unedited PV11.0 Sony files: a strong toe lift that
+/// converges to a slight highlight shoulder. Control points (x -> y):
+const PV2012_TONE: &[[f32; 2]] = &[
+    [0.0, 0.0],
+    [0.001, 0.0131],
+    [0.0072, 0.0371],
+    [0.0145, 0.0486],
+    [0.025, 0.0620],
+    [0.0387, 0.0847],
+    [0.0611, 0.1104],
+    [0.086, 0.1364],
+    [0.1232, 0.1719],
+    [0.1727, 0.2166],
+    [0.2456, 0.2826],
+    [0.4009, 0.3973],
+    [0.6201, 0.5654],
+    [0.8, 0.74],
+    [1.0, 0.93],
+];
+
+fn pv2012_tone(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let n = PV2012_TONE.len();
+    for w in PV2012_TONE.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if x <= b[0] {
+            let t = if b[0] > a[0] {
+                (x - a[0]) / (b[0] - a[0])
+            } else {
+                1.0
+            };
+            return a[1] + (b[1] - a[1]) * t;
+        }
+    }
+    // above the last control point: continue the mild shoulder
+    PV2012_TONE[n - 1][1] + (x - PV2012_TONE[n - 1][0]).max(0.0) * 0.3
 }
 
 /// smoothstep(edge0, edge1, x) helper
@@ -2174,7 +2226,7 @@ fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32;
         let cy = sy.clamp(0, rh - 1) as usize;
         let col = m.cfa.cells[(cy % ph) * pw + (cx % pw)] as usize;
         let ci = col.min(3);
-        (m.data[cy * m.raw_w + cx] as f32 - m.black[ci]) * norm[ci]
+        (m.data[cy * m.raw_w + cx] as f32 - black_at(m, ci)) * norm[ci]
     };
     let is_color = |sx: i32, sy: i32, ch: usize| -> bool {
         let cy = sy.clamp(0, rh - 1) as usize;
@@ -2830,7 +2882,7 @@ fn demosaic_pixel(m: &Mosaic, vx: usize, vy: usize, stride: usize, norm: &[f32; 
                 let col = cfa.color_at(sx % cfa.w, sy % cfa.h) as usize;
                 let cc = if col == 3 { 1 } else { col };
                 let raw = m.data[row + sx] as f32;
-                sums[cc] += (raw - m.black[col.min(3)]) * norm[col.min(3)];
+                sums[cc] += (raw - black_at(m, col.min(3))) * norm[col.min(3)];
                 cnts[cc] += 1;
             }
         }
@@ -2849,13 +2901,31 @@ fn demosaic_pixel(m: &Mosaic, vx: usize, vy: usize, stride: usize, norm: &[f32; 
 }
 
 /// black level + white point normalization factors per CFA colour index.
-fn norm_factors(m: &Mosaic) -> [f32; 4] {
+pub(crate) fn norm_factors(m: &Mosaic) -> [f32; 4] {
     let mut n = [0.0f32; 4];
     for c in 0..4 {
-        let denom = (m.maximum as f32 - m.black[c]).max(1.0);
+        // libraw's linear_max is the real per-channel saturation point when
+        // known (e.g. Sony ARW: 15360 < maximum 16383); normalizing by the
+        // advertised maximum would under-expose by ~7%.
+        let white = if m.linear_max[c] > m.black[c] as u32 {
+            (m.linear_max[c] as f32).min(m.maximum as f32)
+        } else {
+            m.maximum as f32
+        };
+        let denom = (white - black_at(m, c)).max(1.0);
         n[c] = 1.0 / denom;
     }
     n
+}
+
+/// diagnostic knob: SAFELIGHT_BLACK_BIAS=delta subtracts extra DN on top of
+/// the reported black point — probes effective-black differences vs ACR.
+fn black_at(m: &Mosaic, c: usize) -> f32 {
+    m.black[c.min(3)]
+        + std::env::var("SAFELIGHT_BLACK_BIAS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
 }
 
 /// Full development: decoded -> rgba8 oriented, fit inside max_px (0 = full res).
@@ -3179,6 +3249,8 @@ fn develop_raster(
         h: 0,
         black: [0.0; 4],
         maximum: 65535,
+        baseline_exposure: 0.0,
+        linear_max: [0; 4],
         cam_mul: [1.0; 4],
         cam_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0; 3]],
         rgb_cam: [
@@ -5137,7 +5209,12 @@ mod tests {
     #[test]
     #[ignore = "slow diagnostic: full-res demosaic of a local raw"]
     fn stage_means_sony() {
-        let p = std::path::Path::new(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW");
+        let p = std::env::var("SAFELIGHT_STAGE_RAW")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW")
+            });
+        let p = p.as_path();
         if !p.exists() {
             return;
         }

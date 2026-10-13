@@ -71,6 +71,10 @@ pub struct Mosaic {
     pub h: usize,
     pub black: [f32; 4],
     pub maximum: u32,
+    /// libraw's per-camera scene-referred gain in EV (0 when unspecified)
+    pub baseline_exposure: f32,
+    /// per-channel real saturation point when libraw knows it (0 = n/a)
+    pub linear_max: [u32; 4],
     /// as-shot white balance multipliers (R G1 B G2)
     pub cam_mul: [f32; 4],
     /// XYZ->camera matrix (dcraw cam_xyz semantics), 4x3
@@ -283,6 +287,12 @@ fn mosaic_decoded(
         h: hgt,
         black,
         maximum: info.maximum.max(1),
+        baseline_exposure: if info.baseline_exposure < -100.0 {
+            0.0
+        } else {
+            info.baseline_exposure
+        },
+        linear_max: info.linear_max,
         cam_mul: info.cam_mul,
         cam_xyz: info.cam_xyz,
         rgb_cam: info.rgb_cam,
@@ -701,8 +711,8 @@ mod rawstats {
         match decode(p) {
             Ok(Decoded::Mosaic(m)) => {
                 eprintln!(
-                    "black={:?} max={} cam_mul={:?} pre_mul={:?}",
-                    m.black, m.maximum, m.cam_mul, m.pre_mul
+                    "black={:?} max={} cam_mul={:?} pre_mul={:?} baseline_ev={} linear_max={:?}",
+                    m.black, m.maximum, m.cam_mul, m.pre_mul, m.baseline_exposure, m.linear_max
                 );
                 // raw DN histogram on the CFA plane (sample every 4th px)
                 let mut h = [0u64; 16];

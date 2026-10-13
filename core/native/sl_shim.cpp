@@ -90,6 +90,8 @@ SlRaw* sl_raw_open(const char* path, SlRawInfo* info) {
   info->aperture = id.other.aperture;
   info->focal = id.other.focal_len;
   info->timestamp = (long)id.other.timestamp;
+  info->baseline_exposure = id.color.dng_levels.baseline_exposure;
+  for (int i = 0; i < 4; i++) info->linear_max[i] = id.color.linear_max[i];
 
   return new SlRaw{r};
 }
@@ -109,6 +111,8 @@ void sl_raw_refresh_info(SlRaw* r, SlRawInfo* info) {
     info->pre_mul[i] = id.color.pre_mul[i];
   }
   memcpy(info->rgb_cam, id.color.rgb_cam, sizeof(info->rgb_cam));
+  info->baseline_exposure = id.color.dng_levels.baseline_exposure;
+  for (int i = 0; i < 4; i++) info->linear_max[i] = id.color.linear_max[i];
 }
 
 int sl_raw_cfa(SlRaw* r, unsigned short** out, int* count) {
