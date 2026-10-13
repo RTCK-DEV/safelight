@@ -501,6 +501,22 @@ pub struct PowerWindow {
     /// window — raw 19-float rows + per-swatch variance (LocalColorVariance).
     #[serde(default)]
     pub pcs: Vec<([f32; 19], f32)>,
+    /// LR AI-mask bitmap reference: MaskDigest identifies the computed
+    /// matte in the catalog's `.lrcat-data` blob store. During `lrcat`
+    /// import the blob is extracted to a PNG next to the sidecar and
+    /// `mask_file` names it (relative to the image). When set, the
+    /// renderer samples this real Adobe matte instead of the heuristic
+    /// subject/sky/etc. approximation.
+    #[serde(default)]
+    pub mask_digest: String,
+    #[serde(default)]
+    pub mask_file: String,
+    /// mask bitmap placement: origin (x,y) of the TIFF bbox and the
+    /// whole-image area (w,h), all in mask-space pixels.
+    #[serde(default)]
+    pub mask_org: [f32; 2],
+    #[serde(default)]
+    pub mask_area: [f32; 2],
 }
 
 fn defringe_pu_default() -> [f32; 3] {
@@ -549,6 +565,10 @@ impl Default for PowerWindow {
             texture: 0.0,
             refine: [0.0; 6],
             pcs: Vec::new(),
+            mask_digest: String::new(),
+            mask_file: String::new(),
+            mask_org: [0.0; 2],
+            mask_area: [0.0; 2],
         }
     }
 }

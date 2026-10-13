@@ -1331,6 +1331,10 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 texture: tex,
                 refine: [0.0; 6],
                 pcs: Vec::new(),
+                mask_digest: String::new(),
+                mask_file: String::new(),
+                mask_org: [0.0; 2],
+                mask_area: [0.0; 2],
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -1379,30 +1383,64 @@ fn local_corrections(body: &str, r: &mut Recipe) {
             // (subject matte gated by a body-region prior from MaskName)
             for mb in mask_blocks(&item, "Image") {
                 let sub = field(&mb, "crs:MaskSubType").unwrap_or(0.0) as i32;
+                let inv = truthy(field_str(&mb, "crs:MaskInverted"));
+                let n0 = r.windows.len();
                 if sub == 1 {
-                    r.windows.push(win("subject", [0.0; 6], 0.0, false));
+                    r.windows.push(win("subject", [0.0; 6], 0.0, inv));
                 } else if sub == 2 {
-                    r.windows.push(win("sky", [0.0; 6], 0.0, false));
+                    r.windows.push(win("sky", [0.0; 6], 0.0, inv));
                 } else if sub == 3 {
                     let name = field_str(&mb, "crs:MaskName").unwrap_or_default();
                     let (cx, cy, rx, ry) = part_prior(&name);
                     r.windows
-                        .push(win("part", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
+                        .push(win("part", [cx, cy, rx, ry, 0.0, 0.4], 0.0, inv));
                 } else if sub == 0 {
                     // LR11+ landscape semantic masks: Sky reuses the sky
                     // matte, Vegetation the veg matte, the rest are
                     // (1 - sky) gated by a class region prior.
                     let name = field_str(&mb, "crs:MaskName").unwrap_or_default();
                     match name.as_str() {
-                        "Sky" => r.windows.push(win("sky", [0.0; 6], 0.0, false)),
+                        "Sky" => r.windows.push(win("sky", [0.0; 6], 0.0, inv)),
                         "Vegetation" => {
                             r.windows
-                                .push(win("veg", [0.5, 0.5, 1.5, 1.5, 0.0, 0.4], 0.0, false))
+                                .push(win("veg", [0.5, 0.5, 1.5, 1.5, 0.0, 0.4], 0.0, inv))
                         }
                         _ => {
                             let (cx, cy, rx, ry) = land_prior(&name);
                             r.windows
-                                .push(win("nsky", [cx, cy, rx, ry, 0.0, 0.4], 0.0, false));
+                                .push(win("nsky", [cx, cy, rx, ry, 0.0, 0.4], 0.0, inv));
+                        }
+                    }
+                }
+                // AI mask bitmap binding: MaskDigest names the computed
+                // matte in the catalog .lrcat-data blob store; Origin and
+                // WholeImageArea place its bounding box in mask space.
+                if let Some(w) = r.windows.get_mut(n0) {
+                    if let Some(d) = field_str(&mb, "crs:MaskDigest") {
+                        w.mask_digest = d.to_string();
+                    }
+                    if let Some(o) = field_str(&mb, "crs:Origin") {
+                        let v: Vec<f32> = o
+                            .split(|c: char| c == ',' || c.is_whitespace())
+                            .filter_map(|t| t.parse().ok())
+                            .collect();
+                        if v.len() >= 2 {
+                            w.mask_org = [v[0], v[1]];
+                        }
+                    }
+                    if let Some(a) = field_str(&mb, "crs:WholeImageArea") {
+                        // "top,left,bottom,right" as n/d rationals
+                        let v: Vec<f32> = a
+                            .split(',')
+                            .filter_map(|t| {
+                                let mut it = t.trim().split('/');
+                                let n: f32 = it.next()?.parse().ok()?;
+                                let d: f32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+                                (d != 0.0).then_some(n / d)
+                            })
+                            .collect();
+                        if v.len() >= 4 {
+                            w.mask_area = [v[3] - v[1], v[2] - v[0]];
                         }
                     }
                 }
@@ -1738,6 +1776,10 @@ mod tests {
             texture: 0.0,
             refine: [0.0; 6],
             pcs: Vec::new(),
+            mask_digest: String::new(),
+            mask_file: String::new(),
+            mask_org: [0.0; 2],
+            mask_area: [0.0; 2],
         }];
         sc.rating = 4;
         sc.label = "Red".into();

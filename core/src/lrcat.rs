@@ -65,6 +65,272 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
 }
 
 // ---------------------------------------------------------------------------
+// .lrcat-data AI-mask blob extraction
+// ---------------------------------------------------------------------------
+//
+// Lightroom stores its *computed* AI-mask bitmaps (subject/sky/landscape
+// semantic mattes) in the catalog's `<name>.lrcat-data` LevelDB/blob store,
+// keyed by each mask's `MaskDigest`. Every `.blob` file is a ~110-byte
+// header — the digest as a 32-char ASCII GUID near offset 62 — followed by
+// an embedded grayscale TIFF (deflate strips or JPEG tiles) covering only
+// the mask's bounding box; `Origin`/`WholeImageArea` in the develop text
+// place that box in mask space. Extracting these gives us Adobe's real
+// mattes instead of our heuristic approximations.
+
+/// A resolved mask bitmap inside the `.lrcat-data` store: either a slice
+/// of a `NNNNNN.blob` file or TIFF data held inline in an SST record.
+#[derive(Debug, Clone)]
+pub struct MaskBlob {
+    pub path: PathBuf,
+    /// byte offset of the embedded TIFF record
+    pub off: u64,
+    /// 0 = to end of file
+    pub len: u64,
+    /// non-empty: TIFF-bearing record stored inline in the SST
+    pub inline: Vec<u8>,
+}
+
+fn rv64(b: &[u8], o: &mut usize) -> Option<u64> {
+    let (mut r, mut s) = (0u64, 0u32);
+    loop {
+        let x = *b.get(*o)? as u64;
+        *o += 1;
+        r |= (x & 0x7f) << s;
+        if x & 0x80 == 0 {
+            return Some(r);
+        }
+        s += 7;
+        if s > 63 {
+            return None;
+        }
+    }
+}
+
+/// LevelDB/RocksDB table (SST) records — the `.lrcat-data` store keys each
+/// mask's MaskDigest to either `[1, blob_file_no, data_off, data_len]` (the
+/// TIFF then sits at `data_off + 16` inside `NNNNNN.blob`) or an inline
+/// TIFF in the value itself. Records are prefix-compressed; we scan
+/// linearly and resync across block boundaries/restart arrays.
+fn sst_records(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    let mut prev: Vec<u8> = Vec::new();
+    while o < raw.len() {
+        let st = o;
+        let rec = (|| {
+            let sh = rv64(raw, &mut o)? as usize;
+            let ns = rv64(raw, &mut o)? as usize;
+            let vl = rv64(raw, &mut o)? as usize;
+            if sh > prev.len() || ns > 4096 || o.checked_add(ns + vl)? > raw.len() {
+                return None;
+            }
+            let mut k = prev[..sh].to_vec();
+            k.extend_from_slice(&raw[o..o + ns]);
+            o += ns;
+            let v = raw[o..o + vl].to_vec();
+            o += vl;
+            Some((k, v))
+        })();
+        match rec {
+            Some((k, v)) => {
+                out.push((k.clone(), v));
+                prev = k;
+            }
+            None => {
+                // restart arrays, block trailers and the index/meta blocks
+                // don't parse as records — resync at the next offset that
+                // starts a fresh (shared=0) record
+                o = st + 1;
+                prev.clear();
+                let mut probe = o;
+                while probe < raw.len() {
+                    let mut q = probe;
+                    let good = (|| {
+                        let sh = rv64(raw, &mut q)? as usize;
+                        let ns = rv64(raw, &mut q)? as usize;
+                        let vl = rv64(raw, &mut q)? as usize;
+                        (sh == 0 && ns > 0 && ns < 4096 && q + ns + vl <= raw.len()).then_some(())
+                    })();
+                    if good.is_some() {
+                        break;
+                    }
+                    probe += 1;
+                }
+                if probe >= raw.len() {
+                    break;
+                }
+                o = probe;
+            }
+        }
+    }
+    out
+}
+
+/// Map MaskDigest (uppercase hex) → TIFF location for every AI-mask
+/// bitmap in the catalog's `<catalog>.lrcat-data` store. Two keying
+/// styles are handled: newer catalogs key a LevelDB SST record by
+/// MaskDigest; older stores carry the digest in each `.blob` header.
+pub fn blob_index(cat: &Path) -> std::collections::HashMap<String, MaskBlob> {
+    let mut out = std::collections::HashMap::new();
+    let dir = cat.with_extension("lrcat-data");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut blobs: Vec<(u64, PathBuf)> = Vec::new();
+        for e in rd.flatten() {
+            let p = e.path();
+            match p.extension().and_then(|s| s.to_str()) {
+                Some("blob") => {
+                    if let Some(n) = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        blobs.push((n, p));
+                    }
+                }
+                Some("sst") => {
+                    let Ok(raw) = std::fs::read(&p) else {
+                        continue;
+                    };
+                    for (k, v) in sst_records(&raw) {
+                        if k.len() < 32
+                            || !k[..32]
+                                .iter()
+                                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b))
+                        {
+                            continue;
+                        }
+                        let d = String::from_utf8_lossy(&k[..32]).into_owned();
+                        if v.windows(4).any(|w| w == b"II*\x00") {
+                            // small mattes are stored inline in the record
+                            out.insert(
+                                d,
+                                MaskBlob {
+                                    path: p.clone(),
+                                    off: 0,
+                                    len: 0,
+                                    inline: v,
+                                },
+                            );
+                            continue;
+                        }
+                        let mut o = 0;
+                        let (Some(ver), Some(fno), Some(off), Some(len)) = (
+                            rv64(&v, &mut o),
+                            rv64(&v, &mut o),
+                            rv64(&v, &mut o),
+                            rv64(&v, &mut o),
+                        ) else {
+                            continue;
+                        };
+                        if ver != 1 || len == 0 {
+                            continue;
+                        }
+                        out.insert(
+                            d,
+                            MaskBlob {
+                                path: dir.join(format!("{fno:06}.blob")),
+                                off: off + 16,
+                                len,
+                                inline: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        // fallback: scan blob headers for a 32-char uppercase-hex digest
+        // (older catalogs key the blob header by MaskDigest directly)
+        for (_, p) in blobs {
+            let Ok(mut f) = std::fs::File::open(&p) else {
+                continue;
+            };
+            use std::io::Read;
+            let mut head = [0u8; 160];
+            let n = f.read(&mut head).unwrap_or(0);
+            for i in 0..n.saturating_sub(32) {
+                if head[i..i + 32]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b))
+                {
+                    let d = String::from_utf8_lossy(&head[i..i + 32]).into_owned();
+                    out.entry(d).or_insert(MaskBlob {
+                        path: p.clone(),
+                        off: 110,
+                        len: 0,
+                        inline: Vec::new(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decode the embedded TIFF of a mask blob → (w, h, 8-bit gray pixels).
+pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
+    let d = if !b.inline.is_empty() {
+        b.inline.clone()
+    } else {
+        let mut d = std::fs::read(&b.path).ok()?;
+        d.drain(..b.off.min(d.len() as u64) as usize);
+        if b.len > 0 {
+            d.truncate(b.len as usize);
+        }
+        d
+    };
+    let o = d.windows(4).position(|w| w == b"II*\x00")?;
+    let dec = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(&d[o..])).ok()?;
+    let img = image::DynamicImage::from_decoder(dec).ok()?.to_luma8();
+    Some((img.width(), img.height(), img.into_raw()))
+}
+
+/// Extract the blob-store mattes referenced by the recipe's windows:
+/// writes `<stem>.slmask-<digest8>.png` next to `img` and sets
+/// `mask_file`. Returns the number of bitmaps bound.
+pub fn apply_blob_masks(
+    blobs: &std::collections::HashMap<String, MaskBlob>,
+    r: &mut crate::recipe::Recipe,
+    img: &Path,
+) -> usize {
+    let mut n = 0;
+    let Some(dir) = img.parent() else {
+        return 0;
+    };
+    let stem = img
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("img")
+        .to_string();
+    for w in &mut r.windows {
+        if w.mask_digest.is_empty() || !w.mask_file.is_empty() {
+            continue;
+        }
+        let Some(mb) = blobs.get(&w.mask_digest.to_ascii_uppercase()) else {
+            continue;
+        };
+        let Some((mw, mh, px)) = decode_mask_blob(mb) else {
+            continue;
+        };
+        let name = format!(
+            "{stem}.slmask-{}.png",
+            &w.mask_digest[..8.min(w.mask_digest.len())]
+        );
+        let out = dir.join(&name);
+        if image::save_buffer(&out, &px, mw, mh, image::ColorType::L8).is_ok() {
+            w.mask_file = name;
+            n += 1;
+        }
+    }
+    // serial stages can carry masked corrections too
+    for s in &mut r.stages {
+        n += apply_blob_masks(blobs, &mut s.params, img);
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
 // Lua settings blob -> XMP document
 // ---------------------------------------------------------------------------
 
@@ -744,5 +1010,88 @@ mod tests {
         assert!((c[2] - 0.2).abs() < 1e-4);
         assert!((c[0] - 0.212).abs() < 1e-3); // +3 diameters
         assert!((c[1] - c[3]).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    /// catalog Lua → XMP → window: MaskDigest/Origin/WholeImageArea carry
+    /// the blob-store binding and the bitmap's mask-space geometry.
+    #[test]
+    fn lua_mask_digest_and_geometry() {
+        let r = crate::xmp::crs_to_recipe(&lua_to_xmp(
+            "s = { MaskGroupBasedCorrections = { { CorrectionActive = true, \
+             CorrectionAmount = 1, LocalExposure2012 = -0.5, What = \"Correction\", \
+             CorrectionMasks = { { MaskSubType = 1, MaskValue = 1, \
+             What = \"Mask/Image\", MaskDigest = \"07AAE06235F86CE296BFE0189999E42A\", \
+             Origin = \"444,20\", \
+             WholeImageArea = \"0/1,0/1,1920/1,2879/1\" } } } } }",
+        ));
+        assert_eq!(r.windows.len(), 1);
+        let w = &r.windows[0];
+        assert_eq!(w.kind, "subject");
+        assert_eq!(w.mask_digest, "07AAE06235F86CE296BFE0189999E42A");
+        assert_eq!(w.mask_org, [444.0, 20.0]);
+        assert_eq!(w.mask_area, [2879.0, 1920.0]);
+    }
+
+    /// MaskDigest → SST record [1, blob_file_no, off, len] → embedded TIFF
+    /// in NNNNNN.blob decodes to the stored grayscale matte.
+    #[test]
+    fn sst_digest_to_blob_tiff() {
+        // 2x2 L8 TIFF via the image encoder
+        let mut tiff = Vec::new();
+        image::DynamicImage::ImageLuma8(
+            image::GrayImage::from_raw(2, 2, vec![0, 200, 120, 255]).unwrap(),
+        )
+        .write_to(
+            &mut std::io::Cursor::new(&mut tiff),
+            image::ImageFormat::Tiff,
+        )
+        .unwrap();
+
+        let tmp = std::env::temp_dir().join(format!("sl_blob_{}", std::process::id()));
+        let data_dir = tmp.join("cat.lrcat-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(tmp.join("cat.lrcat"), b"").unwrap();
+        // blob record: 16B header + TIFF payload (value off = 0 → +16)
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&tiff);
+        std::fs::write(data_dir.join("000042.blob"), &blob).unwrap();
+        // SST record: [shared=0, key_len=40, vlen] key trailer + [1,fno,off,len]
+        let mut sst = Vec::new();
+        sst.push(0u8);
+        sst.push(40u8);
+        // value len covers the whole blob record (16B header + payload);
+        // varint-encode each field properly (len may exceed 127)
+        let mut val = vec![1u8, 42u8, 0u8];
+        let mut l = 16 + tiff.len() as u64;
+        loop {
+            let mut b = (l & 0x7f) as u8;
+            l >>= 7;
+            if l > 0 {
+                b |= 0x80;
+            }
+            val.push(b);
+            if l == 0 {
+                break;
+            }
+        }
+        sst.push(val.len() as u8);
+        sst.extend_from_slice(b"07AAE06235F86CE296BFE0189999E42A");
+        sst.extend_from_slice(&[0x11, 0, 0, 0, 0, 0, 0, 0]);
+        sst.extend_from_slice(&val);
+        std::fs::write(data_dir.join("000001.sst"), &sst).unwrap();
+
+        let idx = blob_index(&tmp.join("cat.lrcat"));
+        let mb = idx
+            .get("07AAE06235F86CE296BFE0189999E42A")
+            .expect("digest resolves via SST");
+        let (w, h, px) = decode_mask_blob(mb).expect("TIFF decodes");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![0, 200, 120, 255]);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

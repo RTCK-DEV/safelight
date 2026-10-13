@@ -196,6 +196,11 @@ pub struct Params {
     /// LR camera calibration: 3x3 chroma-rotation matrix (row-major 9)
     /// + shadow green/magenta tint [9..12]
     pub calib: [f32; 12],
+    /// real AI-mask bitmaps extracted from the catalog `.lrcat-data` blob
+    /// store: index-aligned with win flag 1024 — win[21] is the slot here.
+    /// Each carries the affine from post-crop normalized (nx,ny) into the
+    /// bitmap's (u,v): u = nx*ax + bx.
+    pub wmats: Vec<WMatte>,
     /// LR Lens Blur amount 0..1 — defocus blend gated by (1-subject matte)
     pub lens_blur: f32,
     /// [highlight_boost, highlight_thresh, aspect, shape, spherical_ab]
@@ -1005,6 +1010,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut wins = [[0.0; 24]; 16];
     let mut refines = [[0.0; 6]; 16];
     let mut lpcs = [[0.0; 41]; 16];
+    let mut wmats: Vec<WMatte> = Vec::new();
     for (i, w) in r.windows.iter().take(16).enumerate() {
         refines[i] = w.refine;
         let mut n = 0usize;
@@ -1102,6 +1108,72 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             0.0,
             0.0,
         ];
+        // real LR AI-mask bitmap (extracted .lrcat-data blob → PNG beside
+        // the sidecar): supersedes the heuristic kind matte entirely.
+        // Mask space = WholeImageArea in *sensor* orientation; the TIFF
+        // covers a bbox at mask_org. Post-crop nx,ny → display-frame
+        // (dx,dy) → mask-space px via the dcraw flip code → bitmap u,v:
+        //   dx = crop_l + nx*sw, mx_px = f(dx,dy)*area_w - org_x, u = /bw
+        if !w.mask_file.is_empty() && w.mask_area[0] > 1.0 && w.mask_area[1] > 1.0 {
+            if let Some(bm) = load_mask_bitmap(&w.mask_file) {
+                let (aw, ah) = (w.mask_area[0], w.mask_area[1]);
+                let (ox, oy) = (w.mask_org[0], w.mask_org[1]);
+                let (bw, bh) = (bm.w as f32, bm.h as f32);
+                let (cl, ct) = (r.crop[0], r.crop[1]);
+                // display-normalized → mask-normalized per flip code,
+                // composed with the crop map into u = ux*nx+uy*ny+uc.
+                let (ux, uy, uc, vx, vy, vc) = match m.info.flip {
+                    3 => (
+                        // display = 180° rot: mx_n = 1-dx, my_n = 1-dy
+                        -sw * aw / bw,
+                        0.0,
+                        (aw * (1.0 - cl) - ox) / bw,
+                        0.0,
+                        -sh * ah / bh,
+                        (ah * (1.0 - ct) - oy) / bh,
+                    ),
+                    5 => (
+                        // display = 90° CCW: mx_n = 1-dy, my_n = dx
+                        0.0,
+                        -sh * aw / bw,
+                        (aw * (1.0 - ct) - ox) / bw,
+                        sw * ah / bh,
+                        0.0,
+                        (cl * ah - oy) / bh,
+                    ),
+                    6 => (
+                        // display = 90° CW: mx_n = dy, my_n = 1-dx
+                        0.0,
+                        sh * aw / bw,
+                        (ct * aw - ox) / bw,
+                        -sw * ah / bh,
+                        0.0,
+                        (ah * (1.0 - cl) - oy) / bh,
+                    ),
+                    _ => (
+                        sw * aw / bw,
+                        0.0,
+                        (cl * aw - ox) / bw,
+                        0.0,
+                        sh * ah / bh,
+                        (ct * ah - oy) / bh,
+                    ),
+                };
+                // flag 1024 + clear the heuristic kind bits (16..512); keep
+                // invert(2)/link_q(8)
+                wins[i][0] = ((wins[i][0] as i32 & 0b1011) | 1024) as f32;
+                wins[i][21] = wmats.len() as f32;
+                wmats.push(WMatte {
+                    m: bm,
+                    ux,
+                    uy,
+                    uc,
+                    vx,
+                    vy,
+                    vc,
+                });
+            }
+        }
     }
 
     // adjustment brushes → flattened segments + per-stroke records.
@@ -1364,6 +1436,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         has_qual: r.qh[1] > 0.0,
         wins,
         refines,
+        wmats,
         lpcs,
         n_wins: r.windows.len().min(16) as u32,
         zones: [
@@ -2999,10 +3072,27 @@ pub struct DenCache {
 
 /// AI subject matte (U-2-Net), stored u16 luma at a modest resolution —
 /// sampled bilinear in normalized coords, so any size works.
+#[derive(Debug, Clone)]
 pub struct Matte {
     pub data: Vec<u16>, // u16 luma, w*h
     pub w: usize,
     pub h: usize,
+}
+
+/// LR-computed AI mask bitmap (catalog .lrcat-data blob) bound to a window:
+/// the matte lives in LR's mask space (WholeImageArea, sensor orientation)
+/// and the TIFF covers the mask's bounding box at Origin. The affine maps
+/// post-crop normalized coords → bitmap-normalized (u,v):
+/// u = nx*ux + ny*uy + uc, v = nx*vx + ny*vy + vc.
+#[derive(Debug, Clone)]
+pub struct WMatte {
+    pub m: Matte,
+    pub ux: f32,
+    pub uy: f32,
+    pub uc: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub vc: f32,
 }
 
 pub fn develop_cpu_ctx(
@@ -3746,6 +3836,7 @@ fn finish_linear(
                             sky,
                             veg,
                             &sp.wins[..sp.n_wins as usize],
+                            &sp.wmats,
                         ) * win[10];
                         if (win[0] as i32) & 8 != 0 {
                             m2 *= qual_mask(col, sp);
@@ -4004,6 +4095,7 @@ fn local_ops(
             sky,
             veg,
             &p.wins[..p.n_wins as usize],
+            &p.wmats,
         ) * win[10];
         // link_q: gate the window by the HSL qualifier matte
         if (win[0] as i32) & 8 != 0 {
@@ -4250,12 +4342,29 @@ fn window_mask(
     sky: Option<&Matte>,
     veg: Option<&Matte>,
     wins: &[[f32; 24]],
+    wmats: &[WMatte],
 ) -> f32 {
     let base = w[0] as i32;
     let kind = base % 2;
     let inv = base & 2 != 0;
     let lum = base & 4 != 0;
-    let mask = if base & 16 != 0 {
+    let mask = if base & 1024 != 0 {
+        // real LR AI-mask bitmap (extracted catalog blob): affine-map the
+        // post-crop normalized coords into the bbox and bilinear-sample.
+        // Pixels outside the TIFF bbox are mask=0.
+        wmats
+            .get(w[21] as usize)
+            .map(|t| {
+                let u = nx * t.ux + ny * t.uy + t.uc;
+                let v = nx * t.vx + ny * t.vy + t.vc;
+                if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                    matte_bil(&t.m, u, v)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0)
+    } else if base & 16 != 0 {
         // AI subject matte: bilinear sample in normalized dst coords
         subj.map(|m| matte_bil(m, nx, ny)).unwrap_or(0.0)
     } else if base & 64 != 0 {
@@ -4536,6 +4645,21 @@ fn lens_blur_img(
         }
     }
     (out, mw, mh)
+}
+
+/// load an extracted LR AI-mask bitmap (PNG written next to the sidecar
+/// during `lrcat` import) as a u16 luma matte
+fn load_mask_bitmap(path: &str) -> Option<Matte> {
+    let img = image::open(path).ok()?.to_luma16();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(Matte {
+        data: img.into_raw(),
+        w: w as usize,
+        h: h as usize,
+    })
 }
 
 /// bilinear sample of the AI subject matte at normalized coords; 0 when empty
@@ -5097,13 +5221,158 @@ mod tests {
         w[6] = 0.4;
         w[10] = 1.0;
         // centre of the prior → mask ≈ 1
-        assert!(window_mask(&w, &[0.0; 6], 0.5, 0.3, [0.5; 3], Some(&m), None, None, &[]) > 0.9);
+        assert!(
+            window_mask(
+                &w,
+                &[0.0; 6],
+                0.5,
+                0.3,
+                [0.5; 3],
+                Some(&m),
+                None,
+                None,
+                &[],
+                &[]
+            ) > 0.9
+        );
         // far outside the ellipse → ≈ 0
-        assert!(window_mask(&w, &[0.0; 6], 0.5, 0.8, [0.5; 3], Some(&m), None, None, &[]) < 0.05);
+        assert!(
+            window_mask(
+                &w,
+                &[0.0; 6],
+                0.5,
+                0.8,
+                [0.5; 3],
+                Some(&m),
+                None,
+                None,
+                &[],
+                &[]
+            ) < 0.05
+        );
         // no subject matte → no mask at all
         assert_eq!(
-            window_mask(&w, &[0.0; 6], 0.5, 0.3, [0.5; 3], None, None, None, &[]),
+            window_mask(
+                &w,
+                &[0.0; 6],
+                0.5,
+                0.3,
+                [0.5; 3],
+                None,
+                None,
+                None,
+                &[],
+                &[]
+            ),
             0.0
+        );
+    }
+
+    /// LR catalog AI-mask bitmap (flag 1024): the WMatte affine maps
+    /// post-crop nx,ny into the stored TIFF bbox; outside it the mask is 0
+    /// and the heuristic kind bits are ignored entirely.
+    #[test]
+    fn window_mask_bitmap_matte() {
+        // 2x2 matte: left column 0, right column full
+        let wm = WMatte {
+            m: Matte {
+                w: 2,
+                h: 2,
+                data: vec![0, 65535, 0, 65535],
+            },
+            ux: 1.0,
+            uy: 0.0,
+            uc: 0.0,
+            vx: 0.0,
+            vy: 1.0,
+            vc: 0.0,
+        };
+        let mut w = [0.0f32; 24];
+        w[0] = 1024.0 + 32.0; // bitmap + a leftover "sky" bit (ignored)
+        w[21] = 0.0;
+        let call = |nx, ny| {
+            window_mask(
+                &w,
+                &[0.0; 6],
+                nx,
+                ny,
+                [0.5; 3],
+                None,
+                None,
+                None,
+                &[w],
+                std::slice::from_ref(&wm),
+            )
+        };
+        assert!(call(0.9, 0.5) > 0.9, "right side of bitmap");
+        assert!(call(0.1, 0.5) < 0.1, "left side of bitmap");
+        // rotated affine (90°: u = ny): the same matte gates by ny instead
+        let wm_rot = WMatte {
+            m: wm.m.clone(),
+            ux: 0.0,
+            uy: 1.0,
+            uc: 0.0,
+            vx: -1.0,
+            vy: 0.0,
+            vc: 1.0,
+        };
+        let call_rot = |nx, ny| {
+            window_mask(
+                &w,
+                &[0.0; 6],
+                nx,
+                ny,
+                [0.5; 3],
+                None,
+                None,
+                None,
+                &[w],
+                std::slice::from_ref(&wm_rot),
+            )
+        };
+        assert!(call_rot(0.5, 0.9) > 0.9, "bottom edge maps u→1");
+        assert!(call_rot(0.5, 0.1) < 0.1, "top edge maps u→0");
+        // affine pushing the sample outside [0,1] → mask 0 (bbox edge)
+        let wm_off = WMatte {
+            m: wm.m.clone(),
+            ux: 1.0,
+            uy: 0.0,
+            uc: -2.0, // bbox starts off-frame right
+            vx: 0.0,
+            vy: 1.0,
+            vc: 0.0,
+        };
+        assert_eq!(
+            window_mask(
+                &w,
+                &[0.0; 6],
+                0.5,
+                0.5,
+                [0.5; 3],
+                None,
+                None,
+                None,
+                &[w],
+                std::slice::from_ref(&wm_off),
+            ),
+            0.0
+        );
+        // invert flag still applies on top of the bitmap
+        let mut wi = w;
+        wi[0] += 2.0;
+        assert!(
+            window_mask(
+                &wi,
+                &[0.0; 6],
+                0.1,
+                0.5,
+                [0.5; 3],
+                None,
+                None,
+                None,
+                &[w],
+                std::slice::from_ref(&wm),
+            ) > 0.9
         );
     }
 
@@ -5223,6 +5492,104 @@ mod tests {
         // degenerate: zero-width outer edge = step
         assert_eq!(trap01(0.3, 0.4, 0.4, 0.6, 0.6), 0.0);
         assert_eq!(trap01(0.5, 0.4, 0.4, 0.6, 0.6), 1.0);
+    }
+
+    /// minimal mosaic fixture for build_params tests
+    fn fake_mosaic(make: &str, iso: f32) -> Mosaic {
+        Mosaic {
+            data: Vec::new(),
+            raw_w: 0,
+            raw_h: 0,
+            left: 0,
+            top: 0,
+            w: 0,
+            h: 0,
+            black: [0.0; 4],
+            maximum: 16383,
+            baseline_exposure: 0.0,
+            linear_max: [0; 4],
+            cam_mul: [1.0; 4],
+            cam_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0; 3]],
+            rgb_cam: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            pre_mul: [1.0; 4],
+            cfa: crate::decode::CfaPattern {
+                w: 2,
+                h: 2,
+                cells: vec![0, 1, 1, 2],
+            },
+            info: crate::decode::CameraInfo {
+                make: make.to_string(),
+                model: String::new(),
+                lens: String::new(),
+                iso,
+                shutter: 0.0,
+                aperture: 0.0,
+                focal: 0.0,
+                timestamp: 0,
+                flip: 0,
+            },
+            dng_ops: None,
+        }
+    }
+
+    /// Sony expanded-LOW ISO: ACR pulls the baseline by log2(iso/100) — the
+    /// sensor exposes at native ISO and the file is tagged down. Verified
+    /// against LR previews of ISO50 files (MAE ~4x better with the pull).
+    /// Gated to Sony so native-ISO64 bodies (Nikon D850, Fuji GFX) keep 1.0.
+    #[test]
+    fn iso_pull_sony_expanded_low() {
+        let r = Recipe::default();
+        let s50 = build_params(&fake_mosaic("SONY", 50.0), &r, None);
+        assert!(
+            (s50.exposure_mul - 0.5).abs() < 0.01,
+            "{}",
+            s50.exposure_mul
+        );
+        // native base ISO and non-Sony sub-100 are untouched
+        let s100 = build_params(&fake_mosaic("SONY", 100.0), &r, None);
+        assert!(
+            (s100.exposure_mul - 1.0).abs() < 0.01,
+            "{}",
+            s100.exposure_mul
+        );
+        let n64 = build_params(&fake_mosaic("NIKON", 64.0), &r, None);
+        assert!(
+            (n64.exposure_mul - 1.0).abs() < 0.01,
+            "{}",
+            n64.exposure_mul
+        );
+    }
+
+    /// ACR PV2012 tone compensation: catalog images get an empirical
+    /// ours→LR transfer folded into the recipe LUT — strong toe lift, mild
+    /// shoulder. PV11 gets it full strength, PV15 half, and it tapers with
+    /// |Exposure2012| (a large user push already relocates the scene).
+    #[test]
+    fn pv2012_compensation_blends_into_lut() {
+        let m = fake_mosaic("SONY", 100.0);
+        let toe_idx = 2; // low end of the 256-entry lut
+        let lut_at = |r: &Recipe| build_params(&m, r, None).lut[toe_idx];
+        let base = lut_at(&Recipe::default()); // pv=0 → untouched
+        let mut r11 = Recipe::default();
+        r11.process_version = 11.0;
+        let mut r15 = Recipe::default();
+        r15.process_version = 15.4;
+        let lift11 = lut_at(&r11) - base;
+        let lift15 = lut_at(&r15) - base;
+        assert!(lift11 > 0.01, "pv11 toe not lifted: {lift11}");
+        assert!(
+            lift15 > 0.0 && lift15 < lift11,
+            "pv15 weaker: {lift15} vs {lift11}"
+        );
+        // exposure taper: +2EV shrinks the compensation
+        let mut r11e = r11.clone();
+        r11e.exposure = 2.0;
+        let lift11e = lut_at(&r11e) - base;
+        assert!(lift11e < lift11, "exposure taper: {lift11e} vs {lift11}");
     }
 
     /// diagnostic (needs the local RAW collection): stage means through the

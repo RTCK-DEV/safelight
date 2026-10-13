@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use safelight_core::{Engine, Recipe};
@@ -122,17 +122,41 @@ fn main() -> Result<()> {
                 .find_map(|a| a.strip_prefix("--limit="))
                 .and_then(|v| v.parse().ok());
             let grep = args.iter().find_map(|a| a.strip_prefix("--grep="));
-            let mut list = safelight_core::lrcat::entries(Path::new(&args[2]))?;
+            // catalog stores the volume it was created on; remap when files
+            // moved (e.g. --root=D:/カメラ/RAW/=G:/カメラ/RAW_alpha7R3/2023/)
+            let remap: Vec<(&str, &str)> = args
+                .iter()
+                .filter_map(|a| a.strip_prefix("--root="))
+                .filter_map(|s| s.split_once('='))
+                .collect();
+            let cat_path = Path::new(&args[2]);
+            let mut list = safelight_core::lrcat::entries(cat_path)?;
+            for e in &mut list {
+                for (from, to) in &remap {
+                    let p = e.path.to_string_lossy().replace('\\', "/");
+                    if let Some(rest) = p.strip_prefix(from) {
+                        e.path = PathBuf::from(format!("{to}{rest}"));
+                    }
+                }
+            }
             if let Some(g) = grep {
                 list.retain(|e| e.path.to_string_lossy().contains(g));
             }
             if let Some(n) = limit {
                 list.truncate(n);
             }
+            // LR's computed AI-mask bitmaps live in <catalog>.lrcat-data/*.blob
+            // keyed by MaskDigest — index once, extract per image on apply.
+            let blobs = if apply {
+                safelight_core::lrcat::blob_index(cat_path)
+            } else {
+                Default::default()
+            };
             let mut n_disk = 0usize;
             let mut n_edits = 0usize;
             let mut n_write = 0usize;
-            for e in &list {
+            let mut n_masks = 0usize;
+            for e in &mut list {
                 if !e.path.exists() {
                     continue;
                 }
@@ -146,6 +170,11 @@ fn main() -> Result<()> {
                 }
                 n_edits += 1;
                 if apply {
+                    n_masks += safelight_core::lrcat::apply_blob_masks(
+                        &blobs,
+                        &mut e.sidecar.recipe,
+                        &e.path,
+                    );
                     let sp = safelight_core::recipe::sidecar_path_for(&e.path);
                     std::fs::write(&sp, serde_json::to_string_pretty(&e.sidecar)?)
                         .with_context(|| format!("write {}", sp.display()))?;
@@ -158,7 +187,7 @@ fn main() -> Result<()> {
                 n_disk,
                 n_edits,
                 if apply {
-                    format!("{n_write} sidecars written")
+                    format!("{n_write} sidecars written, {n_masks} mask bitmaps extracted")
                 } else {
                     "dry run — pass --apply".into()
                 }

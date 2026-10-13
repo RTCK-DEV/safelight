@@ -162,6 +162,10 @@ struct Uni {
     pp0: [f32; 4],
     pp1: [f32; 4],
     pp2: [f32; 4],
+    /// LR bitmap-mask mattes (flag 1024): 3 vec4 per matte index j —
+    /// [w, h, wmbuf word offset, 0], u-row [ux, uy, uc, 0], v-row
+    /// [vx, vy, vc, 0] mapping post-crop nx,ny → bitmap u,v. w==0 = none.
+    wmeta: [[f32; 4]; 48],
 }
 
 const WGSL: &str = r#"
@@ -266,6 +270,8 @@ struct Uni {
     pp0: vec4<f32>,
     pp1: vec4<f32>,
     pp2: vec4<f32>,
+    // LR bitmap-mask mattes: per matte index [w,h,wmbuf off,0] + 2x3 affine
+    wmeta: array<vec4<f32>, 48>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -285,6 +291,8 @@ struct Uni {
 // profile look table (HsMap): [hd, sd, vd] then cells of
 // [hue_shift_deg, sat_scale, val_scale] in (h,s,v) order, val fastest
 @group(0) @binding(18) var<storage, read> lookbuf: array<f32>;
+// flat packed-u16 store for LR bitmap mask mattes (indexed via pg.wmeta)
+@group(0) @binding(19) var<storage, read> wmbuf: array<u32>;
 // lens blur: matte-res defocused copy of the linear image,
 // [0].xy = (mw,mh), data at [1..]
 @group(0) @binding(17) var<storage, read_write> lbl: array<vec4<f32>>;
@@ -965,6 +973,39 @@ fn subj_bil(nx: f32, ny: f32) -> f32 {
     let ty = fy - f32(y0);
     let a = mix(subj_at(x0, y0), subj_at(x0 + 1, y0), tx);
     let b = mix(subj_at(x0, y0 + 1), subj_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
+// LR bitmap mask matte (extracted .lrcat-data blob): flat wmbuf, per-matte
+// [w,h,word_off,0] + 2x3 affine rows in pg.wmeta (mirrors WMatte in
+// develop.rs). u16 luma packed 2-per-u32.
+fn wmat_at(mt: vec4<f32>, ix: i32, iy: i32) -> f32 {
+    let w = i32(mt.x);
+    let h = i32(mt.y);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = wmbuf[u32(mt.z) + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn wmat_bil(mi: u32, nx: f32, ny: f32) -> f32 {
+    let mt = pg.wmeta[mi * 3u];
+    if (mt.x < 1.0) { return 0.0; }
+    let ru = pg.wmeta[mi * 3u + 1u];
+    let rv = pg.wmeta[mi * 3u + 2u];
+    let u = nx * ru.x + ny * ru.y + ru.z;
+    let v = nx * rv.x + ny * rv.y + rv.z;
+    if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) { return 0.0; }
+    let fx = u * mt.x - 0.5;
+    let fy = v * mt.y - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(wmat_at(mt, x0, y0), wmat_at(mt, x0 + 1, y0), tx);
+    let b = mix(wmat_at(mt, x0, y0 + 1), wmat_at(mt, x0 + 1, y0 + 1), tx);
     return mix(a, b, ty);
 }
 
@@ -2055,7 +2096,11 @@ fn win_mask(wi: u32, w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f
     let kb = u32(w2.y);
     let kind = kb & 1u;
     var mask = 0.0;
-    if ((kb & 16u) != 0u) {
+    if ((kb & 1024u) != 0u) {
+        // real LR AI-mask bitmap — supersedes every heuristic kind matte.
+        // wins[wi*6+5].y carries this window's matte index.
+        mask = wmat_bil(u32(pg.wins[wi * 6u + 5u].y), nx, ny);
+    } else if ((kb & 16u) != 0u) {
         mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
     } else if ((kb & 64u) != 0u) {
         // LR person-part mask (MaskSubType=3): subject matte gated by a
@@ -2551,7 +2596,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..19)
+                entries: &(0..20)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -2902,7 +2947,8 @@ impl Gpu {
                     a[i * 6 + 2] = [w[9], w[0], w[10], w[11]];
                     a[i * 6 + 3] = [w[12], w[13], w[14], w[15]];
                     a[i * 6 + 4] = [w[16], w[17], w[18], w[19]];
-                    a[i * 6 + 5] = [w[20], 0.0, 0.0, 0.0];
+                    // .y = bitmap-mask matte index (flag 1024)
+                    a[i * 6 + 5] = [w[20], w[21], 0.0, 0.0];
                 }
                 a
             },
@@ -3072,12 +3118,36 @@ impl Gpu {
                 p.post_profile[2][2],
                 0.0,
             ],
+            wmeta: [[0.0; 4]; 48],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
         // a stats-free params build produces identical segments to the main
         // pass's params below.
         let p0 = build_params(m, r, None);
+        // LR bitmap-mask mattes (flag 1024): one flat packed-u16 store for
+        // the base params + every stage; each Uni's wmeta records [w,h,off]
+        // + the post-crop→bitmap affine per matte index.
+        let mut wmbuf32: Vec<u32> = vec![0];
+        let pack_wmats = |wmats: &[crate::develop::WMatte], buf: &mut Vec<u32>| -> [[f32; 4]; 48] {
+            let mut a = [[0.0f32; 4]; 48];
+            for (j, t) in wmats.iter().take(16).enumerate() {
+                let off = buf.len();
+                for px in t.m.data.chunks(2) {
+                    buf.push(px[0] as u32 | ((px.get(1).copied().unwrap_or(0) as u32) << 16));
+                }
+                a[j * 3] = [t.m.w as f32, t.m.h as f32, off as f32, 0.0];
+                a[j * 3 + 1] = [t.ux, t.uy, t.uc, 0.0];
+                a[j * 3 + 2] = [t.vx, t.vy, t.vc, 0.0];
+            }
+            a
+        };
+        let wm_main = pack_wmats(&p0.wmats, &mut wmbuf32);
+        let wm_stages: Vec<[[f32; 4]; 48]> = p0
+            .stages
+            .iter()
+            .map(|(sp, _, _)| pack_wmats(&sp.wmats, &mut wmbuf32))
+            .collect();
         let mut segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
         // per-stage segments appended; each stage Uni records its vec4 base
         let mut stg_seg_base: Vec<f32> = Vec::new();
@@ -3133,6 +3203,7 @@ impl Gpu {
             storage_in,
         );
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
+        let wm_b = mk_buf("wmbuf", bytemuck::cast_slice(&wmbuf32), storage_in);
         // lens blur: matte-res defocused copy (header vec4 + 192² pixels)
         let lbl_b = mk_buf("lblbuf", &vec![0u8; (1 + 192 * 192) * 16], storage_in);
         // HSV shift maps + profile tone: [look dims+cells][256 tone][hsm
@@ -3180,7 +3251,7 @@ impl Gpu {
 
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> = [
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
             ]
             .iter()
             .map(|&i| wgpu::BindGroupEntry {
@@ -3204,6 +3275,7 @@ impl Gpu {
                     15 => dng_b.as_entire_binding(),
                     16 => sky_b.as_entire_binding(),
                     17 => lbl_b.as_entire_binding(),
+                    19 => wm_b.as_entire_binding(),
                     _ => look_b.as_entire_binding(),
                 },
             })
@@ -3354,6 +3426,7 @@ impl Gpu {
         self.queue
             .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         let mut u_main = mk_uni(&p, 0);
+        u_main.wmeta = wm_main;
         u_main.stg0 = [p.stages.len() as f32, 0.0, 0.0, 0.0];
         for (i, (_, sop, sinv)) in p.stages.iter().enumerate() {
             u_main.sop0[i] = *sop;
@@ -3380,6 +3453,7 @@ impl Gpu {
                 .enumerate()
                 .map(|(i, (sp, _, _))| {
                     let mut uu = mk_uni(sp, 0);
+                    uu.wmeta = wm_stages.get(i).copied().unwrap_or([[0.0; 4]; 48]);
                     uu.misc3 = [
                         slut0 as f32 + i as f32 * LUT_N as f32,
                         1.0,

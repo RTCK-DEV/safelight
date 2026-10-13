@@ -88,6 +88,19 @@ impl Engine {
 
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
+        // extracted LR mask bitmaps sit next to the image as
+        // <stem>.slmask-<digest>.png — make them absolute so the renderer
+        // can load them regardless of the caller's cwd.
+        let mut owned;
+        let recipe = if recipe_needs_mask_dir(recipe) {
+            owned = recipe.clone();
+            if let Some(dir) = path.parent() {
+                absolutize_mask_files(&mut owned, dir);
+            }
+            &owned
+        } else {
+            recipe
+        };
         // AI-denoised base (SCUNet): only loaded when the recipe asks for it.
         let den = if recipe.ai_denoise > 0.001 {
             load_denoise_cache(path)
@@ -543,6 +556,27 @@ impl Engine {
             "assets" => Ok(json!(self.catalog.assets(&path()?)?)),
             _ => anyhow::bail!("unknown library op: {op}"),
         }
+    }
+}
+
+/// any window (incl. serial-stage recipes) references an extracted LR mask
+/// bitmap that still needs path resolution
+fn recipe_needs_mask_dir(r: &Recipe) -> bool {
+    r.windows.iter().any(|w| !w.mask_file.is_empty())
+        || r.stages
+            .iter()
+            .any(|s| s.enabled && recipe_needs_mask_dir(&s.params))
+}
+
+/// make every window's relative mask_file absolute under `dir`
+fn absolutize_mask_files(r: &mut Recipe, dir: &Path) {
+    for w in &mut r.windows {
+        if !w.mask_file.is_empty() && !Path::new(&w.mask_file).is_absolute() {
+            w.mask_file = dir.join(&w.mask_file).to_string_lossy().into_owned();
+        }
+    }
+    for s in &mut r.stages {
+        absolutize_mask_files(&mut s.params, dir);
     }
 }
 
