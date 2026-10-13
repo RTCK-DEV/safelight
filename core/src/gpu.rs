@@ -166,6 +166,9 @@ struct Uni {
     /// [w, h, wmbuf word offset, 0], u-row [ux, uy, uc, 0], v-row
     /// [vx, vy, vc, 0] mapping post-crop nx,ny → bitmap u,v. w==0 = none.
     wmeta: [[f32; 4]; 48],
+    /// LR PatchMatch remove spots: 3 vec4 per spot —
+    /// [dst_x0, dst_y0, pw, ph], [ell cx, cy, rx, ry], [pmbuf base, opacity, 0, 0].
+    pm: [[f32; 4]; 36],
 }
 
 const WGSL: &str = r#"
@@ -272,6 +275,9 @@ struct Uni {
     pp2: vec4<f32>,
     // LR bitmap-mask mattes: per matte index [w,h,wmbuf off,0] + 2x3 affine
     wmeta: array<vec4<f32>, 48>,
+    // LR PatchMatch remove spots: 3 vec4 per spot —
+    // [dst x0,y0, pw,ph] [ellipse cx,cy,rx,ry] [pmbuf base, opacity, 0,0]
+    pm: array<vec4<f32>, 36>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -293,6 +299,8 @@ struct Uni {
 @group(0) @binding(18) var<storage, read> lookbuf: array<f32>;
 // flat packed-u16 store for LR bitmap mask mattes (indexed via pg.wmeta)
 @group(0) @binding(19) var<storage, read> wmbuf: array<u32>;
+// LR PatchMatch source maps: src vec2 per patch px (indexed via pg.pm)
+@group(0) @binding(20) var<storage, read> pmbuf: array<vec2<f32>>;
 // lens blur: matte-res defocused copy of the linear image,
 // [0].xy = (mw,mh), data at [1..]
 @group(0) @binding(17) var<storage, read_write> lbl: array<vec4<f32>>;
@@ -1171,6 +1179,46 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
             let blend = 1.0 - sstep(0.7, 1.0, d);
             c = mix(c, sv + acc, blend);
         }
+    }
+    // LR PatchMatch remove spots: per-pixel source coords from pmbuf
+    // (mirrors pm_heal_lin in develop.rs — keep in sync)
+    for (var s = 0u; s < 12u; s = s + 1u) {
+        let pr = pg.pm[s * 3u];
+        if (pr.z <= 0.0) { continue; }
+        let pxf = vec2<f32>(f32(i % w), f32(i / w));
+        let sc = pg.pm[s * 3u + 2u].z;
+        let lx = i32(floor((pxf.x - pr.x) / sc));
+        let ly = i32(floor((pxf.y - pr.y) / sc));
+        if (lx < 0 || ly < 0 || lx >= i32(pr.z) || ly >= i32(pr.w)) { continue; }
+        let base = u32(pg.pm[s * 3u + 2u].x);
+        let own = pmbuf[base + u32(ly) * u32(pr.z) + u32(lx)];
+        let ep = pg.pm[s * 3u + 1u];
+        let dd = length(vec2<f32>(
+            (pxf.x - ep.x) / max(ep.z, 1.0),
+            (pxf.y - ep.y) / max(ep.w, 1.0),
+        ));
+        let blend = (1.0 - sstep(0.7, 1.0, dd)) * pg.pm[s * 3u + 2u].y;
+        if (blend <= 0.0) { continue; }
+        let tap_r = (ep.z + ep.w) * 0.25;
+        var acc = vec3<f32>(0.0);
+        for (var k = 0u; k < 9u; k = k + 1u) {
+            var tp = pxf;
+            if (k > 0u) {
+                let a = f32(k - 1u) * 6.2832 / 8.0;
+                tp = pxf + vec2<f32>(cos(a), sin(a)) * tap_r;
+            }
+            var so = own;
+            let tx = i32(floor((tp.x - pr.x) / sc));
+            let ty = i32(floor((tp.y - pr.y) / sc));
+            if (tx >= 0 && ty >= 0 && tx < i32(pr.z) && ty < i32(pr.w)) {
+                so = pmbuf[base + u32(ty) * u32(pr.z) + u32(tx)];
+            }
+            let t = px_at(i32(tp.x + 0.5), i32(tp.y + 0.5));
+            let svv = px_at(i32(so.x + 0.5), i32(so.y + 0.5));
+            acc = acc + (t - svv) / 9.0;
+        }
+        let sv = px_at(i32(own.x + 0.5), i32(own.y + 0.5));
+        c = mix(c, sv + acc, blend);
     }
     // clone stamps: copy the source patch into the destination circle
     let nc = u32(pg.misc2.y);
@@ -2596,7 +2644,7 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..20)
+                entries: &(0..21)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -3119,6 +3167,7 @@ impl Gpu {
                 0.0,
             ],
             wmeta: [[0.0; 4]; 48],
+            pm: [[0.0; 4]; 36],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
@@ -3143,6 +3192,36 @@ impl Gpu {
             a
         };
         let wm_main = pack_wmats(&p0.wmats, &mut wmbuf32);
+        // LR PatchMatch remove spots: one flat vec2 store of per-patch-px
+        // source coords; each Uni's pm record indexes it via pm[3i+2].x.
+        // pm coords are sensor px — scale into the virtual frame (g2 = vw).
+        let pm_sc = if p0.pm_frame[0] > 0.0 {
+            vw as f32 / p0.pm_frame[0]
+        } else {
+            1.0
+        };
+        let mut pmv: Vec<[f32; 2]> = vec![[0.0, 0.0]];
+        let pm_main = {
+            let mut a = [[0.0f32; 4]; 36];
+            for (i, m) in p0.pms.iter().take(12).enumerate() {
+                let base = pmv.len();
+                pmv.extend(
+                    m.src
+                        .iter()
+                        .take(m.pw * m.ph)
+                        .map(|s| [s[0] * pm_sc, s[1] * pm_sc]),
+                );
+                a[i * 3] = [m.dst[0] * pm_sc, m.dst[1] * pm_sc, m.pw as f32, m.ph as f32];
+                a[i * 3 + 1] = [
+                    m.ell[0] * pm_sc,
+                    m.ell[1] * pm_sc,
+                    m.ell[2] * pm_sc,
+                    m.ell[3] * pm_sc,
+                ];
+                a[i * 3 + 2] = [base as f32, m.opacity, pm_sc, 0.0];
+            }
+            a
+        };
         let wm_stages: Vec<[[f32; 4]; 48]> = p0
             .stages
             .iter()
@@ -3204,6 +3283,7 @@ impl Gpu {
         );
         let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
         let wm_b = mk_buf("wmbuf", bytemuck::cast_slice(&wmbuf32), storage_in);
+        let pm_b = mk_buf("pmbuf", bytemuck::cast_slice(&pmv), storage_in);
         // lens blur: matte-res defocused copy (header vec4 + 192² pixels)
         let lbl_b = mk_buf("lblbuf", &vec![0u8; (1 + 192 * 192) * 16], storage_in);
         // HSV shift maps + profile tone: [look dims+cells][256 tone][hsm
@@ -3251,7 +3331,7 @@ impl Gpu {
 
         let bind = |pipe: &Pipe| {
             let entries: Vec<wgpu::BindGroupEntry> = [
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
             ]
             .iter()
             .map(|&i| wgpu::BindGroupEntry {
@@ -3276,6 +3356,7 @@ impl Gpu {
                     16 => sky_b.as_entire_binding(),
                     17 => lbl_b.as_entire_binding(),
                     19 => wm_b.as_entire_binding(),
+                    20 => pm_b.as_entire_binding(),
                     _ => look_b.as_entire_binding(),
                 },
             })
@@ -3427,6 +3508,7 @@ impl Gpu {
             .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         let mut u_main = mk_uni(&p, 0);
         u_main.wmeta = wm_main;
+        u_main.pm = pm_main;
         u_main.stg0 = [p.stages.len() as f32, 0.0, 0.0, 0.0];
         for (i, (_, sop, sinv)) in p.stages.iter().enumerate() {
             u_main.sop0[i] = *sop;
@@ -3496,7 +3578,7 @@ impl Gpu {
         }
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.
-        if p.n_spots > 0 || p.n_clones > 0 {
+        if p.n_spots > 0 || p.n_clones > 0 || !p.pms.is_empty() {
             run(&mut enc, &self.heal, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }

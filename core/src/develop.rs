@@ -201,6 +201,13 @@ pub struct Params {
     /// Each carries the affine from post-crop normalized (nx,ny) into the
     /// bitmap's (u,v): u = nx*ax + bx.
     pub wmats: Vec<WMatte>,
+    /// LR PatchMatch remove spots: per-target-px absolute source coords
+    /// decoded from the catalog patchmap, sensor/lin px space.
+    pub pms: Vec<PmMap>,
+    /// frame the pm coords were authored in [w, h] — the raw's sensor dims
+    /// (or raster dims); `lin` may be a subsampled virtual frame, so the pm
+    /// pass scales coords by lin_w/pm_frame[0]. 0 = identity.
+    pub pm_frame: [f32; 2],
     /// LR Lens Blur amount 0..1 — defocus blend gated by (1-subject matte)
     pub lens_blur: f32,
     /// [highlight_boost, highlight_thresh, aspect, shape, spherical_ab]
@@ -1214,6 +1221,38 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         }
     }
 
+    // LR PatchMatch remove spots: decode the extracted 16-bit RGB patchmap
+    // into absolute source px (ch0,ch1 normalize into the search rect; ch2
+    // is refinement data we don't need). pm coords live in LR's frame
+    // (whole_image origin) — shift into lin px.
+    let mut pms: Vec<PmMap> = Vec::new();
+    for s in r.pm_spots.iter().take(12) {
+        if s.file.is_empty() {
+            continue;
+        }
+        let Some((pw, ph, src)) = load_pm_map(s) else {
+            continue;
+        };
+        let (ec, er) = frame_to_src(s.ellipse[0], s.ellipse[1], m.w, m.h, m.info.flip);
+        let (fw, fh) = match m.info.flip {
+            5 | 6 => (m.h as f32, m.w as f32),
+            _ => (m.w as f32, m.h as f32),
+        };
+        pms.push(PmMap {
+            src,
+            pw,
+            ph,
+            dst: [
+                s.target[0] - s.frame_org[0],
+                s.target[1] - s.frame_org[1],
+                s.target[2] - s.frame_org[0],
+                s.target[3] - s.frame_org[1],
+            ],
+            ell: [ec, er, s.ellipse[2] * fw, s.ellipse[3] * fh],
+            opacity: s.opacity.clamp(0.0, 1.0),
+        });
+    }
+
     // adjustment brushes → flattened segments + per-stroke records.
     // Strokes live in frame-normalized coords like windows; translate into
     // dst-normalized space here. Radius is a frame-height fraction → /sh.
@@ -1475,6 +1514,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         wins,
         refines,
         wmats,
+        pms,
+        pm_frame: [m.w as f32, m.h as f32],
         lpcs,
         n_wins: r.windows.len().min(16) as u32,
         zones: [
@@ -3122,6 +3163,19 @@ pub struct Matte {
 /// and the TIFF covers the mask's bounding box at Origin. The affine maps
 /// post-crop normalized coords → bitmap-normalized (u,v):
 /// u = nx*ux + ny*uy + uc, v = nx*vx + ny*vy + vc.
+/// decoded PatchMatch heal map: `src` = per-patch-px absolute source
+/// position (lin/virtual-src px), `dst` = target rect, `ell` = feather
+/// ellipse, all in lin px.
+#[derive(Debug, Clone)]
+pub struct PmMap {
+    pub src: Vec<[f32; 2]>,
+    pub pw: usize,
+    pub ph: usize,
+    pub dst: [f32; 4],
+    pub ell: [f32; 4],
+    pub opacity: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct WMatte {
     pub m: Matte,
@@ -3443,7 +3497,9 @@ fn develop_raster(
     } else {
         None
     };
-    let p = build_params(&fake, r, stats.as_ref());
+    let mut p = build_params(&fake, r, stats.as_ref());
+    // pm coords for a raster (e.g. enhanced DNG) live in its own pixel frame
+    p.pm_frame = [w as f32, h as f32];
     // raster is already sRGB-encoded u16: decode gamma to linear, adjust, re-encode
     let mut lin = vec![[0.0f32; 3]; w * h];
     for (i, px) in rgba.chunks_exact(4).enumerate() {
@@ -3632,6 +3688,87 @@ fn heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, spots: &[[f32; 4]; 8], n: 
     }
 }
 
+/// LR Remove (PatchMatch) spots: the catalog patchmap gives the exact
+/// per-pixel source LR computed; we apply it with the same
+/// frequency-separation blend as heal_lin (≈ the poisson seamless clone
+/// LR uses): healed = src + lowpass(target − src) over a box blur.
+fn pm_heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, pms: &[PmMap], frame: [f32; 2]) {
+    if pms.is_empty() {
+        return;
+    }
+    // pm coords are authored in sensor px; `lin` may be a virtual (subsampled)
+    // frame — scale coords into it and stride the patchmap lookup.
+    let sc = if frame[0] > 0.0 {
+        w as f32 / frame[0]
+    } else {
+        1.0
+    };
+    let orig = lin.to_vec();
+    let sample = |x: f32, y: f32| -> [f32; 3] {
+        let xi = (x.round() as i32).clamp(0, w as i32 - 1) as usize;
+        let yi = (y.round() as i32).clamp(0, h as i32 - 1) as usize;
+        orig[yi * w + xi]
+    };
+    // patch-space source lookup in lin px; taps outside the map reuse the
+    // pixel's own source — mirrors the gpu.rs pm loop (keep in sync).
+    let src_at = |pm: &PmMap, px: f32, py: f32, fb: [f32; 2]| -> [f32; 2] {
+        let lx = ((px - pm.dst[0] * sc) / sc).floor() as i32;
+        let ly = ((py - pm.dst[1] * sc) / sc).floor() as i32;
+        if lx >= 0 && ly >= 0 && lx < pm.pw as i32 && ly < pm.ph as i32 {
+            let s = pm.src[ly as usize * pm.pw + lx as usize];
+            [s[0] * sc, s[1] * sc]
+        } else {
+            fb
+        }
+    };
+    for pm in pms {
+        // iterate the dst rect in lin px — it may be smaller than pw×ph
+        let dw = ((pm.dst[2] - pm.dst[0]) * sc).round().max(1.0) as i32;
+        let dh = ((pm.dst[3] - pm.dst[1]) * sc).round().max(1.0) as i32;
+        let tap_r = (pm.ell[2] + pm.ell[3]) * 0.25 * sc; // half the mean radius
+        for y in 0..dh {
+            for x in 0..dw {
+                let (dx, dy) = (pm.dst[0] * sc + x as f32, pm.dst[1] * sc + y as f32);
+                // feathered coverage by the spot's ellipse
+                let d = ((dx - pm.ell[0] * sc) / (pm.ell[2] * sc).max(1.0))
+                    .hypot((dy - pm.ell[1] * sc) / (pm.ell[3] * sc).max(1.0));
+                let blend = (1.0 - sstep(0.7, 1.0, d)) * pm.opacity;
+                if blend <= 0.0 {
+                    continue;
+                }
+                let xi = dx.round() as i32;
+                let yi = dy.round() as i32;
+                if xi < 0 || yi < 0 || xi >= w as i32 || yi >= h as i32 {
+                    continue;
+                }
+                // low-freq diff = mean of (target-src) over centre + 8 taps
+                let own = src_at(pm, dx, dy, [dx, dy]);
+                let mut acc = [0.0f32; 3];
+                for k in 0..9 {
+                    let (tx, ty) = if k == 0 {
+                        (dx, dy)
+                    } else {
+                        let a = (k - 1) as f32 * std::f32::consts::TAU / 8.0;
+                        (dx + tap_r * a.cos(), dy + tap_r * a.sin())
+                    };
+                    let so = src_at(pm, tx, ty, own);
+                    let t = sample(tx, ty);
+                    let sv = sample(so[0], so[1]);
+                    for c in 0..3 {
+                        acc[c] += (t[c] - sv[c]) / 9.0;
+                    }
+                }
+                let sv = sample(own[0], own[1]);
+                let li = yi as usize * w + xi as usize;
+                for c in 0..3 {
+                    let healed = sv[c] + acc[c];
+                    lin[li][c] = lin[li][c] * (1.0 - blend) + healed * blend;
+                }
+            }
+        }
+    }
+}
+
 /// pick the donor offset for one heal spot. `sample` is clamped nearest.
 /// Same candidate set + scoring as gpu.rs `heal_src` — keep in sync.
 fn heal_find_source(sample: &dyn Fn(f32, f32) -> [f32; 3], sx: f32, sy: f32, r: f32) -> (f32, f32) {
@@ -3724,6 +3861,7 @@ fn finish_linear(
         pc.ca_b = kb * s;
     }
     heal_lin(&mut lin, w, h, &pc.spots, pc.n_spots, flip);
+    pm_heal_lin(&mut lin, w, h, &pc.pms, pc.pm_frame);
     clone_lin(&mut lin, w, h, &pc.clones, pc.n_clones, flip);
     if pc.noise_luma > 0.0 {
         lin = guided_nr_lum(&lin, w, h, pc.noise_luma);
@@ -4700,6 +4838,30 @@ fn load_mask_bitmap(path: &str) -> Option<Matte> {
     })
 }
 
+/// decode a PatchMatch offset-map PNG (16-bit RGB) → per-target-px
+/// absolute source position in lin px. ch0,ch1 normalize into the spot's
+/// search rect; LR's pm coords live in whole-image space so subtract the
+/// frame origin.
+fn load_pm_map(s: &crate::recipe::PmSpot) -> Option<(usize, usize, Vec<[f32; 2]>)> {
+    let img = image::open(&s.file).ok()?.to_rgb16();
+    let (pw, ph) = img.dimensions();
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let (sw, sh) = (s.search[2] - s.search[0], s.search[3] - s.search[1]);
+    let src = img
+        .into_raw()
+        .chunks_exact(3)
+        .map(|px| {
+            [
+                (px[0] as f32 / 65535.0) * sw + s.search[0] - s.frame_org[0],
+                (px[1] as f32 / 65535.0) * sh + s.search[1] - s.frame_org[1],
+            ]
+        })
+        .collect();
+    Some((pw as usize, ph as usize, src))
+}
+
 /// bilinear sample of the AI subject matte at normalized coords; 0 when empty
 /// Fold multi-member LR corrections into combined mattes. Returns
 /// (leader_window_index → (combined matte, union origin in mask space),
@@ -4750,11 +4912,7 @@ fn fold_mask_groups(
             .iter()
             .copied()
             .filter(|&i| windows[i].blend == 0)
-            .chain(
-                idxs.iter()
-                    .copied()
-                    .filter(|&i| windows[i].blend != 0),
-            )
+            .chain(idxs.iter().copied().filter(|&i| windows[i].blend != 0))
             .collect();
         for (k, &i) in order.iter().enumerate() {
             let w = &windows[i];
@@ -5586,6 +5744,51 @@ mod tests {
         solo.group = 0;
         let (merged, skip) = fold_mask_groups(&[solo.clone(), solo], &loaded);
         assert!(merged.is_empty() && !skip[0] && !skip[1]);
+    }
+
+    /// LR PatchMatch remove: the defect is replaced by the patchmap's
+    /// source pixels (frequency-separated — target keeps its low-freq,
+    /// so a small defect inside a larger patch vanishes against a
+    /// smooth background).
+    #[test]
+    fn pm_heal_uses_patchmap_sources() {
+        let (w, h) = (32, 32);
+        // smooth horizontal gradient scene
+        let mut lin: Vec<[f32; 3]> = (0..w * h)
+            .map(|i| [0.2 + (i % w) as f32 * 0.01; 3])
+            .collect();
+        // 2x2 bright defect at (12..14, 12..14)
+        for y in 12..14 {
+            for x in 12..14 {
+                lin[y * w + x] = [0.95; 3];
+            }
+        }
+        let (pw, ph) = (8, 8);
+        // patch px (x,y) pulls from (x+14, y) — 4 px to the right
+        let src: Vec<[f32; 2]> = (0..pw * ph)
+            .map(|i| [10.0 + (i % pw) as f32 + 4.0, 10.0 + (i / pw) as f32])
+            .collect();
+        let pm = PmMap {
+            src,
+            pw,
+            ph,
+            dst: [10.0, 10.0, 18.0, 18.0],
+            ell: [14.0, 14.0, 4.0, 4.0],
+            opacity: 1.0,
+        };
+        pm_heal_lin(&mut lin, w, h, &[pm], [32.0, 32.0]);
+        // defect centre now follows the source region (v ≈ 0.34 + small
+        // low-freq offset), nowhere near the 0.95 defect
+        let c = lin[13 * w + 13];
+        for v in c {
+            assert!(v < 0.6, "defect healed toward source level, got {v}");
+        }
+        // a pixel far outside the ellipse is untouched
+        assert_eq!(lin[2 * w + 2], [0.22; 3]);
+        // empty map list is a no-op
+        let mut lin2 = vec![[0.3f32; 3]; 4];
+        pm_heal_lin(&mut lin2, 2, 2, &[], [0.0, 0.0]);
+        assert_eq!(lin2[0], [0.3; 3]);
     }
 
     /// LR Point Colors: 19-float rows decode in the alphabetical layout

@@ -563,6 +563,7 @@ impl Engine {
 /// bitmap that still needs path resolution
 fn recipe_needs_mask_dir(r: &Recipe) -> bool {
     r.windows.iter().any(|w| !w.mask_file.is_empty())
+        || r.pm_spots.iter().any(|s| !s.file.is_empty())
         || r.stages
             .iter()
             .any(|s| s.enabled && recipe_needs_mask_dir(&s.params))
@@ -573,6 +574,11 @@ fn absolutize_mask_files(r: &mut Recipe, dir: &Path) {
     for w in &mut r.windows {
         if !w.mask_file.is_empty() && !Path::new(&w.mask_file).is_absolute() {
             w.mask_file = dir.join(&w.mask_file).to_string_lossy().into_owned();
+        }
+    }
+    for s in &mut r.pm_spots {
+        if !s.file.is_empty() && !Path::new(&s.file).is_absolute() {
+            s.file = dir.join(&s.file).to_string_lossy().into_owned();
         }
     }
     for s in &mut r.stages {

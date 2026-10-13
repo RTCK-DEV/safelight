@@ -643,6 +643,35 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
             if !what.contains("Retouch") {
                 continue;
             }
+            // LR PatchMatch remove: pm_* attrs (emitted by the catalog
+            // importer) carry the offset-map digest + sensor-px rects —
+            // the blob bitmap supersedes the clone approximation.
+            if let Some(dig) = field_str(&item, "crs:PmPatch") {
+                let f4 = |name: &str| -> Option<[f32; 4]> {
+                    let v: Vec<f32> = field_str(&item, name)?
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+                };
+                let f2 = |name: &str| -> Option<[f32; 2]> {
+                    let v: Vec<f32> = field_str(&item, name)?
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    (v.len() == 2).then(|| [v[0], v[1]])
+                };
+                r.pm_spots.push(crate::recipe::PmSpot {
+                    target: f4("crs:PmTarget").unwrap_or_default(),
+                    search: f4("crs:PmSearch").unwrap_or_default(),
+                    frame_org: f2("crs:PmFrame").unwrap_or_default(),
+                    ellipse: f4("crs:PmEllipse").unwrap_or_default(),
+                    opacity: field(&item, "crs:PmOpacity").unwrap_or(1.0),
+                    digest: dig,
+                    ..Default::default()
+                });
+                continue;
+            }
             let sx = field(&item, "crs:SourceX").unwrap_or(0.5);
             let sy = field(&item, "crs:SourceY").unwrap_or(0.5);
             let dx = field(&item, "crs:SpotX").unwrap_or(0.5);
@@ -1948,6 +1977,28 @@ mod tests {
         assert!((c[0] - 0.6).abs() < 1e-6 && (c[1] - 0.5).abs() < 1e-6);
         assert!((c[2] - 0.4).abs() < 1e-6 && (c[3] - 0.5).abs() < 1e-6);
         assert!((c[4] - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn retouch_patchmatch_attrs_bind_pm_spot() {
+        let body = r##"<x:xmpmeta><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="">
+ <crs:RetouchAreas>
+  <rdf:Seq>
+   <rdf:li crs:What="Retouch" crs:Method="poisson" crs:SpotX="0.6" crs:SpotY="0.7" crs:SpotDiam="0.05" crs:SourceX="0.4" crs:SourceY="0.7" crs:PmTarget="100,200,180,260" crs:PmSearch="300,100,500,360" crs:PmFrame="8,12" crs:PmEllipse="0.6,0.7,0.03,0.05" crs:PmPatch="A1B2C3D4" crs:PmOpacity="0.8"/>
+  </rdf:Seq>
+ </crs:RetouchAreas>
+</rdf:Description></rdf:RDF></x:xmpmeta>"##;
+        let r = crs_to_recipe(body);
+        assert_eq!(r.pm_spots.len(), 1);
+        let s = &r.pm_spots[0];
+        assert_eq!(s.target, [100.0, 200.0, 180.0, 260.0]);
+        assert_eq!(s.search, [300.0, 100.0, 500.0, 360.0]);
+        assert_eq!(s.frame_org, [8.0, 12.0]);
+        assert_eq!(s.ellipse, [0.6, 0.7, 0.03, 0.05]);
+        assert_eq!(s.digest, "A1B2C3D4");
+        assert!((s.opacity - 0.8).abs() < 1e-6);
+        // a pm item never falls through to the clone approximation
+        assert!(r.clones.is_empty());
     }
 
     #[test]

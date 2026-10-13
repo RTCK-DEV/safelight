@@ -196,6 +196,9 @@ pub struct Recipe {
     pub mono: [f32; 3],
     /// clone stamps [sx, sy, dx, dy, radius, _] frame-normalized (max 8)
     pub clones: Vec<[f32; 6]>,
+    /// LR PatchMatch remove spots with extracted offset maps (max 12)
+    #[serde(default)]
+    pub pm_spots: Vec<PmSpot>,
     /// skin smoothing amount 0..1 (edge-aware, skin-hue weighted)
     pub beauty: f32,
     // ---- restoration + light fx ----
@@ -528,6 +531,43 @@ pub struct PowerWindow {
     pub group: u32,
 }
 
+/// LR Remove/PatchMatch heal spot (`heal_patchmatch`): Lightroom stores the
+/// computed per-pixel source-offset map in the catalog `.lrcat-data` blob
+/// store keyed by the `pm_patch` digest; during import it is extracted to a
+/// 16-bit RGB PNG named by `file`. Coordinates are sensor px.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PmSpot {
+    /// destination rect in sensor px [l, t, r, b] — the patchmap covers it
+    pub target: [f32; 4],
+    /// search rect in sensor px [l, t, r, b]; patchmap channels normalize
+    /// to this rect (v/65535 * size + origin)
+    pub search: [f32; 4],
+    /// LR whole-image frame origin [l, t] (pm_whole_image_left/top)
+    pub frame_org: [f32; 2],
+    /// destination ellipse [cx, cy, rx, ry] in normalized post-flip frame
+    /// coords (the spot's feathered coverage)
+    pub ellipse: [f32; 4],
+    pub opacity: f32,
+    pub digest: String,
+    /// extracted patchmap PNG beside the image (16-bit RGB)
+    pub file: String,
+}
+
+impl Default for PmSpot {
+    fn default() -> Self {
+        PmSpot {
+            target: [0.0; 4],
+            search: [0.0; 4],
+            frame_org: [0.0; 2],
+            ellipse: [0.0; 4],
+            opacity: 1.0,
+            digest: String::new(),
+            file: String::new(),
+        }
+    }
+}
+
 fn defringe_pu_default() -> [f32; 3] {
     [0.0, 246.0, 294.0]
 }
@@ -666,6 +706,7 @@ impl Default for Recipe {
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),
+            pm_spots: Vec::new(),
             beauty: 0.0,
             noise_chroma: 0.2,
             dehaze: 0.0,

@@ -295,8 +295,9 @@ fn blob_index_dir(dir: &Path, out: &mut std::collections::HashMap<String, MaskBl
 }
 
 /// Decode the embedded TIFF of a mask blob → (w, h, 8-bit gray pixels).
-pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
-    let d = if !b.inline.is_empty() {
+/// extract the embedded TIFF bytes from a mask blob record
+fn blob_tiff(b: &MaskBlob) -> Option<Vec<u8>> {
+    let mut d = if !b.inline.is_empty() {
         b.inline.clone()
     } else {
         let mut d = std::fs::read(&b.path).ok()?;
@@ -307,7 +308,13 @@ pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
         d
     };
     let o = d.windows(4).position(|w| w == b"II*\x00")?;
-    let t = &d[o..];
+    d.drain(..o);
+    Some(d)
+}
+
+pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
+    let d = blob_tiff(b)?;
+    let t = &d[..];
     if let Ok(dec) = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(t)) {
         if let Ok(img) = image::DynamicImage::from_decoder(dec) {
             let img = img.to_luma8();
@@ -320,10 +327,35 @@ pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
     decode_tiff_tiles(t)
 }
 
+/// Decode a blob TIFF at full fidelity → (w, h, per-channel u16 planes).
+/// Needed for PatchMatch offset maps (3×16-bit channels) which must not
+/// collapse to luma. JPEG/JXL tile codestreams decode to their native
+/// precision; anything the image crate handles normalizes to u16.
+pub fn decode_blob_rgb16(b: &MaskBlob) -> Option<(u32, u32, Vec<Vec<u16>>)> {
+    let d = blob_tiff(b)?;
+    let t = &d[..];
+    if let Ok(dec) = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(t)) {
+        if let Ok(img) = image::DynamicImage::from_decoder(dec) {
+            let rgb = img.to_rgb16();
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = rgb.into_raw();
+            let mut planes = vec![Vec::with_capacity((w * h) as usize); 3];
+            for px in raw.chunks_exact(3) {
+                planes[0].push(px[0]);
+                planes[1].push(px[1]);
+                planes[2].push(px[2]);
+            }
+            return Some((w, h, planes));
+        }
+    }
+    decode_tiff_tiles_rgb(t)
+}
+
 /// minimal TIFF reader for Adobe's compressed-tile mask bitmaps: pulls each
 /// tile's codestream through the JPEG or JPEG XL decoder and blits the
 /// tiles into one luma matte.
-fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+/// parse a TIFF IFD → (w, h, compression, tile_w, tile_h, offsets, lens)
+fn tiff_layout(t: &[u8]) -> Option<(u32, u32, u32, u32, u32, Vec<u32>, Vec<u32>)> {
     fn le32(t: &[u8], o: usize) -> Option<u32> {
         Some(u32::from_le_bytes(t.get(o..o + 4)?.try_into().ok()?))
     }
@@ -368,7 +400,7 @@ fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         Some(
             (0..cnt as usize)
                 .filter_map(|i| match tsz {
-                    1 => t.get(base + i).map(|&b| b as u32),
+                    1 => t.get(base + i).map(|&b| b as u8 as u32),
                     2 => le16(t, base + i * 2).map(|v| v as u32),
                     _ => le32(t, base + i * 4),
                 })
@@ -385,6 +417,11 @@ fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         .unwrap_or(h);
     let offs = vals(324).or_else(|| vals(273))?;
     let lens = vals(325).or_else(|| vals(279))?;
+    Some((w, h, comp, tw, th, offs, lens))
+}
+
+fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h, comp, tw, th, offs, lens) = tiff_layout(t)?;
     let nx = w.div_ceil(tw) as usize;
     let mut out = vec![0u8; (w * h) as usize];
     for (ti, (&to, &tl)) in offs.iter().zip(lens.iter()).enumerate() {
@@ -404,6 +441,87 @@ fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         }
     }
     Some((w, h, out))
+}
+
+/// multi-channel tile decode → per-channel u16 planes (PatchMatch maps:
+/// 3×16-bit). JPEG tiles go through the lossless decoder (16-bit);
+/// JXL tiles use jxl-oxide (f32 planes scaled to u16).
+fn decode_tiff_tiles_rgb(t: &[u8]) -> Option<(u32, u32, Vec<Vec<u16>>)> {
+    let (w, h, comp, tw, th, offs, lens) = tiff_layout(t)?;
+    let nx = w.div_ceil(tw) as usize;
+    let mut out: Vec<Vec<u16>> = Vec::new();
+    for (ti, (&to, &tl)) in offs.iter().zip(lens.iter()).enumerate() {
+        let tile = t.get(to as usize..(to + tl) as usize)?;
+        let (pw, ph, planes) = match comp {
+            52546 => jxl_planes_u16(tile)?,
+            7 => jpeg_lossless_planes(tile)
+                .map(|(w, h, prec, pl)| {
+                    let mx = ((1i64 << prec.min(31)) - 1).max(1) as f32;
+                    (
+                        w,
+                        h,
+                        pl.iter()
+                            .map(|p| {
+                                p.iter()
+                                    .map(|&v| (v as f32 * 65535.0 / mx).clamp(0.0, 65535.0) as u16)
+                                    .collect::<Vec<u16>>()
+                            })
+                            .collect(),
+                    )
+                })
+                .or_else(|| jpeg_planes_u16(tile))?,
+            _ => return None,
+        };
+        if out.is_empty() {
+            out = vec![vec![0u16; (w * h) as usize]; planes.len()];
+        }
+        let (tx, ty) = ((ti % nx) as u32 * tw, (ti / nx) as u32 * th);
+        for (c, p) in planes.iter().enumerate().take(out.len()) {
+            for y in 0..(ph as u32).min(h.saturating_sub(ty)) {
+                for x in 0..(pw as u32).min(w.saturating_sub(tx)) {
+                    out[c][(ty + y) as usize * w as usize + (tx + x) as usize] =
+                        p[y as usize * pw + x as usize];
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some((w, h, out))
+}
+
+/// JXL codestream → (w, h, per-channel u16 planes)
+fn jxl_planes_u16(b: &[u8]) -> Option<(usize, usize, Vec<Vec<u16>>)> {
+    let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
+    let render = img.render_frame(0).ok()?;
+    let planes: Vec<Vec<u16>> = render
+        .image_planar()
+        .iter()
+        .map(|fb| {
+            fb.buf()
+                .iter()
+                .map(|&v| (v * 65535.0).clamp(0.0, 65535.0) as u16)
+                .collect()
+        })
+        .collect();
+    let binding = render.image_planar();
+    let fb = binding.first()?;
+    Some((fb.width(), fb.height(), planes))
+}
+
+/// baseline JPEG → (w, h, per-channel u16 planes) via the image crate
+fn jpeg_planes_u16(b: &[u8]) -> Option<(usize, usize, Vec<Vec<u16>>)> {
+    let img = image::load_from_memory_with_format(b, image::ImageFormat::Jpeg).ok()?;
+    let rgb = img.to_rgb16();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let mut planes = vec![Vec::with_capacity(w * h); 3];
+    for px in rgb.into_raw().chunks_exact(3) {
+        planes[0].push(px[0]);
+        planes[1].push(px[1]);
+        planes[2].push(px[2]);
+    }
+    Some((w, h, planes))
 }
 
 /// decode one JPEG XL codestream → (w, h, 8-bit gray)
@@ -438,10 +556,26 @@ fn jpeg_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 /// against the SOS-selected spatial predictor. Handles the simple Adobe
 /// case — 8-bit, no subsampling, optional restart intervals.
 fn jpeg_lossless_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let (w, h, prec, planes) = jpeg_lossless_planes(b)?;
+    let nc = planes.len();
+    let scale = 255.0 / ((1i32 << prec.min(31)) - 1).max(1) as f32;
+    let px = (0..w * h)
+        .map(|i| {
+            let s: i32 = planes.iter().map(|p| p[i]).sum();
+            (s as f32 / nc as f32 * scale).round().clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    Some((w, h, px))
+}
+
+/// raw lossless-JPEG decode → (w, h, bit precision, per-channel sample
+/// planes). Handles 8/12/16-bit precision and multi-component scans
+/// (e.g. PatchMatch offset maps: 3×16-bit channels).
+fn jpeg_lossless_planes(b: &[u8]) -> Option<(usize, usize, usize, Vec<Vec<i32>>)> {
     let be16 = |o: usize| -> Option<usize> {
         Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?) as usize)
     };
-    let (mut w, mut h, mut nc) = (0usize, 0usize, 0usize);
+    let (mut w, mut h, mut nc, mut prec) = (0usize, 0usize, 0usize, 8usize);
     let mut dht: [Option<([u16; 16], Vec<u8>)>; 4] = Default::default();
     let mut dtd = [0usize; 8]; // per-component DC table id
     let (mut pred, mut pt, mut ri) = (0usize, 0u32, 0usize);
@@ -481,6 +615,7 @@ fn jpeg_lossless_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
                 }
             }
             0xc3 | 0xc1 => {
+                prec = seg.get(0).copied()? as usize;
                 h = be16(o + 5)?;
                 w = be16(o + 7)?;
                 nc = seg.get(5).copied()? as usize;
@@ -551,7 +686,7 @@ fn jpeg_lossless_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     // entropy data is pixel-major, components interleaved; each component
     // keeps its own predictor state and DC table
     let mut planes = vec![vec![0i32; w * h]; nc];
-    let init = 1i32 << (8 - pt - 1); // first-sample prediction
+    let init = 1i32 << (prec - pt as usize - 1); // first-sample prediction
     if ri > 0 {
         return None; // restart intervals not needed by the small Adobe tiles
     }
@@ -606,13 +741,7 @@ fn jpeg_lossless_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
             }
         }
     }
-    let px = (0..w * h)
-        .map(|i| {
-            let s: i32 = planes.iter().map(|p| p[i]).sum();
-            ((s / nc as i32).clamp(0, 255)) as u8
-        })
-        .collect();
-    Some((w, h, px))
+    Some((w, h, prec, planes))
 }
 
 /// Extract the blob-store mattes referenced by the recipe's windows:
@@ -649,6 +778,34 @@ pub fn apply_blob_masks(
         let out = dir.join(&name);
         if image::save_buffer(&out, &px, mw, mh, image::ColorType::L8).is_ok() {
             w.mask_file = name;
+            n += 1;
+        }
+    }
+    // PatchMatch remove spots: pm_patch digest → 3×16-bit offset map,
+    // written as a 16-bit RGB PNG so the u16 planes survive intact.
+    for s in &mut r.pm_spots {
+        if s.digest.is_empty() || !s.file.is_empty() {
+            continue;
+        }
+        let Some(mb) = blobs.get(&s.digest.to_ascii_uppercase()) else {
+            continue;
+        };
+        let Some((pw, ph, planes)) = decode_blob_rgb16(mb) else {
+            continue;
+        };
+        if planes.len() < 2 {
+            continue;
+        }
+        let mut rgb = Vec::with_capacity((pw * ph) as usize * 6);
+        for i in 0..(pw * ph) as usize {
+            rgb.extend_from_slice(&planes[0][i].to_be_bytes());
+            rgb.extend_from_slice(&planes[1][i].to_be_bytes());
+            rgb.extend_from_slice(&planes.get(2).map(|p| p[i]).unwrap_or(0).to_be_bytes());
+        }
+        let name = format!("{stem}.slpm-{}.png", &s.digest[..8.min(s.digest.len())]);
+        let out = dir.join(&name);
+        if image::save_buffer(&out, &rgb, pw, ph, image::ColorType::Rgb16).is_ok() {
+            s.file = name;
             n += 1;
         }
     }
@@ -1091,6 +1248,7 @@ fn retouch_li(t: &[(String, Lua)]) -> String {
     let mut sx = get_num(t, &["centerX", "SpotX"]);
     let mut sy = get_num(t, &["centerY", "SpotY"]);
     let mut rad = get_num(t, &["radius"]);
+    let mut rad_y: Option<f64> = None;
     for (k, v) in t {
         if k != "Masks" {
             continue;
@@ -1106,6 +1264,7 @@ fn retouch_li(t: &[(String, Lua)]) -> String {
                     }
                     if rad.is_none() {
                         rad = get_num(mi, &["SizeX"]);
+                        rad_y = get_num(mi, &["SizeY"]);
                     }
                 }
                 Some("Mask/Paint") => {
@@ -1146,13 +1305,32 @@ fn retouch_li(t: &[(String, Lua)]) -> String {
     }
     let (dx, dy) = (sx.unwrap_or(0.5), sy.unwrap_or(0.5));
     let diam = (rad.unwrap_or(0.02) * 2.0).clamp(0.004, 1.0);
+    // PatchMatch remove (spotType heal_patchmatch): the catalog carries the
+    // pm_* block — target/search rects in sensor px, a frame origin, and the
+    // pm_patch digest keying the computed offset map in .lrcat-data. Emit it
+    // as crs attrs so the recipe can bind the extracted bitmap.
+    let mut pm = String::new();
+    if get_str(t, &["SpotType", "spotType"]) == Some("heal_patchmatch") {
+        let g = |n: &str| get_num(t, &[n]).unwrap_or(0.0);
+        if let Some(dig) = get_str(t, &["pm_patch"]) {
+            let ry = rad_y.unwrap_or_else(|| rad.unwrap_or(0.01));
+            pm = format!(
+                " crs:PmTarget=\"{},{},{},{}\" crs:PmSearch=\"{},{},{},{}\" crs:PmFrame=\"{},{}\" crs:PmEllipse=\"{:.6},{:.6},{:.6},{:.6}\" crs:PmPatch=\"{}\" crs:PmOpacity=\"{:.4}\"",
+                g("pm_target_left"), g("pm_target_top"), g("pm_target_right"), g("pm_target_bottom"),
+                g("pm_search_left"), g("pm_search_top"), g("pm_search_right"), g("pm_search_bottom"),
+                g("pm_whole_image_left"), g("pm_whole_image_top"),
+                dx, dy, rad.unwrap_or(0.01), ry,
+                esc(dig),
+                get_num(t, &["Opacity", "opacity"]).unwrap_or(1.0),
+            );
+        }
+    }
     // source: lowercase dup fields, else SourceX + OffsetY
     let mut srcx = get_num(t, &["sourceX", "SourceX"]).unwrap_or(dx);
     let mut srcy = get_num(t, &["sourceY", "SourceY", "OffsetY"]).unwrap_or(dy);
     if (srcx == 0.0 && srcy == 0.0) || (srcx == dx && srcy == dy) {
-        // patchmatch/auto-computed source — the real patch offset lives in an
-        // opaque digest; approximate a heal by cloning from a few diameters
-        // sideways (dust spots sit in uniform areas, so any neighbor works)
+        // patchmatch/auto-computed source — when the pm_patch map is present
+        // the renderer uses it; otherwise approximate by cloning sideways
         srcx = if dx > 0.8 {
             dx - 3.0 * diam
         } else {
@@ -1162,9 +1340,10 @@ fn retouch_li(t: &[(String, Lua)]) -> String {
     }
     let method = get_str(t, &["Method"]).unwrap_or("clone");
     format!(
-        "<rdf:li crs:What=\"Retouch\" crs:Method=\"{}\" crs:SpotX=\"{:.6}\" crs:SpotY=\"{:.6}\" crs:SpotDiam=\"{:.6}\" crs:SourceX=\"{:.6}\" crs:SourceY=\"{:.6}\"/>",
+        "<rdf:li crs:What=\"Retouch\" crs:Method=\"{}\" crs:SpotX=\"{:.6}\" crs:SpotY=\"{:.6}\" crs:SpotDiam=\"{:.6}\" crs:SourceX=\"{:.6}\" crs:SourceY=\"{:.6}\"{}/>",
         esc(method),
-        dx, dy, diam, srcx, srcy
+        dx, dy, diam, srcx, srcy,
+        pm
     )
 }
 
@@ -1470,5 +1649,109 @@ mod diag_tests {
             }
             eprintln!("  decode ok={ok} bad={bad:?} → {}", out_dir.display());
         }
+    }
+
+    /// diagnostic: decode a PatchMatch pm_patch TIFF at full fidelity and
+    /// dump per-channel stats (offset-map structure analysis).
+    /// SL_PM_DIGEST = hex digest, searches every *.lrcat-data blob.
+    #[test]
+    #[ignore]
+    fn pm_patch_dump() {
+        let dig = std::env::var("SL_PM_DIGEST")
+            .unwrap_or_else(|_| "183CD5D7162DE26E52CDF9BFB1EB0569".into());
+        let dir = std::env::var("SL_LRCAT_DIR").unwrap_or_else(|_| {
+            r"C:\Users\stu12\OneDrive - 愛知産業大学\画像\Lightroom".to_string()
+        });
+        let mut raw = Vec::new();
+        let mut pos = 0usize;
+        for dd in std::fs::read_dir(&dir).unwrap().flatten() {
+            let d = dd.path();
+            if d.extension().and_then(|s| s.to_str()) != Some("lrcat-data") {
+                continue;
+            }
+            for f in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = f.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("blob") {
+                    continue;
+                }
+                let Ok(r) = std::fs::read(&p) else { continue };
+                if let Some(i) = r.windows(32).position(|w| w == dig.as_bytes()) {
+                    // TIFF header follows the record prefix
+                    if let Some(t) = r[i..]
+                        .windows(4)
+                        .position(|w| w == b"II*\x00")
+                        .map(|x| i + x)
+                    {
+                        (raw, pos) = (r, t);
+                    }
+                }
+                if !raw.is_empty() {
+                    break;
+                }
+            }
+            if !raw.is_empty() {
+                break;
+            }
+        }
+        assert!(!raw.is_empty(), "digest {dig} not found in blob stores");
+        let t = &raw[pos..];
+        eprintln!("record at blob offset {pos}");
+        // payload: FF D8 JPEG or FF 0A JPEG XL codestream
+        let js = t
+            .windows(2)
+            .position(|w| w == b"\xff\xd8" || w == b"\xff\x0a")
+            .expect("no codec start");
+        let is_jpeg = t[js] == 0xff && t[js + 1] == 0xd8;
+        let (w, h, planes) = if is_jpeg {
+            let (w, h, _p, pl) = jpeg_lossless_planes(&t[js..]).expect("decode pm_patch jpeg");
+            (w, h, pl)
+        } else {
+            let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&t[js..]))
+                .expect("jxl header");
+            let render = img.render_frame(0).expect("jxl frame");
+            let planes: Vec<Vec<i32>> = render
+                .image_planar()
+                .iter()
+                .map(|fb| fb.buf().iter().map(|&v| (v * 65535.0) as i32).collect())
+                .collect();
+            let (w, h) = (
+                render.image_planar()[0].width(),
+                render.image_planar()[0].height(),
+            );
+            (w, h, planes)
+        };
+        eprintln!("pm_patch {w}x{h} channels={}", planes.len());
+        for (c, p) in planes.iter().enumerate() {
+            let (mn, mx) = (*p.iter().min().unwrap(), *p.iter().max().unwrap());
+            eprintln!(
+                "  ch{c}: min={mn} max={mx} center={} corner={}",
+                p[(h / 2) * w + w / 2],
+                p[0]
+            );
+        }
+        // dump channel grids for structural analysis
+        for (c, p) in planes.iter().enumerate() {
+            let mut s = String::new();
+            for y in (0..h).step_by((h / 12).max(1)) {
+                for x in (0..w).step_by((w / 16).max(1)) {
+                    s += &format!("{:6} ", p[y * w + x]);
+                }
+                s += "\n";
+            }
+            eprintln!("ch{c} grid:\n{s}");
+        }
+        // raw planes for offline analysis: [w:u32 h:u32 nc:u32] + i32 data
+        let out = std::env::temp_dir().join(format!("pm_{}.bin", &dig[..8]));
+        let mut b = Vec::new();
+        b.extend((w as u32).to_le_bytes());
+        b.extend((h as u32).to_le_bytes());
+        b.extend((planes.len() as u32).to_le_bytes());
+        for p in &planes {
+            for &v in p {
+                b.extend(v.to_le_bytes());
+            }
+        }
+        std::fs::write(&out, &b).ok();
+        eprintln!("planes → {}", out.display());
     }
 }
