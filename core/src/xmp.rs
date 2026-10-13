@@ -1239,6 +1239,7 @@ fn li_floats(li: &str) -> Option<Vec<f32>> {
 
 fn local_corrections(body: &str, r: &mut Recipe) {
     use crate::recipe::{BrushLayer, BrushStroke, PowerWindow};
+    let mut corr_id = 1u32;
     for tag in [
         "crs:GradientBasedCorrections",
         "crs:CircularGradientBasedCorrections",
@@ -1335,6 +1336,8 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 mask_file: String::new(),
                 mask_org: [0.0; 2],
                 mask_area: [0.0; 2],
+                blend: 0,
+                group: 0,
             };
             // linear gradient: full effect at (FullX,FullY), zero at
             // (ZeroX,ZeroY); "Flipped" swaps the two ends.
@@ -1415,7 +1418,11 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                 // AI mask bitmap binding: MaskDigest names the computed
                 // matte in the catalog .lrcat-data blob store; Origin and
                 // WholeImageArea place its bounding box in mask space.
+                // MaskBlendMode says how this member combines inside its
+                // correction: 0 add, 1 subtract, 2 intersect.
                 if let Some(w) = r.windows.get_mut(n0) {
+                    w.blend = field(&mb, "crs:MaskBlendMode").unwrap_or(0.0) as i32;
+                    w.group = corr_id;
                     if let Some(d) = field_str(&mb, "crs:MaskDigest") {
                         w.mask_digest = d.to_string();
                     }
@@ -1587,6 +1594,16 @@ fn local_corrections(body: &str, r: &mut Recipe) {
                     strokes,
                 });
             }
+            // every mask member this correction produced belongs to the
+            // same blend group — the renderer folds their mattes with
+            // each member's MaskBlendMode before applying the correction
+            let from = n_win0.min(r.windows.len());
+            for w in r.windows[from..].iter_mut() {
+                if w.group == 0 {
+                    w.group = corr_id;
+                }
+            }
+            corr_id += 1;
         }
     }
 }
@@ -1780,6 +1797,8 @@ mod tests {
             mask_file: String::new(),
             mask_org: [0.0; 2],
             mask_area: [0.0; 2],
+            blend: 0,
+            group: 0,
         }];
         sc.rating = 4;
         sc.label = "Red".into();

@@ -1011,7 +1011,35 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut refines = [[0.0; 6]; 16];
     let mut lpcs = [[0.0; 41]; 16];
     let mut wmats: Vec<WMatte> = Vec::new();
+    // Pre-load every window's LR blob-store bitmap so correction members
+    // can be folded before packing.
+    let mut loaded: Vec<Option<Matte>> = r
+        .windows
+        .iter()
+        .take(16)
+        .map(|w| {
+            if !w.mask_file.is_empty() && w.mask_area[0] > 1.0 && w.mask_area[1] > 1.0 {
+                load_mask_bitmap(&w.mask_file)
+            } else {
+                None
+            }
+        })
+        .collect();
+    // LR semantics: a correction's mask members combine with
+    // MaskBlendMode (0 add, 1 subtract, 2 intersect); MaskInverted flips
+    // the member first. When all members resolved to blob bitmaps, fold
+    // them into one matte covering the union of their bboxes in the
+    // shared WholeImageArea mask space — the correction applies once.
+    let (mut merged, skip_win) = fold_mask_groups(&r.windows[..r.windows.len().min(16)], &loaded);
+    for (i, v) in loaded.iter_mut().enumerate() {
+        if skip_win[i] {
+            *v = None;
+        }
+    }
     for (i, w) in r.windows.iter().take(16).enumerate() {
+        if skip_win[i] {
+            continue;
+        }
         refines[i] = w.refine;
         let mut n = 0usize;
         for (row, var) in w.pcs.iter().take(2) {
@@ -1114,10 +1142,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // covers a bbox at mask_org. Post-crop nx,ny → display-frame
         // (dx,dy) → mask-space px via the dcraw flip code → bitmap u,v:
         //   dx = crop_l + nx*sw, mx_px = f(dx,dy)*area_w - org_x, u = /bw
-        if !w.mask_file.is_empty() && w.mask_area[0] > 1.0 && w.mask_area[1] > 1.0 {
-            if let Some(bm) = load_mask_bitmap(&w.mask_file) {
+        // A correction-group leader carries the pre-folded member matte
+        // and union origin instead of its own blob.
+        let is_merged = merged.contains_key(&i);
+        let merged_m = merged.remove(&i);
+        let solo = std::mem::take(&mut loaded[i]);
+        if let Some((bm, org)) = merged_m
+            .map(|(m, o)| (m, o))
+            .or_else(|| solo.map(|m| (m, w.mask_org)))
+        {
+            if w.mask_area[0] > 1.0 && w.mask_area[1] > 1.0 {
                 let (aw, ah) = (w.mask_area[0], w.mask_area[1]);
-                let (ox, oy) = (w.mask_org[0], w.mask_org[1]);
+                let (ox, oy) = (org[0], org[1]);
                 let (bw, bh) = (bm.w as f32, bm.h as f32);
                 let (cl, ct) = (r.crop[0], r.crop[1]);
                 // display-normalized → mask-normalized per flip code,
@@ -1160,8 +1196,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                     ),
                 };
                 // flag 1024 + clear the heuristic kind bits (16..512); keep
-                // invert(2)/link_q(8)
-                wins[i][0] = ((wins[i][0] as i32 & 0b1011) | 1024) as f32;
+                // invert(2)/link_q(8). Folded mattes already applied each
+                // member's MaskInverted, so drop the leader's own invert.
+                let keep = if is_merged { 0b1001 } else { 0b1011 };
+                wins[i][0] = ((wins[i][0] as i32 & keep) | 1024) as f32;
                 wins[i][21] = wmats.len() as f32;
                 wmats.push(WMatte {
                     m: bm,
@@ -4663,6 +4701,110 @@ fn load_mask_bitmap(path: &str) -> Option<Matte> {
 }
 
 /// bilinear sample of the AI subject matte at normalized coords; 0 when empty
+/// Fold multi-member LR corrections into combined mattes. Returns
+/// (leader_window_index → (combined matte, union origin in mask space),
+/// per-window skip flags). A group folds only when every member resolved
+/// a bitmap — otherwise the members keep their independent windows.
+fn fold_mask_groups(
+    windows: &[crate::recipe::PowerWindow],
+    loaded: &[Option<Matte>],
+) -> (
+    std::collections::HashMap<usize, (Matte, [f32; 2])>,
+    [bool; 16],
+) {
+    let mut skip_win = [false; 16];
+    let mut merged = std::collections::HashMap::new();
+    let mut groups: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for (i, w) in windows.iter().enumerate() {
+        if w.group != 0 && i < loaded.len() && loaded[i].is_some() {
+            groups.entry(w.group).or_default().push(i);
+        }
+    }
+    for idxs in groups.values() {
+        if idxs.len() < 2 || !idxs.iter().all(|&i| loaded[i].is_some()) {
+            continue;
+        }
+        let (aw, ah) = {
+            let w0 = &windows[idxs[0]];
+            (w0.mask_area[0], w0.mask_area[1])
+        };
+        // member union bbox in leader mask space (scale orgs if a member
+        // was stored against a different WholeImageArea)
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &i in idxs {
+            let w = &windows[i];
+            let m = loaded[i].as_ref().unwrap();
+            let sx = aw / w.mask_area[0].max(1.0);
+            let sy = ah / w.mask_area[1].max(1.0);
+            x0 = x0.min(w.mask_org[0] * sx);
+            y0 = y0.min(w.mask_org[1] * sy);
+            x1 = x1.max((w.mask_org[0] + m.w as f32) * sx);
+            y1 = y1.max((w.mask_org[1] + m.h as f32) * sy);
+        }
+        let cw = (x1 - x0).ceil().max(1.0) as usize;
+        let ch = (y1 - y0).ceil().max(1.0) as usize;
+        let mut acc = vec![0u16; cw * ch];
+        // application order: base/add members union first regardless of
+        // list order, then subtract/intersect members in list order
+        let order: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| windows[i].blend == 0)
+            .chain(
+                idxs.iter()
+                    .copied()
+                    .filter(|&i| windows[i].blend != 0),
+            )
+            .collect();
+        for (k, &i) in order.iter().enumerate() {
+            let w = &windows[i];
+            let m = loaded[i].as_ref().unwrap();
+            let sx = aw / w.mask_area[0].max(1.0);
+            let sy = ah / w.mask_area[1].max(1.0);
+            for y in 0..ch {
+                for x in 0..cw {
+                    // canvas px → member px → normalized sample
+                    // (pixel-centre convention, matching matte_bil)
+                    let mx = ((x0 + x as f32) / sx - w.mask_org[0] + 0.5) / m.w as f32;
+                    let my = ((y0 + y as f32) / sy - w.mask_org[1] + 0.5) / m.h as f32;
+                    let mut v = if (0.0..1.0).contains(&mx) && (0.0..1.0).contains(&my) {
+                        matte_bil(m, mx, my)
+                    } else {
+                        0.0
+                    };
+                    if w.invert {
+                        v = 1.0 - v;
+                    }
+                    let a = acc[y * cw + x] as f32 / 65535.0;
+                    let nv = if k == 0 || w.blend == 0 {
+                        a + v - a * v // add: screen union
+                    } else if w.blend == 1 {
+                        a * (1.0 - v) // subtract
+                    } else {
+                        a * v // intersect
+                    };
+                    acc[y * cw + x] = (nv * 65535.0).clamp(0.0, 65535.0) as u16;
+                }
+            }
+        }
+        merged.insert(
+            idxs[0],
+            (
+                Matte {
+                    w: cw,
+                    h: ch,
+                    data: acc,
+                },
+                [x0, y0],
+            ),
+        );
+        for &i in &idxs[1..] {
+            skip_win[i] = true;
+        }
+    }
+    (merged, skip_win)
+}
+
 fn matte_bil(m: &Matte, nx: f32, ny: f32) -> f32 {
     if m.w < 2 || m.h < 2 || m.data.len() < m.w * m.h {
         return 0.0;
@@ -5374,6 +5516,76 @@ mod tests {
                 std::slice::from_ref(&wm),
             ) > 0.9
         );
+    }
+
+    /// A correction's mask members fold by MaskBlendMode before the local
+    /// adjustment applies once: base sky matte minus a subject matte
+    /// (blend 1) leaves a hole where the subject is; the non-leader
+    /// window is skipped so it cannot double-apply.
+    #[test]
+    fn fold_mask_groups_add_subtract() {
+        use crate::recipe::PowerWindow;
+        let mk = |blend: i32, invert: bool| PowerWindow {
+            mask_file: "x.png".into(),
+            mask_area: [4.0, 4.0],
+            group: 1,
+            blend,
+            invert,
+            ..Default::default()
+        };
+        // member 0: full 4x4 matte at origin (0,0); member 1: 2x2 matte
+        // at origin (1,1) — subtracted
+        let mut w0 = mk(0, false);
+        w0.mask_org = [0.0, 0.0];
+        let mut w1 = mk(1, false);
+        w1.mask_org = [1.0, 1.0];
+        let windows = vec![w0, w1];
+        let loaded = vec![
+            Some(Matte {
+                w: 4,
+                h: 4,
+                data: vec![65535; 16],
+            }),
+            Some(Matte {
+                w: 2,
+                h: 2,
+                data: vec![65535; 4],
+            }),
+        ];
+        let (merged, skip) = fold_mask_groups(&windows, &loaded);
+        assert!(skip[1], "subject member folded away");
+        let (m, org) = merged.get(&0).expect("leader keeps merged matte");
+        assert_eq!((m.w, m.h, *org), (4, 4, [0.0, 0.0]));
+        for y in 0..4 {
+            for x in 0..4 {
+                let hole = (1..3).contains(&x) && (1..3).contains(&y);
+                let v = m.data[y * 4 + x] as f32 / 65535.0;
+                if hole {
+                    assert!(v < 0.05, "subject subtracted at {x},{y}: {v}");
+                } else {
+                    assert!(v > 0.95, "sky kept at {x},{y}: {v}");
+                }
+            }
+        }
+        // inverted subject member: subtract(1 - matte) = keep only subject
+        let mut w1i = mk(1, true);
+        w1i.mask_org = [1.0, 1.0];
+        let windows = vec![windows[0].clone(), w1i];
+        let (merged, _) = fold_mask_groups(&windows, &loaded);
+        let (m, _) = merged.get(&0).unwrap();
+        assert!(
+            m.data[0] as f32 / 65535.0 < 0.05,
+            "outside inverted subject = 0"
+        );
+        assert!(
+            m.data[1 * 4 + 1] as f32 / 65535.0 > 0.95,
+            "inside inverted subject = 1"
+        );
+        // ungrouped windows never fold
+        let mut solo = mk(0, false);
+        solo.group = 0;
+        let (merged, skip) = fold_mask_groups(&[solo.clone(), solo], &loaded);
+        assert!(merged.is_empty() && !skip[0] && !skip[1]);
     }
 
     /// LR Point Colors: 19-float rows decode in the alphabetical layout

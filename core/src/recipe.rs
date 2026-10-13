@@ -517,6 +517,15 @@ pub struct PowerWindow {
     pub mask_org: [f32; 2],
     #[serde(default)]
     pub mask_area: [f32; 2],
+    /// LR MaskBlendMode for this mask member inside its correction:
+    /// 0 = add, 1 = subtract, 2 = intersect.
+    #[serde(default)]
+    pub blend: i32,
+    /// correction membership: windows sharing a nonzero group are mask
+    /// members of the same LR correction and their mattes combine with
+    /// `blend` before the correction's adjustments apply once.
+    #[serde(default)]
+    pub group: u32,
 }
 
 fn defringe_pu_default() -> [f32; 3] {
@@ -569,6 +578,8 @@ impl Default for PowerWindow {
             mask_file: String::new(),
             mask_org: [0.0; 2],
             mask_area: [0.0; 2],
+            blend: 0,
+            group: 0,
         }
     }
 }

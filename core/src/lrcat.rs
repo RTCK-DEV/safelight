@@ -172,8 +172,32 @@ fn sst_records(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// MaskDigest; older stores carry the digest in each `.blob` header.
 pub fn blob_index(cat: &Path) -> std::collections::HashMap<String, MaskBlob> {
     let mut out = std::collections::HashMap::new();
-    let dir = cat.with_extension("lrcat-data");
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    let own = cat.with_extension("lrcat-data");
+    // Masks are content-addressed by digest and recomputed mattes land in
+    // the *newest* catalog's data store — index every sibling
+    // `*.lrcat-data` directory, then the requested catalog's own so its
+    // records win ties.
+    if let Some(parent) = cat.parent() {
+        if let Ok(rd) = std::fs::read_dir(parent) {
+            let mut sibs: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    *p != own && p.extension().and_then(|s| s.to_str()) == Some("lrcat-data")
+                })
+                .collect();
+            sibs.sort();
+            for d in sibs {
+                blob_index_dir(&d, &mut out);
+            }
+        }
+    }
+    blob_index_dir(&own, &mut out);
+    out
+}
+
+fn blob_index_dir(dir: &Path, out: &mut std::collections::HashMap<String, MaskBlob>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
         let mut blobs: Vec<(u64, PathBuf)> = Vec::new();
         for e in rd.flatten() {
             let p = e.path();
@@ -268,7 +292,6 @@ pub fn blob_index(cat: &Path) -> std::collections::HashMap<String, MaskBlob> {
             }
         }
     }
-    out
 }
 
 /// Decode the embedded TIFF of a mask blob → (w, h, 8-bit gray pixels).
