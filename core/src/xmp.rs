@@ -220,6 +220,19 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
             r.grade_blend * 100.0
         ));
     }
+    if r.hdr_edit {
+        a.push_str(&format!(
+            "   crs:HDREditMode=\"1\" crs:HDRMaxValue=\"{:.0}\" crs:SDRBlend=\"{:.0}\" crs:SDRBrightness=\"{:.0}\" crs:SDRContrast=\"{:.0}\" crs:SDRHighlights=\"{:.0}\" crs:SDRShadows=\"{:.0}\" crs:SDRWhites=\"{:.0}\" crs:SDRClarity=\"{:.0}\"\n",
+            r.hdr_max,
+            r.sdr[0] * 100.0,
+            r.sdr[1] * 100.0,
+            r.sdr[2] * 100.0,
+            r.sdr[3] * 100.0,
+            r.sdr[4] * 100.0,
+            r.sdr[5] * 100.0,
+            r.sdr[6] * 100.0
+        ));
+    }
     if sc.rating != 0 {
         a.push_str(&format!("   xmp:Rating=\"{}\"\n", sc.rating.clamp(-1, 5)));
     }
@@ -819,6 +832,24 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
                 ];
             }
         }
+        // HDR edit mode (LR13+): HDREditMode=1 edits were authored in HDR
+        // space; SDRBlend/SDR* drive the SDR rendition. Our SDR render is
+        // that rendition — preserve the fields so they round-trip.
+        if attr(&body, "crs:HDREditMode").unwrap_or(0.0) >= 1.0 {
+            r.hdr_edit = true;
+        }
+        if let Some(v) = attr(&body, "crs:HDRMaxValue") {
+            r.hdr_max = v;
+        }
+        r.sdr = [
+            (attr(&body, "crs:SDRBlend").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+            (attr(&body, "crs:SDRBrightness").unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+            (attr(&body, "crs:SDRContrast").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+            (attr(&body, "crs:SDRHighlights").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+            (attr(&body, "crs:SDRShadows").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+            (attr(&body, "crs:SDRWhites").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+            (attr(&body, "crs:SDRClarity").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
+        ];
         // legacy split toning + PV2012 color grading share our
         // shadow/mid/highlight hue-sat fields
         let sh = attr(&body, "crs:SplitToningShadowHue")
@@ -1904,6 +1935,42 @@ mod tests {
         write_xmp(&asset, &sc).unwrap();
         let back = read_xmp(&asset).unwrap();
         assert_eq!(back.keywords, sc.keywords);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hdr_fields_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("xmp_test_hdr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // parse: LR13+ HDR edit metadata lands on the recipe
+        let r = crs_to_recipe(
+            r#"<rdf:Description rdf:about="" crs:HDREditMode="1" crs:HDRMaxValue="4" crs:SDRBlend="0" crs:SDRBrightness="5" crs:SDRContrast="25" crs:SDRHighlights="0" crs:SDRShadows="0" crs:SDRWhites="0" crs:SDRClarity="0"/>"#,
+        );
+        assert!(r.hdr_edit);
+        assert!((r.hdr_max - 4.0).abs() < 1e-6);
+        assert!((r.sdr[1] - 0.05).abs() < 1e-6);
+        assert!((r.sdr[2] - 0.25).abs() < 1e-6);
+        // write: emitted only when hdr_edit is set, and parses back
+        let asset = dir.join("hdr.arw");
+        std::fs::write(&asset, b"fake").unwrap();
+        let mut sc = Sidecar::default();
+        sc.recipe.hdr_edit = true;
+        sc.recipe.hdr_max = 4.0;
+        sc.recipe.sdr = [0.0, 0.05, 0.25, 0.0, 0.0, 0.0, 0.0];
+        write_xmp(&asset, &sc).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(xml.contains("crs:HDREditMode=\"1\""));
+        assert!(xml.contains("crs:HDRMaxValue=\"4\""));
+        assert!(xml.contains("crs:SDRContrast=\"25\""));
+        let back = read_xmp(&asset).unwrap();
+        assert!(back.recipe.hdr_edit);
+        assert!((back.recipe.hdr_max - 4.0).abs() < 1e-6);
+        assert!((back.recipe.sdr[1] - 0.05).abs() < 1e-6);
+        assert!((back.recipe.sdr[2] - 0.25).abs() < 1e-6);
+        // off by default — plain recipes don't gain HDR attrs
+        write_xmp(&asset, &Sidecar::default()).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(!xml.contains("HDREditMode"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

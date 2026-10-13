@@ -201,6 +201,18 @@ pub struct Recipe {
     pub pm_spots: Vec<PmSpot>,
     /// skin smoothing amount 0..1 (edge-aware, skin-hue weighted)
     pub beauty: f32,
+    /// LR HDR edit mode (HDREditMode=1): the develop edit was authored in
+    /// HDR space. SDR output is still just the SDR rendition — we preserve
+    /// the flag + SDR-rendition sliders for round-trip fidelity.
+    #[serde(default)]
+    pub hdr_edit: bool,
+    /// LR HDR display peak (HDRMaxValue, EV multiplier 1..16)
+    #[serde(default)]
+    pub hdr_max: f32,
+    /// LR SDR-rendition sliders [Blend, Brightness, Contrast, Highlights,
+    /// Shadows, Whites, Clarity] — 0..1
+    #[serde(default)]
+    pub sdr: [f32; 7],
     // ---- restoration + light fx ----
     /// chroma noise reduction 0..1 (spatial, pairs with noise_luma)
     pub noise_chroma: f32,
@@ -708,6 +720,9 @@ impl Default for Recipe {
             clones: Vec::new(),
             pm_spots: Vec::new(),
             beauty: 0.0,
+            hdr_edit: false,
+            hdr_max: 0.0,
+            sdr: [0.0; 7],
             noise_chroma: 0.2,
             dehaze: 0.0,
             ca_fix: 0.0,
