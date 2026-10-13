@@ -62,7 +62,7 @@ pub fn decode(encoded: &str) -> Option<Table> {
 /// [hue_shift_deg, sat_scale, val_scale] in the dng_hue_sat_map storage
 /// order — value outermost, hue middle, saturation fastest — the same
 /// layout ProfileLookTableData uses inside a .dcp. The encoding u32
-/// (and optional min/max/flags) trails the cells.
+/// (0=linear, 1=sRGB) trails the cells, then optional min/max/flags.
 fn parse_look(r: &mut Rd) -> Option<HsMap> {
     let version = r.u32()?;
     if !(1..=2).contains(&version) {
@@ -77,9 +77,11 @@ fn parse_look(r: &mut Rd) -> Option<HsMap> {
     for _ in 0..n {
         data.push([r.f32()?, r.f32()?, r.f32()?]);
     }
+    let srgb_encoded = r.u32().unwrap_or(0) == 1;
     Some(HsMap {
         dims: [hd, sd, vd],
         data,
+        srgb_encoded,
     })
 }
 

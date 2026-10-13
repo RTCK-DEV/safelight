@@ -1496,14 +1496,23 @@ fn qual_mask(c: vec3<f32>) -> f32 {
 
 // DNG ProfileLookTable / ProfileHueSatMap: trilinear HSV shift map.
 // Mirrors HsMap::lookup + apply in dcp.rs. lookbuf layout:
-//   [0..3] look dims, look cells, 256 tone-curve floats,
-//   [..+3] hsm dims, hsm cells
+//   [0..4] look dims+enc flag, look cells, 256 tone-curve floats,
+//   [..+4] hsm dims+enc flag, hsm cells
 fn map_cell(base: u32, h: u32, s: u32, v: u32, c: u32) -> f32 {
     let hd = u32(lookbuf[base]);
     let sd = u32(lookbuf[base + 1u]);
     // dng_hue_sat_map storage: value outer, hue middle, sat fastest
-    let i = base + 3u + ((v * hd + h) * sd + s) * 3u + c;
+    let i = base + 4u + ((v * hd + h) * sd + s) * 3u + c;
     return lookbuf[i];
+}
+
+fn map_srgb_encode(x: f32) -> f32 {
+    let xc = clamp(x, 0.0, 1.0);
+    return select(1.055 * pow(xc, 1.0 / 2.4) - 0.055, 12.92 * xc, xc <= 0.0031308);
+}
+fn map_srgb_decode(x: f32) -> f32 {
+    let xc = clamp(x, 0.0, 1.0);
+    return select(pow((xc + 0.055) / 1.055, 2.4), xc / 12.92, xc <= 0.04045);
 }
 
 fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
@@ -1511,6 +1520,7 @@ fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
     let sd = u32(lookbuf[base + 1u]);
     let vd = u32(lookbuf[base + 2u]);
     if (hd < 1u || sd < 1u || vd < 1u) { return x; }
+    let enc = lookbuf[base + 3u] > 0.5;
     let hsv = rgb_to_hsv(x);
     // no neutral early-out: the map's val scale applies to neutrals too
     // (mirrors dcp.rs HsMap::apply — Adobe Standard lifts shadows ~1.2x)
@@ -1522,7 +1532,12 @@ fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
     let s0 = u32(sf);
     let s1 = min(s0 + 1u, sd - 1u);
     let st = sf - f32(s0);
-    let vf = max(min(hsv.z * f32(vd - 1u), f32(vd - 1u) - 1e-6), 0.0);
+    // sRGB-encoded maps (ProfileLookTableEncoding=1): the V coordinate is
+    // encoded for the lookup and the scaled result decoded back — mirrors
+    // dng_reference.cpp RefBaselineHueSatMap / dcp.rs HsMap::apply
+    var v_enc = hsv.z;
+    if (enc && vd > 1u) { v_enc = map_srgb_encode(hsv.z); }
+    let vf = max(min(v_enc * f32(vd - 1u), f32(vd - 1u) - 1e-6), 0.0);
     let v0 = u32(vf);
     let v1 = min(v0 + 1u, vd - 1u);
     let vt = vf - f32(v0);
@@ -1547,7 +1562,9 @@ fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
             if (c == 1u) { d.y = v2; } else { d.z = v2; }
         }
     }
-    return hsv_to_rgb(hsv.x + d.x / 360.0, clamp(hsv.y * d.y, 0.0, 1.0), max(hsv.z * d.z, 0.0));
+    var v2 = clamp(v_enc * d.z, 0.0, 1.0);
+    if (enc) { v2 = map_srgb_decode(v2); }
+    return hsv_to_rgb(hsv.x + d.x / 360.0, clamp(hsv.y * d.y, 0.0, 1.0), v2);
 }
 
 fn look_apply(x: vec3<f32>) -> vec3<f32> {
@@ -1557,7 +1574,7 @@ fn look_apply(x: vec3<f32>) -> vec3<f32> {
 // DNG ProfileHueSatMap — same trilinear map evaluated in camera space
 // between WB and the color matrix (DNG spec order, mirrors colorize_plane).
 fn hsm_apply(x: vec3<f32>) -> vec3<f32> {
-    let base = 3u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u + 256u;
+    let base = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u + 256u;
     return map_apply(base, x);
 }
 
@@ -1574,9 +1591,9 @@ fn trap01(x: f32, ln: f32, lf: f32, uf: f32, un: f32) -> f32 {
 
 fn pc_base() -> u32 {
     let lk = u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]);
-    let hb = 3u + lk * 3u + 256u;
+    let hb = 4u + lk * 3u + 256u;
     let hm = u32(lookbuf[hb]) * u32(lookbuf[hb + 1u]) * u32(lookbuf[hb + 2u]);
-    return hb + 3u + hm * 3u;
+    return hb + 4u + hm * 3u;
 }
 
 fn pc_apply(x: vec3<f32>) -> vec3<f32> {
@@ -1649,7 +1666,7 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     x = look_apply(x);
     // DCP ProfileToneCurve — appended to lookbuf after the look cells
     if (pg.bmisc.w > 0.5) {
-        let pto = 3u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u;
+        let pto = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u;
         x = vec3<f32>(
             lookbuf[pto + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
             lookbuf[pto + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
@@ -3304,12 +3321,17 @@ impl Gpu {
         // dims+cells]. Tone guarded by bmisc.w; maps self-guard via dims==0.
         let push_map = |v: &mut Vec<f32>, m: &Option<crate::dcp::HsMap>| match m {
             Some(m) if !m.data.is_empty() => {
-                v.extend([m.dims[0] as f32, m.dims[1] as f32, m.dims[2] as f32]);
+                v.extend([
+                    m.dims[0] as f32,
+                    m.dims[1] as f32,
+                    m.dims[2] as f32,
+                    if m.srgb_encoded { 1.0 } else { 0.0 },
+                ]);
                 for cell in &m.data {
                     v.extend_from_slice(cell);
                 }
             }
-            _ => v.extend([0.0; 3]),
+            _ => v.extend([0.0; 4]),
         };
         let look32: Vec<f32> = {
             let mut v = Vec::new();

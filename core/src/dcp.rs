@@ -27,6 +27,31 @@ pub struct HsMap {
     /// dng_hue_sat_map storage order: value outermost, hue middle,
     /// saturation fastest — idx = (v * hue_divs + h) * sat_divs + s.
     pub data: Vec<[f32; 3]>,
+    /// ProfileHueSatMapEncoding / ProfileLookTableEncoding (0xC7A3 / 0xC7A4):
+    /// true when the table is declared sRGB-encoded. Per dng_reference.cpp
+    /// RefBaselineHueSatMap, only the V coordinate is gamma-encoded for the
+    /// table lookup and the scaled V is decoded back to linear afterwards —
+    /// hue/sat coords stay linear. Sony camera-matching DCPs all ship
+    /// LookTableEncoding=1; sampling them at linear V reads the wrong cells.
+    pub srgb_encoded: bool,
+}
+
+fn hsm_srgb_encode(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.0031308 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn hsm_srgb_decode(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 impl HsMap {
@@ -124,10 +149,26 @@ impl HsMap {
         let [h, s, v] = Self::hsv(rgb);
         // note: neutrals (s≈0) must NOT early-out — the map's val scale
         // still applies to them (Adobe Standard lifts shadows ~1.2×)
-        let d = self.lookup(h, s, v);
+        //
+        // sRGB-encoded tables (dng_reference.cpp RefBaselineHueSatMap):
+        // the V coordinate is sRGB-encoded before the table lookup when
+        // valDivisions >= 2, valScale multiplies the ENCODED v, and the
+        // result is decoded back — so v' = dec(enc(v) * scale). For a 2.5D
+        // map (vd < 2) the encode is skipped but the decode still applies.
+        let enc = self.srgb_encoded;
+        let mut v_enc = v;
+        if enc && self.dims[2] > 1 {
+            v_enc = hsm_srgb_encode(v);
+        }
+        let d = self.lookup(h, s, v_enc);
         let h2 = h + d[0] / 360.0;
         let s2 = (s * d[1]).clamp(0.0, 1.0);
-        let v2 = (v * d[2]).max(0.0);
+        let v2_enc = (v_enc * d[2]).clamp(0.0, 1.0);
+        let v2 = if enc {
+            hsm_srgb_decode(v2_enc)
+        } else {
+            v2_enc.max(0.0)
+        };
         Self::rgb_from_hsv(h2, s2, v2)
     }
 }
@@ -521,6 +562,13 @@ impl DcpProfile {
             .and_then(|v| v.first().copied())
             .unwrap_or(0.0);
 
+        // 0xC7A3 ProfileHueSatMapEncoding / 0xC7A4 ProfileLookTableEncoding:
+        // 0 = linear, 1 = sRGB-encoded V coordinate.
+        let hsm_encoded = t
+            .u32_tag(0xC7A3)
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0)
+            == 1;
         let read_hsm = |dims_tag: u16, d1: u16, d2: u16| -> (Option<HsMap>, Option<HsMap>) {
             let dims = t.u32_tag(dims_tag).unwrap_or_default();
             let mut a = None;
@@ -543,6 +591,7 @@ impl DcpProfile {
                             *slot = Some(HsMap {
                                 dims: [dims[0], dims[1], dims[2]],
                                 data,
+                                srgb_encoded: hsm_encoded,
                             });
                         }
                     }
@@ -560,6 +609,11 @@ impl DcpProfile {
         p.hsm1 = h1;
         p.hsm2 = h2;
 
+        let look_encoded = t
+            .u32_tag(0xC7A4)
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0)
+            == 1;
         let lt_dims = t.u32_tag(T_LOOKDIMS).unwrap_or_default();
         if lt_dims.len() >= 3 {
             let want = (lt_dims[0] * lt_dims[1] * lt_dims[2] * 3) as usize;
@@ -572,6 +626,7 @@ impl DcpProfile {
                     p.look_table = Some(HsMap {
                         dims: [lt_dims[0], lt_dims[1], lt_dims[2]],
                         data,
+                        srgb_encoded: look_encoded,
                     });
                 }
             }
@@ -997,4 +1052,77 @@ pub fn find_profile(make: &str, model: &str, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srgb_encoded_map_v_axis() {
+        // dng_reference.cpp RefBaselineHueSatMap: an encoded map samples the
+        // table at srgb_encode(v) and the valScale multiplies the encoded
+        // value before decode — for dark pixels a scale of 1.0 at the
+        // encoded coord is identity, while sampling at linear v would read
+        // a different cell entirely.
+        // 1 hue × 1 sat? need >=2 sat to interpolate; use 2x2x2 grid where
+        // val scale differs by v cell: 0.5 at v=0 cell, 2.0 at v=1 cell.
+        let mut data = Vec::new();
+        for v in 0..2 {
+            for _h in 0..2 {
+                for _s in 0..2 {
+                    data.push([0.0, 1.0, if v == 0 { 0.5 } else { 2.0 }]);
+                }
+            }
+        }
+        let linear = HsMap {
+            dims: [2, 2, 2],
+            data: data.clone(),
+            srgb_encoded: false,
+        };
+        let enc = HsMap {
+            dims: [2, 2, 2],
+            data,
+            srgb_encoded: true,
+        };
+        // dark neutral pixel: linear v=0.02 -> sample near v cell 0
+        // (scale 0.5 -> v~0.01); encoded v = srgb(0.02)=0.156 -> still cell
+        // 0-ish but valScale applies in encoded domain then decodes.
+        let lin_out = linear.apply([0.02, 0.02, 0.02])[0];
+        let enc_out = enc.apply([0.02, 0.02, 0.02])[0];
+        assert!((lin_out - 0.01).abs() < 3e-3, "lin_out={lin_out}");
+        let expected = {
+            // v_enc = srgb_encode(0.02); the v-axis interpolant t = v_enc
+            // blends cell scales .5 and 2.0: scale = .5 + 1.5*t; the scaled
+            // encoded v then decodes back to linear
+            let v_enc = 1.055 * 0.02f32.powf(1.0 / 2.4) - 0.055;
+            let scale = 0.5 + 1.5 * v_enc;
+            let v2 = (v_enc * scale).clamp(0.0, 1.0);
+            if v2 <= 0.04045 {
+                v2 / 12.92
+            } else {
+                ((v2 + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        assert!(
+            (enc_out - expected).abs() < 1e-4,
+            "enc_out={enc_out} expected={expected} lin_out={lin_out}"
+        );
+        assert!(enc_out != lin_out, "encoding must change the result");
+    }
+
+    #[test]
+    fn unencoded_map_unchanged() {
+        // identity map (hue shift 0, scales 1) is a no-op either way
+        let data = vec![[0.0, 1.0, 1.0]; 8];
+        for enc in [false, true] {
+            let m = HsMap {
+                dims: [2, 2, 2],
+                data: data.clone(),
+                srgb_encoded: enc,
+            };
+            let o = m.apply([0.3, 0.5, 0.2]);
+            assert!((o[0] - 0.3).abs() < 1e-3 && (o[1] - 0.5).abs() < 1e-3);
+        }
+    }
 }

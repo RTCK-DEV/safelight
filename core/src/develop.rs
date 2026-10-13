@@ -317,6 +317,14 @@ fn curve_lut(points: &[[f32; 2]], default: impl Fn(f32) -> f32, maxy: f32) -> Ve
         .collect();
     mid.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
     mid.retain(|p| p[0] > 0.0 && p[0] < 1.0);
+    if mid.is_empty() {
+        // endpoint-only curve (e.g. LR "Linear" = [[0,0],[1,1]]): the
+        // Catmull-Rom endpoint clamp would bow it ~20% dark — a two-point
+        // ramp IS the default mapping, emit it directly.
+        return (0..256)
+            .map(|i| default(i as f32 / 255.0).clamp(0.0, maxy))
+            .collect();
+    }
     pts.extend(mid);
     pts.push([1.0, default(1.0)]);
     let n = pts.len();
@@ -3498,7 +3506,12 @@ fn develop_raster(
     } else {
         None
     };
-    let mut p = build_params(&fake, r, stats.as_ref());
+    // raster input is already display-rendered: LR applies no raw
+    // tone-scale compensation to it, so build params with pv=0 (skips the
+    // PV2012 compensation blend while keeping the recipe's own curve)
+    let mut rr = r.clone();
+    rr.process_version = 0.0;
+    let mut p = build_params(&fake, &rr, stats.as_ref());
     // pm coords for a raster (e.g. enhanced DNG) live in its own pixel frame
     p.pm_frame = [w as f32, h as f32];
     // raster is already sRGB-encoded u16: decode gamma to linear, adjust, re-encode
@@ -6062,6 +6075,29 @@ mod tests {
         assert!(lift11e < lift11, "exposure taper: {lift11e} vs {lift11}");
     }
 
+    /// LR "Linear" maps to an endpoint-only curve [[0,0],[1,1]] — the
+    /// Catmull-Rom endpoint clamp must NOT bow it dark; the lut is the
+    /// identity ramp. Regression test for the ~20% toe-darkening bug.
+    #[test]
+    fn endpoint_only_curve_is_identity() {
+        let lut = curve_lut(&[[0.0, 0.0], [1.0, 1.0]], |x| x, 1.0);
+        for i in [0usize, 64, 128, 192, 255] {
+            let want = i as f32 / 255.0;
+            assert!(
+                (lut[i] - want).abs() < 1e-3,
+                "lut[{i}]={} want {want}",
+                lut[i]
+            );
+        }
+        // a curve WITH interior points still interpolates
+        let curved = curve_lut(&[[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]], |x| x, 1.0);
+        assert!(
+            (curved[128] - 0.25).abs() < 0.05,
+            "interior point not honored: {}",
+            curved[128]
+        );
+    }
+
     /// diagnostic (needs the local RAW collection): stage means through the
     /// profile pipeline on a dark Sony file — lin (ProPhoto) -> adjust ->
     /// srgb — so a stage that loses light is visible by name.
@@ -6081,7 +6117,11 @@ mod tests {
             return;
         };
         let mut r = crate::recipe::Recipe::default();
-        r.profile = "Adobe Color".to_string();
+        if let Ok(pr) = std::env::var("SAFELIGHT_STAGE_PROFILE") {
+            r.profile = pr;
+        } else {
+            r.profile = "Adobe Color".to_string();
+        }
         r.curve = vec![[0.0, 0.0], [1.0, 1.0]];
         let prm = build_params(&m, &r, None);
         let d = crate::decode::Decoded::Mosaic(m);
@@ -6129,6 +6169,20 @@ mod tests {
             n += 1;
         }
         let n = n.max(1) as f64;
+        eprintln!(
+            "pivot={:.3} exp_mul={:.3} lut[0]={:.4} lut[64]={:.4} lut[128]={:.4} lut[255]={:.4} has_tone={} tone_lut[32]={:.4} tone_lut[128]={:.4} ptone[64]={:.4} ptone[128]={:.4}",
+            prm.pivot,
+            prm.exposure_mul,
+            prm.lut[0],
+            prm.lut[64],
+            prm.lut[128],
+            prm.lut[255],
+            prm.has_tone,
+            prm.tone_lut[32],
+            prm.tone_lut[128],
+            prm.profile_tone_lut.get(64).copied().unwrap_or(-1.0),
+            prm.profile_tone_lut.get(128).copied().unwrap_or(-1.0),
+        );
         eprintln!(
             "lin={:.5} look={:.5} tone={:.5} pp={:.5} adj={:.5} srgb={:.5}",
             s_lin / n,
