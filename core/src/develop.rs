@@ -1233,11 +1233,12 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         let Some((pw, ph, src)) = load_pm_map(s) else {
             continue;
         };
-        let (ec, er) = frame_to_src(s.ellipse[0], s.ellipse[1], m.w, m.h, m.info.flip);
-        let (fw, fh) = match m.info.flip {
-            5 | 6 => (m.h as f32, m.w as f32),
-            _ => (m.w as f32, m.h as f32),
-        };
+        // pm coords — target/search/source *and* the feather ellipse — live
+        // in LR's whole-image space, which is sensor-native like the mask
+        // bitmaps (verified: target/sensor_dims ≈ ellipse). Scale the
+        // normalized ellipse straight into sensor px; no flip mapping.
+        let (ec, er) = (s.ellipse[0] * m.w as f32, s.ellipse[1] * m.h as f32);
+        let (fw, fh) = (m.w as f32, m.h as f32);
         pms.push(PmMap {
             src,
             pw,
@@ -3709,6 +3710,28 @@ fn pm_heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, pms: &[PmMap], frame: [
         let yi = (y.round() as i32).clamp(0, h as i32 - 1) as usize;
         orig[yi * w + xi]
     };
+    // source fetch = 3×3 box mean at ±2 px. LR applies PatchMatch maps in
+    // the gradient domain (Method="poisson"), so per-px outliers on the
+    // source side never reach the output; a small box gives the same
+    // robustness while still passing texture above ~4 px (mirrors the
+    // gpu.rs source fetch — keep in sync).
+    let sample_src = |x: f32, y: f32| -> [f32; 3] {
+        let mut acc = [0.0f32; 3];
+        for oy in -2i32..=2 {
+            for ox in -2i32..=2 {
+                if (ox + oy) % 2 != 0 {
+                    continue;
+                }
+                let xi = ((x + ox as f32).round() as i32).clamp(0, w as i32 - 1) as usize;
+                let yi = ((y + oy as f32).round() as i32).clamp(0, h as i32 - 1) as usize;
+                let p = orig[yi * w + xi];
+                for c in 0..3 {
+                    acc[c] += p[c] / 13.0;
+                }
+            }
+        }
+        acc
+    };
     // patch-space source lookup in lin px; taps outside the map reuse the
     // pixel's own source — mirrors the gpu.rs pm loop (keep in sync).
     let src_at = |pm: &PmMap, px: f32, py: f32, fb: [f32; 2]| -> [f32; 2] {
@@ -3725,7 +3748,13 @@ fn pm_heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, pms: &[PmMap], frame: [
         // iterate the dst rect in lin px — it may be smaller than pw×ph
         let dw = ((pm.dst[2] - pm.dst[0]) * sc).round().max(1.0) as i32;
         let dh = ((pm.dst[3] - pm.dst[1]) * sc).round().max(1.0) as i32;
-        let tap_r = (pm.ell[2] + pm.ell[3]) * 0.25 * sc; // half the mean radius
+        // low-freq correction LP(t − sv) sampled per px over a 4×4 tap grid
+        // spanning ~patch/4. A patch-wide constant keeps each PatchMatch
+        // fragment's own level (visible as blocky speckle); a tap radius
+        // covering several fragments restores the target's smooth field
+        // while keeping the donor's fine texture (mirrors the gpu.rs pm
+        // loop — keep in sync).
+        let tap_r = (dw.max(dh) as f32 * 0.25).max(1.0);
         for y in 0..dh {
             for x in 0..dw {
                 let (dx, dy) = (pm.dst[0] * sc + x as f32, pm.dst[1] * sc + y as f32);
@@ -3741,24 +3770,21 @@ fn pm_heal_lin(lin: &mut [[f32; 3]], w: usize, h: usize, pms: &[PmMap], frame: [
                 if xi < 0 || yi < 0 || xi >= w as i32 || yi >= h as i32 {
                     continue;
                 }
-                // low-freq diff = mean of (target-src) over centre + 8 taps
                 let own = src_at(pm, dx, dy, [dx, dy]);
                 let mut acc = [0.0f32; 3];
-                for k in 0..9 {
-                    let (tx, ty) = if k == 0 {
-                        (dx, dy)
-                    } else {
-                        let a = (k - 1) as f32 * std::f32::consts::TAU / 8.0;
-                        (dx + tap_r * a.cos(), dy + tap_r * a.sin())
-                    };
-                    let so = src_at(pm, tx, ty, own);
-                    let t = sample(tx, ty);
-                    let sv = sample(so[0], so[1]);
-                    for c in 0..3 {
-                        acc[c] += (t[c] - sv[c]) / 9.0;
+                for gy in 0..4 {
+                    for gx in 0..4 {
+                        let tx = dx - tap_r + (gx as f32 + 0.5) * tap_r * 0.5;
+                        let ty = dy - tap_r + (gy as f32 + 0.5) * tap_r * 0.5;
+                        let so = src_at(pm, tx, ty, own);
+                        let t = sample(tx, ty);
+                        let svv = sample_src(so[0], so[1]);
+                        for c in 0..3 {
+                            acc[c] += (t[c] - svv[c]) / 16.0;
+                        }
                     }
                 }
-                let sv = sample(own[0], own[1]);
+                let sv = sample_src(own[0], own[1]);
                 let li = yi as usize * w + xi as usize;
                 for c in 0..3 {
                     let healed = sv[c] + acc[c];
@@ -4849,7 +4875,8 @@ fn load_pm_map(s: &crate::recipe::PmSpot) -> Option<(usize, usize, Vec<[f32; 2]>
         return None;
     }
     let (sw, sh) = (s.search[2] - s.search[0], s.search[3] - s.search[1]);
-    let src = img
+    let (pw, ph) = (pw as usize, ph as usize);
+    let raw: Vec<[f32; 2]> = img
         .into_raw()
         .chunks_exact(3)
         .map(|px| {
@@ -4859,7 +4886,35 @@ fn load_pm_map(s: &crate::recipe::PmSpot) -> Option<(usize, usize, Vec<[f32; 2]>
             ]
         })
         .collect();
-    Some((pw as usize, ph as usize, src))
+    // 3×3 median on the offset field — isolated map outliers point at
+    // unrelated content and show up as speckle (LR's gradient-domain apply
+    // ignores them); coherent fragments survive the median.
+    let mut src = raw.clone();
+    let mut win = [0.0f32; 18];
+    for y in 0..ph {
+        for x in 0..pw {
+            let mut n = 0;
+            for oy in -1i32..=1 {
+                for ox in -1i32..=1 {
+                    let (xx, yy) = (
+                        (x as i32 + ox).clamp(0, pw as i32 - 1) as usize,
+                        (y as i32 + oy).clamp(0, ph as i32 - 1) as usize,
+                    );
+                    let v = raw[yy * pw + xx];
+                    win[n] = v[0];
+                    win[9 + n] = v[1];
+                    n += 1;
+                }
+            }
+            for ch in 0..2 {
+                let mut w8 = [0.0f32; 9];
+                w8.copy_from_slice(&win[ch * 9..ch * 9 + 9]);
+                w8.sort_by(|a, b| a.total_cmp(b));
+                src[y * pw + x][ch] = w8[4];
+            }
+        }
+    }
+    Some((pw, ph, src))
 }
 
 /// bilinear sample of the AI subject matte at normalized coords; 0 when empty

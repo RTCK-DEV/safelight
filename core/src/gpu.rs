@@ -1199,25 +1199,39 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         ));
         let blend = (1.0 - sstep(0.7, 1.0, dd)) * pg.pm[s * 3u + 2u].y;
         if (blend <= 0.0) { continue; }
-        let tap_r = (ep.z + ep.w) * 0.25;
+        // per-px low-freq correction LP(t − sv): 4×4 tap grid spanning
+        // ±0.75·patch/4. Source fetch is a 13-tap box at ±2 px — LR applies
+        // PatchMatch maps in the gradient domain (Method="poisson"), so the
+        // source must not inject per-px outliers (mirrors pm_heal_lin).
+        let tap_r = max(max(pr.z, pr.w) * sc * 0.25, 1.0);
         var acc = vec3<f32>(0.0);
-        for (var k = 0u; k < 9u; k = k + 1u) {
-            var tp = pxf;
-            if (k > 0u) {
-                let a = f32(k - 1u) * 6.2832 / 8.0;
-                tp = pxf + vec2<f32>(cos(a), sin(a)) * tap_r;
+        for (var gy = 0u; gy < 4u; gy = gy + 1u) {
+            for (var gx = 0u; gx < 4u; gx = gx + 1u) {
+                let tp = pxf - vec2<f32>(tap_r) + vec2<f32>((f32(gx) + 0.5) * tap_r * 0.5, (f32(gy) + 0.5) * tap_r * 0.5);
+                var so = own;
+                let tx = i32(floor((tp.x - pr.x) / sc));
+                let ty = i32(floor((tp.y - pr.y) / sc));
+                if (tx >= 0 && ty >= 0 && tx < i32(pr.z) && ty < i32(pr.w)) {
+                    so = pmbuf[base + u32(ty) * u32(pr.z) + u32(tx)];
+                }
+                let t = px_at(i32(tp.x + 0.5), i32(tp.y + 0.5));
+                var svv = vec3<f32>(0.0);
+                for (var oy = -2i; oy <= 2i; oy = oy + 1i) {
+                    for (var ox = -2i; ox <= 2i; ox = ox + 1i) {
+                        if ((ox + oy) % 2 != 0i) { continue; }
+                        svv = svv + px_at(i32(so.x + 0.5) + ox, i32(so.y + 0.5) + oy) / 13.0;
+                    }
+                }
+                acc = acc + (t - svv) / 16.0;
             }
-            var so = own;
-            let tx = i32(floor((tp.x - pr.x) / sc));
-            let ty = i32(floor((tp.y - pr.y) / sc));
-            if (tx >= 0 && ty >= 0 && tx < i32(pr.z) && ty < i32(pr.w)) {
-                so = pmbuf[base + u32(ty) * u32(pr.z) + u32(tx)];
-            }
-            let t = px_at(i32(tp.x + 0.5), i32(tp.y + 0.5));
-            let svv = px_at(i32(so.x + 0.5), i32(so.y + 0.5));
-            acc = acc + (t - svv) / 9.0;
         }
-        let sv = px_at(i32(own.x + 0.5), i32(own.y + 0.5));
+        var sv = vec3<f32>(0.0);
+        for (var oy = -2i; oy <= 2i; oy = oy + 1i) {
+            for (var ox = -2i; ox <= 2i; ox = ox + 1i) {
+                if ((ox + oy) % 2 != 0i) { continue; }
+                sv = sv + px_at(i32(own.x + 0.5) + ox, i32(own.y + 0.5) + oy) / 13.0;
+            }
+        }
         c = mix(c, sv + acc, blend);
     }
     // clone stamps: copy the source patch into the destination circle

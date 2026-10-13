@@ -315,6 +315,13 @@ fn blob_tiff(b: &MaskBlob) -> Option<Vec<u8>> {
 pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
     let d = blob_tiff(b)?;
     let t = &d[..];
+    // JPEG(7)/JXL(52546) tiles must use the custom decoders — the image
+    // crate may misinterpret the payload and return noise instead of an err
+    if let Some((_, _, comp, ..)) = tiff_layout(t) {
+        if matches!(comp, 7 | 52546) {
+            return decode_tiff_tiles(t);
+        }
+    }
     if let Ok(dec) = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(t)) {
         if let Ok(img) = image::DynamicImage::from_decoder(dec) {
             let img = img.to_luma8();
@@ -334,6 +341,14 @@ pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
 pub fn decode_blob_rgb16(b: &MaskBlob) -> Option<(u32, u32, Vec<Vec<u16>>)> {
     let d = blob_tiff(b)?;
     let t = &d[..];
+    // compressed tiles (JPEG=7, JXL=52546) must go through the custom
+    // multi-plane decoder — the image crate may "succeed" with a garbage
+    // interpretation of the payload and silently return noise.
+    if let Some((_, _, comp, ..)) = tiff_layout(t) {
+        if matches!(comp, 7 | 52546) {
+            return decode_tiff_tiles_rgb(t);
+        }
+    }
     if let Ok(dec) = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(t)) {
         if let Ok(img) = image::DynamicImage::from_decoder(dec) {
             let rgb = img.to_rgb16();
@@ -493,7 +508,7 @@ fn decode_tiff_tiles_rgb(t: &[u8]) -> Option<(u32, u32, Vec<Vec<u16>>)> {
 
 /// JXL codestream → (w, h, per-channel u16 planes)
 fn jxl_planes_u16(b: &[u8]) -> Option<(usize, usize, Vec<Vec<u16>>)> {
-    let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
+    let mut img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
     let render = img.render_frame(0).ok()?;
     let planes: Vec<Vec<u16>> = render
         .image_planar()
@@ -526,7 +541,7 @@ fn jpeg_planes_u16(b: &[u8]) -> Option<(usize, usize, Vec<Vec<u16>>)> {
 
 /// decode one JPEG XL codestream → (w, h, 8-bit gray)
 fn jxl_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
+    let mut img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
     let render = img.render_frame(0).ok()?;
     let planes = render.image_planar();
     let fb = planes.first()?;
@@ -762,7 +777,8 @@ pub fn apply_blob_masks(
         .unwrap_or("img")
         .to_string();
     for w in &mut r.windows {
-        if w.mask_digest.is_empty() || !w.mask_file.is_empty() {
+        if w.mask_digest.is_empty() || (!w.mask_file.is_empty() && dir.join(&w.mask_file).exists())
+        {
             continue;
         }
         let Some(mb) = blobs.get(&w.mask_digest.to_ascii_uppercase()) else {
@@ -784,7 +800,7 @@ pub fn apply_blob_masks(
     // PatchMatch remove spots: pm_patch digest → 3×16-bit offset map,
     // written as a 16-bit RGB PNG so the u16 planes survive intact.
     for s in &mut r.pm_spots {
-        if s.digest.is_empty() || !s.file.is_empty() {
+        if s.digest.is_empty() || (!s.file.is_empty() && dir.join(&s.file).exists()) {
             continue;
         }
         let Some(mb) = blobs.get(&s.digest.to_ascii_uppercase()) else {
@@ -798,9 +814,10 @@ pub fn apply_blob_masks(
         }
         let mut rgb = Vec::with_capacity((pw * ph) as usize * 6);
         for i in 0..(pw * ph) as usize {
-            rgb.extend_from_slice(&planes[0][i].to_be_bytes());
-            rgb.extend_from_slice(&planes[1][i].to_be_bytes());
-            rgb.extend_from_slice(&planes.get(2).map(|p| p[i]).unwrap_or(0).to_be_bytes());
+            // image's PNG encoder expects native-endian u16 samples
+            rgb.extend_from_slice(&planes[0][i].to_ne_bytes());
+            rgb.extend_from_slice(&planes[1][i].to_ne_bytes());
+            rgb.extend_from_slice(&planes.get(2).map(|p| p[i]).unwrap_or(0).to_ne_bytes());
         }
         let name = format!("{stem}.slpm-{}.png", &s.digest[..8.min(s.digest.len())]);
         let out = dir.join(&name);
@@ -1427,6 +1444,23 @@ pub fn lua_to_xmp(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// pm patchmaps are written as 16-bit RGB PNGs; the image crate's PNG
+    /// encoder wants native-endian u16 samples, so a `to_be_bytes` write
+    /// round-trips as byte-swapped garbage. Pin the convention down.
+    #[test]
+    fn rgb16_png_roundtrip() {
+        let vals: Vec<u16> = (0..48 * 3).map(|i| (i * 1377) as u16 ^ 0x5A5A).collect();
+        let mut rgb = Vec::new();
+        for &v in &vals {
+            rgb.extend_from_slice(&v.to_ne_bytes());
+        }
+        let p = std::env::temp_dir().join("sl_rgb16_rt.png");
+        image::save_buffer(&p, &rgb, 16, 3, image::ColorType::Rgb16).unwrap();
+        let back = image::open(&p).unwrap().to_rgb16();
+        assert_eq!(&back.into_raw()[..], &vals[..]);
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn lua_basic_scalars() {
         let r = crate::xmp::crs_to_recipe(&lua_to_xmp(
@@ -1652,6 +1686,73 @@ mod diag_tests {
     }
 
     /// diagnostic: decode a PatchMatch pm_patch TIFF at full fidelity and
+    /// Inspect a dumped JXL tile directly: header info + per-frame render
+    /// stats (SL_JXL_FILE env, defaults to the 03B7DAA4 tile in temp).
+    #[test]
+    #[ignore]
+    fn jxl_inspect() {
+        let path = std::env::var("SL_JXL_FILE")
+            .unwrap_or_else(|_| r"C:\Users\stu12\AppData\Local\Temp\03B7DAA4.jxl".into());
+        let data = std::fs::read(&path).unwrap();
+        let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&data)).unwrap();
+        let h = img.image_header();
+        eprintln!(
+            "size {}x{} bit_depth {:?} orient {:?} xyb? color={:?} frames_loaded={}",
+            h.size.width,
+            h.size.height,
+            h.metadata.bit_depth,
+            h.metadata.orientation,
+            h.metadata.colour_encoding,
+            img.num_loaded_frames()
+        );
+        let encs: Vec<(&str, Option<jxl_oxide::EnumColourEncoding>)> = vec![
+            ("default", None),
+            (
+                "srgb",
+                Some(jxl_oxide::EnumColourEncoding::srgb(
+                    jxl_oxide::RenderingIntent::Relative,
+                )),
+            ),
+            (
+                "srgb_linear",
+                Some(jxl_oxide::EnumColourEncoding::srgb_linear(
+                    jxl_oxide::RenderingIntent::Relative,
+                )),
+            ),
+        ];
+        for (tag, enc) in encs {
+            let mut img =
+                jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&data)).unwrap();
+            if let Some(e) = enc {
+                img.request_color_encoding(e);
+            }
+            let r = img.render_frame(0).unwrap();
+            let mut dump: Vec<u8> = Vec::new();
+            for (c, fb) in r.image_planar().iter().enumerate().take(4) {
+                let b = fb.buf();
+                let (mn, mx) = b
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                // spatial roughness: mean |dx|
+                let w = fb.width();
+                let rough: f32 = b
+                    .chunks_exact(w)
+                    .map(|row| row.windows(2).map(|w2| (w2[1] - w2[0]).abs()).sum::<f32>())
+                    .sum::<f32>()
+                    / (b.len() as f32);
+                eprintln!(
+                    "{tag} ch{c} {}x{} min {mn:.4} max {mx:.4} rough {rough:.4}",
+                    fb.width(),
+                    fb.height()
+                );
+                for &v in b {
+                    dump.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            std::fs::write(path.replace(".jxl", &format!("_{tag}.bin")), &dump).unwrap();
+        }
+    }
+
     /// dump per-channel stats (offset-map structure analysis).
     /// SL_PM_DIGEST = hex digest, searches every *.lrcat-data blob.
     #[test]
@@ -1669,12 +1770,16 @@ mod diag_tests {
             if d.extension().and_then(|s| s.to_str()) != Some("lrcat-data") {
                 continue;
             }
+            eprintln!("scan dir {d:?}");
             for f in std::fs::read_dir(&d).unwrap().flatten() {
                 let p = f.path();
                 if p.extension().and_then(|s| s.to_str()) != Some("blob") {
                     continue;
                 }
-                let Ok(r) = std::fs::read(&p) else { continue };
+                let Ok(r) = std::fs::read(&p) else {
+                    eprintln!("  read fail {p:?}");
+                    continue;
+                };
                 if let Some(i) = r.windows(32).position(|w| w == dig.as_bytes()) {
                     // TIFF header follows the record prefix
                     if let Some(t) = r[i..]
@@ -1696,6 +1801,72 @@ mod diag_tests {
         assert!(!raw.is_empty(), "digest {dig} not found in blob stores");
         let t = &raw[pos..];
         eprintln!("record at blob offset {pos}");
+        // compare the production decode path (blob_index + decode_blob_rgb16)
+        let cat = std::env::var("SL_LRCAT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::Path::new(&dir).join("Lightroom Catalog-v13-3.lrcat"));
+        if cat.exists() {
+            let idx = blob_index(&cat);
+            eprintln!("index has {} digests", idx.len());
+            if let Some(mb) = idx.get(&dig) {
+                eprintln!(
+                    "resolved: {:?} off={} len={} inline={}",
+                    mb.path.file_name().unwrap_or_default(),
+                    mb.off,
+                    mb.len,
+                    mb.inline.len()
+                );
+                if let Some(t) = blob_tiff(mb) {
+                    eprintln!(
+                        "blob_tiff len {} head {:02x?}",
+                        t.len(),
+                        &t[..8.min(t.len())]
+                    );
+                    if let Some(l) = tiff_layout(&t) {
+                        eprintln!(
+                            "layout: w={} h={} comp={} tiles={}",
+                            l.0,
+                            l.1,
+                            l.2,
+                            l.5.len()
+                        );
+                    } else {
+                        eprintln!("tiff_layout FAILED");
+                    }
+                }
+                if let Some((w2, h2, pl2)) = decode_blob_rgb16(mb) {
+                    eprintln!("decode_blob_rgb16 {w2}x{h2} ch={}", pl2.len());
+                    for (c, p) in pl2.iter().enumerate() {
+                        let rough: f64 = p
+                            .chunks_exact(w2 as usize)
+                            .map(|row| {
+                                row.windows(2)
+                                    .map(|w| (w[1] as f64 - w[0] as f64).abs())
+                                    .sum::<f64>()
+                            })
+                            .sum::<f64>()
+                            / (p.len() as f64 * 65535.0);
+                        eprintln!(
+                            "  ch{c}: min={} max={} rough={rough:.4}",
+                            p.iter().min().unwrap(),
+                            p.iter().max().unwrap()
+                        );
+                    }
+                    // dump u16 planes for offline compare
+                    let out2 = std::env::temp_dir().join(format!("blob_{}.bin", &dig[..8]));
+                    let mut b2 = Vec::new();
+                    for p in &pl2 {
+                        for &v in p {
+                            b2.extend(v.to_le_bytes());
+                        }
+                    }
+                    std::fs::write(&out2, &b2).ok();
+                    eprintln!("  blob planes → {}", out2.display());
+                } else {
+                    eprintln!("decode_blob_rgb16 FAILED");
+                }
+            }
+        }
         // payload: FF D8 JPEG or FF 0A JPEG XL codestream
         let js = t
             .windows(2)
@@ -1706,7 +1877,7 @@ mod diag_tests {
             let (w, h, _p, pl) = jpeg_lossless_planes(&t[js..]).expect("decode pm_patch jpeg");
             (w, h, pl)
         } else {
-            let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&t[js..]))
+            let mut img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&t[js..]))
                 .expect("jxl header");
             let render = img.render_frame(0).expect("jxl frame");
             let planes: Vec<Vec<i32>> = render
