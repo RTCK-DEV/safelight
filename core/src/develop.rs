@@ -1697,9 +1697,10 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
             // extended-Reinhard shoulder
             y = y * (1.0 + y / wl2) / (1.0 + y);
             y /= norm;
-            // highlights recovery: extra compression in the upper band
+            // highlights recovery: LR slider <0 recovers (compresses the
+            // upper band), >0 brightens — extra compression in the upper band
             if hl != 0.0 {
-                y /= 1.0 + hl * 0.9 * sstep(0.45, 1.2, y);
+                y /= 1.0 - hl * 0.9 * sstep(0.45, 1.2, y);
             }
             y.clamp(0.0, 1.0)
         })
@@ -2190,6 +2191,20 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     if p.mono[0] != 0.0 || p.mono[1] != 0.0 || p.mono[2] != 0.0 {
         let g = p.mono[0] * x[0] + p.mono[1] * x[1] + p.mono[2] * x[2];
         x = [g, g, g];
+    }
+    // PV2012-style overrange: channels above white fold toward the luma
+    // on an exponential shoulder so hot colors converge to ~white instead
+    // of hard-clipping at the curve LUT (mirrors gpu.rs)
+    let m = x[0].max(x[1]).max(x[2]);
+    if m > 1.0 {
+        let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.0);
+        let h = (1.0 - l).max(0.02);
+        for c in &mut x {
+            let e = *c - l;
+            if e > 0.0 {
+                *c = l + h * (1.0 - (-e / h).exp());
+            }
+        }
     }
     // tone curve lut
     for c in &mut x {
@@ -4462,7 +4477,7 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
             }
         }
         if hi != 0.0 {
-            let d = 1.0 + hi * mask * 0.9 * sstep(0.45, 1.2, l);
+            let d = 1.0 - hi * mask * 0.9 * sstep(0.45, 1.2, l);
             for c in adj.iter_mut() {
                 *c /= d;
             }

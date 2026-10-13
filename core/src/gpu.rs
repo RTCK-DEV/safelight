@@ -1778,6 +1778,20 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let g = dot(pg.mono0.xyz, x);
         x = vec3<f32>(g);
     }
+    // PV2012-style overrange: channels above white fold toward the luma
+    // on an exponential shoulder so hot colors converge to ~white
+    // instead of hard-clipping at the curve LUT (mirrors develop.rs)
+    let omax = max(x.x, max(x.y, x.z));
+    if (omax > 1.0) {
+        let ol = clamp(luma(x), 0.0, 1.0);
+        let oh = max(1.0 - ol, 0.02);
+        for (var c = 0; c < 3; c++) {
+            let oe = x[c] - ol;
+            if (oe > 0.0) {
+                x[c] = ol + oh * (1.0 - exp(-oe / oh));
+            }
+        }
+    }
     x = vec3<f32>(
         lut[u32(pg.misc3.x) + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
         lut[u32(pg.misc3.x) + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
@@ -2415,7 +2429,7 @@ fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex:
             adj = adj + vec3<f32>(ex2.y * mask * 0.22 * (1.0 - sstep(0.0, 0.5, l)) * max(1.0 - l / 1.6, 0.0));
         }
         if (ex2.x != 0.0) {
-            adj = adj / (1.0 + ex2.x * mask * 0.9 * sstep(0.45, 1.2, l));
+            adj = adj / (1.0 - ex2.x * mask * 0.9 * sstep(0.45, 1.2, l));
         }
         if (ex2.z != 0.0) {
             adj = adj * (1.0 + ex2.z * mask * 0.35 * sstep(0.5, 1.0, l));
