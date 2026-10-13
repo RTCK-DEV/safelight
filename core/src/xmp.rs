@@ -239,6 +239,14 @@ pub fn write_xmp(asset: &Path, sc: &Sidecar) -> std::io::Result<()> {
     if !sc.label.is_empty() {
         a.push_str(&format!("   xmp:Label=\"{}\"\n", esc(&sc.label)));
     }
+    // passthrough: foreign attrs harvested on import (Upright, RetouchInfo,
+    // RedEyeInfo, xmpMM:* …) — skip any key we already emitted above
+    for (k, v) in &sc.extras {
+        let needle = format!("{k}=\"");
+        if !a.contains(&needle) {
+            a.push_str(&format!("   {k}=\"{}\"\n", esc(v)));
+        }
+    }
     a.push_str("   ara:Format=\"1\">\n");
     if let Some(lb) = look_block {
         a.push_str(&lb);
@@ -452,8 +460,181 @@ fn embedded_xmp(asset: &Path) -> Option<String> {
     None
 }
 
+/// crs:* keys that crs_to_recipe models — extras_from_xmp skips these so a
+/// re-edited recipe can't be overridden by a stale passthrough value.
+const MODELED_CRS: &[&str] = &[
+    "crs:AutoLateralCA",
+    "crs:Blacks",
+    "crs:Blacks2012",
+    "crs:BlueHue",
+    "crs:BlueSaturation",
+    "crs:CameraProfile",
+    "crs:Clarity",
+    "crs:Clarity2012",
+    "crs:ColorGradeBlending",
+    "crs:ColorGradeGlobalHue",
+    "crs:ColorGradeGlobalLum",
+    "crs:ColorGradeGlobalSat",
+    "crs:ColorGradeHighlightHue",
+    "crs:ColorGradeHighlightLum",
+    "crs:ColorGradeHighlightSat",
+    "crs:ColorGradeMidtoneHue",
+    "crs:ColorGradeMidtoneLum",
+    "crs:ColorGradeMidtoneSat",
+    "crs:ColorGradeShadowHue",
+    "crs:ColorGradeShadowLum",
+    "crs:ColorGradeShadowSat",
+    "crs:ColorNoiseReduction",
+    "crs:Contrast",
+    "crs:Contrast2012",
+    "crs:ConvertToGrayscale",
+    "crs:CropAngle",
+    "crs:CropBottom",
+    "crs:CropLeft",
+    "crs:CropRight",
+    "crs:CropTop",
+    "crs:DefringeGreenAmount",
+    "crs:DefringeGreenHueHi",
+    "crs:DefringeGreenHueLo",
+    "crs:DefringePurpleAmount",
+    "crs:DefringePurpleHueHi",
+    "crs:DefringePurpleHueLo",
+    "crs:Dehaze",
+    "crs:Exposure",
+    "crs:Exposure2012",
+    "crs:GrainAmount",
+    "crs:GrainFrequency",
+    "crs:GrainRoughness",
+    "crs:GrainSize",
+    "crs:GreenHue",
+    "crs:GreenSaturation",
+    "crs:HDREditMode",
+    "crs:HDRMaxValue",
+    "crs:HasCrop",
+    "crs:Highlight2012",
+    "crs:Highlights2012",
+    "crs:IncrementalTemperature",
+    "crs:IncrementalTint",
+    "crs:LensProfileEnable",
+    "crs:LensProfileName",
+    "crs:LookTable",
+    "crs:LuminanceSmoothing",
+    "crs:ParametricDarks",
+    "crs:ParametricHighlightSplit",
+    "crs:ParametricHighlights",
+    "crs:ParametricLights",
+    "crs:ParametricMidtoneSplit",
+    "crs:ParametricShadowSplit",
+    "crs:ParametricShadows",
+    "crs:PerspectiveHorizontal",
+    "crs:PerspectiveRotate",
+    "crs:PerspectiveScale",
+    "crs:PerspectiveVertical",
+    "crs:PointColors",
+    "crs:PostCropVignetteAmount",
+    "crs:PostCropVignetteFeather",
+    "crs:PostCropVignetteMidpoint",
+    "crs:PostCropVignetteRoundness",
+    "crs:ProcessVersion",
+    "crs:RGBTable",
+    "crs:RGBTableAmount",
+    "crs:RedHue",
+    "crs:RedSaturation",
+    "crs:SDRBlend",
+    "crs:SDRBrightness",
+    "crs:SDRClarity",
+    "crs:SDRContrast",
+    "crs:SDRHighlights",
+    "crs:SDRShadows",
+    "crs:SDRWhites",
+    "crs:Saturation",
+    "crs:Saturation2012",
+    "crs:Shadow2012",
+    "crs:ShadowTint",
+    "crs:Shadows2012",
+    "crs:SharpenDetail",
+    "crs:SharpenEdgeMasking",
+    "crs:SharpenRadius",
+    "crs:Sharpness",
+    "crs:SplitToningBalance",
+    "crs:SplitToningHighlightHue",
+    "crs:SplitToningHighlightSaturation",
+    "crs:SplitToningShadowHue",
+    "crs:SplitToningShadowSaturation",
+    "crs:Temperature",
+    "crs:Texture",
+    "crs:Tint",
+    "crs:ToneCurveName",
+    "crs:ToneCurveName2012",
+    "crs:Vibrance",
+    "crs:Vibrance2012",
+    "crs:WhiteBalance",
+    "crs:Whites",
+    "crs:Whites2012",
+];
+
+/// modeled key families generated from band names — matched by prefix
+const MODELED_CRS_PREFIX: &[&str] = &[
+    "crs:HueAdjustment",
+    "crs:SaturationAdjustment",
+    "crs:LuminanceAdjustment",
+    "crs:GrayMixer",
+];
+
+/// Harvest `ns:key="value"` attributes from the first rdf:Description open
+/// tag that we don't model — returned as extras so they re-emit verbatim
+/// (Upright*, RetouchInfo, RedEyeInfo, xmpMM:*, etc.).
+pub fn extras_from_xmp(body: &str) -> Vec<(String, String)> {
+    let Some(i) = body.find("<rdf:Description") else {
+        return Vec::new();
+    };
+    let rest = &body[i..];
+    let end = rest.find('>').unwrap_or(rest.len());
+    let tag = &rest[..end];
+    let mut out = Vec::new();
+    let mut p = 0;
+    while let Some(e) = tag[p..].find('=') {
+        let eq = p + e;
+        let mut ks = eq;
+        let b = tag.as_bytes();
+        while ks > 0
+            && (b[ks - 1].is_ascii_alphanumeric()
+                || b[ks - 1] == b':'
+                || b[ks - 1] == b'_'
+                || b[ks - 1] == b'-')
+        {
+            ks -= 1;
+        }
+        let key = &tag[ks..eq];
+        let Some(&q) = b.get(eq + 1) else { break };
+        if q != b'"' && q != b'\'' {
+            p = eq + 1;
+            continue;
+        }
+        let ve = tag[eq + 2..]
+            .find(q as char)
+            .map(|j| eq + 2 + j)
+            .unwrap_or(tag.len());
+        let val = &tag[eq + 2..ve];
+        let modeled = MODELED_CRS.contains(&key)
+            || MODELED_CRS_PREFIX.iter().any(|p| key.starts_with(p))
+            || key.starts_with("rdf:")
+            || key.starts_with("xmlns")
+            || key.starts_with("ara:")
+            || key == "xmp:Rating"
+            || key == "xmp:Label"
+            || !key.contains(':');
+        if !modeled && !key.is_empty() {
+            out.push((key.to_string(), unescape(val)));
+        }
+        p = ve + 1;
+    }
+    out
+}
+
 fn parse_xmp_body(body: &str) -> Sidecar {
     let mut sc = Sidecar::default();
+    sc.extras = extras_from_xmp(body);
     // lossless path: our own embedded recipe
     if let (Some(i), Some(j)) = (body.find("<ara:Recipe>"), body.find("</ara:Recipe>")) {
         let js = unescape(body[i + 12..j].trim());
@@ -1971,6 +2152,33 @@ mod tests {
         write_xmp(&asset, &Sidecar::default()).unwrap();
         let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
         assert!(!xml.contains("HDREditMode"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unmodeled_attrs_passthrough() {
+        let dir = std::env::temp_dir().join(format!("xmp_test_ext_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = dir.join("ext.arw");
+        std::fs::write(&asset, b"fake").unwrap();
+        std::fs::write(
+            xmp_path_for(&asset),
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" crs:Exposure2012="+1.0" crs:UprightVersion="151388160" crs:UprightCenterMode="0" crs:RetouchInfo="source = 'lomo', spotType = 'heal'" crs:Version="15.4" xmp:Rating="4" xmpMM:DocumentID="abc-123"/></rdf:Description></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+        let sc = read_xmp(&asset).unwrap();
+        assert!(sc.extras.iter().any(|(k, _)| k == "crs:UprightVersion"));
+        assert!(sc.extras.iter().any(|(k, _)| k == "crs:RetouchInfo"));
+        assert!(sc.extras.iter().any(|(k, _)| k == "xmpMM:DocumentID"));
+        // modeled + sidecar-level keys don't enter extras
+        assert!(!sc.extras.iter().any(|(k, _)| k == "crs:Exposure2012"));
+        assert!(!sc.extras.iter().any(|(k, _)| k == "xmp:Rating"));
+        // re-emit: extras land verbatim, no duplicates of modeled keys
+        write_xmp(&asset, &sc).unwrap();
+        let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
+        assert!(xml.contains("crs:UprightVersion=\"151388160\""));
+        assert!(xml.contains("xmpMM:DocumentID=\"abc-123\""));
+        assert_eq!(xml.matches("crs:Exposure2012=").count(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -65,6 +65,7 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
         if text.contains('=') {
             let xmp = lua_to_xmp(&text);
             sc.recipe = crs_to_recipe(&xmp);
+            sc.extras = crate::xmp::extras_from_xmp(&xmp);
             has_edits = sc.recipe.to_json() != crs_to_recipe("s = {}").to_json();
         }
         out.push(LrAsset {

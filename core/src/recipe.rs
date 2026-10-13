@@ -947,6 +947,10 @@ pub struct Sidecar {
     pub recipe: Recipe,
     /// saved grade versions (DaVinci stills/versions)
     pub versions: Vec<GradeVersion>,
+    /// unmodeled XMP attributes harvested on import ("ns:key", "value"),
+    /// re-emitted verbatim by write_xmp so foreign fields round-trip
+    #[serde(default)]
+    pub extras: Vec<(String, String)>,
 }
 
 impl Default for Sidecar {
@@ -959,6 +963,7 @@ impl Default for Sidecar {
             keywords: Vec::new(),
             recipe: Recipe::default(),
             versions: Vec::new(),
+            extras: Vec::new(),
         }
     }
 }
