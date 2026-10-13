@@ -905,7 +905,22 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // gain) and from the file itself (DNG 0xC62A — e.g. DJI writes +1.8
     // because its raws are intentionally exposed dark).
     let dng_baseline_ev = m.dng_ops.as_ref().map(|o| o.baseline_ev).unwrap_or(0.0);
-    let mut exposure_mul = (2.0f32).powf(r.exposure + profile_baseline_ev + dng_baseline_ev);
+    // Sony expanded-LOW ISO (50/64/80 on bodies whose native base is 100):
+    // the sensor records at native ISO and the file is tagged down, so ACR
+    // compensates with a -log2(100/iso) EV baseline pull — verified against
+    // Lightroom previews of ISO50 files (-1EV matched within measurement
+    // error). Gated to Sony; native-ISO64 cameras (e.g. Nikon D850, Fuji
+    // GFX) must not be pulled.
+    let iso_pull_ev = if m.info.make.to_ascii_uppercase().contains("SONY")
+        && m.info.iso > 0.0
+        && m.info.iso < 100.0
+    {
+        (m.info.iso / 100.0).log2()
+    } else {
+        0.0
+    };
+    let mut exposure_mul =
+        (2.0f32).powf(r.exposure + profile_baseline_ev + dng_baseline_ev + iso_pull_ev);
     if r.auto_exposure {
         if let Some(s) = stats {
             let l = post_mean_luma(s);
@@ -1435,14 +1450,21 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     if !(dcp_active && DCP_LOOK_NAMES.contains(&r.look.as_str())) {
         apply_look(&mut p, &r.look);
     }
-    // PV2012-era images (crs:ProcessVersion < 12, i.e. "11.0" in the catalog)
-    // render through ACR's adaptive default tone scale: the measured residual
-    // vs our pipeline is a strong shadow lift that converges to a mild
-    // highlight compression — fitted empirically from digest-matched
-    // Lightroom previews and composed on top of the recipe's tone LUT.
-    if r.process_version > 0.0 && r.process_version < 12.0 {
-        for v in &mut p.lut {
-            *v = pv2012_tone(*v);
+    // Lightroom-catalog images render through ACR's adaptive default tone
+    // scale: the measured residual vs our pipeline is a strong shadow lift
+    // converging to a mild highlight compression — fitted empirically from
+    // digest-matched Lightroom previews and composed on top of the recipe's
+    // tone LUT. PV15 uses a weaker variant (blend 0.5 toward identity) —
+    // its residual has the same shape but smaller magnitude. The strength
+    // also tapers with |Exposure2012|: the adaptive lift is part of the
+    // baseline, and a large user exposure push already relocates the scene.
+    if r.process_version > 0.0 {
+        let base = if r.process_version < 12.0 { 1.0 } else { 0.5 };
+        let k = (base / (1.0 + r.exposure.abs() * 0.7)).clamp(0.0, 1.0);
+        if k > 0.0 {
+            for v in &mut p.lut {
+                *v = *v + (pv2012_tone(*v) - *v) * k;
+            }
         }
     }
     // serial stages: each stage is a full Recipe evaluated with the same

@@ -828,6 +828,43 @@ mod rawstats {
             _ => eprintln!("not mosaic"),
         }
     }
+
+    /// Scene-linear percentiles of the demosaiced G channel, for
+    /// correlating fitted exposure-ramp params with raw stats.
+    /// `SAFELIGHT_DIAG_FILE` picks the raw file.
+    #[test]
+    #[ignore = "diagnostic: decodes a local raw file"]
+    fn raw_stats() {
+        let path = std::env::var("SAFELIGHT_DIAG_FILE")
+            .unwrap_or_else(|_| r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW".into());
+        let p = Path::new(&path);
+        if !p.exists() {
+            return;
+        }
+        let m = match decode(p) {
+            Ok(Decoded::Mosaic(m)) => m,
+            _ => return,
+        };
+        let blk = m.black[0].max(m.black[1]).max(m.black[2]);
+        let white = m
+            .linear_max
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(m.maximum)
+            .max(blk as u32) as f32;
+        // sample the green channel (dominant luma proxy) every 8th px
+        let mut v = Vec::with_capacity(1 << 18);
+        for i in (0..m.data.len()).step_by(8) {
+            v.push((m.data[i] as f32 - blk).max(0.0) / (white - blk));
+        }
+        v.sort_unstable_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
+        eprintln!(
+            "raw_stats {}: p001={:.5} p01={:.5} p05={:.5} p25={:.5} p50={:.5} p75={:.5} p95={:.5} p99={:.5} p999={:.5} max={:.5}",
+            path, q(0.001), q(0.01), q(0.05), q(0.25), q(0.5), q(0.75), q(0.95), q(0.99), q(0.999), v[v.len()-1]
+        );
+    }
 }
 
 #[cfg(test)]
