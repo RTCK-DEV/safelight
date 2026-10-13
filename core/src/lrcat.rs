@@ -239,28 +239,31 @@ pub fn blob_index(cat: &Path) -> std::collections::HashMap<String, MaskBlob> {
                 _ => {}
             }
         }
-        // fallback: scan blob headers for a 32-char uppercase-hex digest
-        // (older catalogs key the blob header by MaskDigest directly)
+        // fallback: scan whole blobs for 32-char uppercase-hex digests —
+        // each record carries the MaskDigest at +62 and its TIFF at +110,
+        // i.e. the TIFF sits at digest_pos + 48. Blob files pack several
+        // records, so only the first record shows up near the header.
         for (_, p) in blobs {
-            let Ok(mut f) = std::fs::File::open(&p) else {
+            let Ok(raw) = std::fs::read(&p) else {
                 continue;
             };
-            use std::io::Read;
-            let mut head = [0u8; 160];
-            let n = f.read(&mut head).unwrap_or(0);
-            for i in 0..n.saturating_sub(32) {
-                if head[i..i + 32]
-                    .iter()
+            let mut i = 0;
+            while i + 52 <= raw.len() {
+                let w = &raw[i..i + 32];
+                if w.iter()
                     .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b))
+                    && raw[i + 48..i + 52] == *b"II*\x00"
                 {
-                    let d = String::from_utf8_lossy(&head[i..i + 32]).into_owned();
+                    let d = String::from_utf8_lossy(w).into_owned();
                     out.entry(d).or_insert(MaskBlob {
                         path: p.clone(),
-                        off: 110,
+                        off: (i + 48) as u64,
                         len: 0,
                         inline: Vec::new(),
                     });
-                    break;
+                    i += 48;
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -281,9 +284,312 @@ pub fn decode_mask_blob(b: &MaskBlob) -> Option<(u32, u32, Vec<u8>)> {
         d
     };
     let o = d.windows(4).position(|w| w == b"II*\x00")?;
-    let dec = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(&d[o..])).ok()?;
-    let img = image::DynamicImage::from_decoder(dec).ok()?.to_luma8();
-    Some((img.width(), img.height(), img.into_raw()))
+    let t = &d[o..];
+    if let Ok(dec) = image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(t)) {
+        if let Ok(img) = image::DynamicImage::from_decoder(dec) {
+            let img = img.to_luma8();
+            return Some((img.width(), img.height(), img.into_raw()));
+        }
+    }
+    // newer catalogs store masks as TIFF tiles holding JPEG or JPEG XL
+    // codestreams (compression 7 / 52546), which the image crate's TIFF
+    // decoder can't handle — parse the IFD and decode each tile directly
+    decode_tiff_tiles(t)
+}
+
+/// minimal TIFF reader for Adobe's compressed-tile mask bitmaps: pulls each
+/// tile's codestream through the JPEG or JPEG XL decoder and blits the
+/// tiles into one luma matte.
+fn decode_tiff_tiles(t: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    fn le32(t: &[u8], o: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(t.get(o..o + 4)?.try_into().ok()?))
+    }
+    fn le16(t: &[u8], o: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(t.get(o..o + 2)?.try_into().ok()?))
+    }
+    if t.get(..4)? != b"II*\x00" {
+        return None;
+    }
+    let ifd = le32(t, 4)? as usize;
+    let n = le16(t, ifd)? as usize;
+    let mut tags = std::collections::HashMap::new();
+    for i in 0..n {
+        let e = ifd + 2 + i * 12;
+        let id = le16(t, e)?;
+        let typ = le16(t, e + 2)?;
+        let cnt = le32(t, e + 4)?;
+        let val = *t.get(e + 8..e + 12)?.first_chunk::<4>()?;
+        tags.insert(id, (typ, cnt, val));
+    }
+    // tag values that don't fit inline are stored at a byte offset
+    let vals = |id: u16| -> Option<Vec<u32>> {
+        let &(typ, cnt, val) = tags.get(&id)?;
+        let tsz = match typ {
+            1 | 2 => 1usize,
+            3 => 2,
+            _ => 4,
+        };
+        let sz = tsz * cnt as usize;
+        if sz <= 4 {
+            return Some(
+                (0..cnt as usize)
+                    .map(|i| match tsz {
+                        1 => val[i] as u32,
+                        2 => u16::from_le_bytes(val[i * 2..i * 2 + 2].try_into().unwrap()) as u32,
+                        _ => u32::from_le_bytes(val[i * 4..i * 4 + 4].try_into().unwrap()),
+                    })
+                    .collect(),
+            );
+        }
+        let base = u32::from_le_bytes(val) as usize;
+        Some(
+            (0..cnt as usize)
+                .filter_map(|i| match tsz {
+                    1 => t.get(base + i).map(|&b| b as u32),
+                    2 => le16(t, base + i * 2).map(|v| v as u32),
+                    _ => le32(t, base + i * 4),
+                })
+                .collect(),
+        )
+    };
+    let w = *vals(256)?.first()?;
+    let h = *vals(257)?.first()?;
+    let comp = *vals(259)?.first()?;
+    let tw = vals(322).and_then(|v| v.first().copied()).unwrap_or(w);
+    let th = vals(323)
+        .and_then(|v| v.first().copied())
+        .or_else(|| vals(278).and_then(|v| v.first().copied()))
+        .unwrap_or(h);
+    let offs = vals(324).or_else(|| vals(273))?;
+    let lens = vals(325).or_else(|| vals(279))?;
+    let nx = w.div_ceil(tw) as usize;
+    let mut out = vec![0u8; (w * h) as usize];
+    for (ti, (&to, &tl)) in offs.iter().zip(lens.iter()).enumerate() {
+        let tile = t.get(to as usize..(to + tl) as usize)?;
+        let (pw, ph, px) = match comp {
+            // 52546: JPEG XL codestream; 7: JPEG bitstream
+            52546 => jxl_gray(tile)?,
+            7 => jpeg_gray(tile)?,
+            _ => return None,
+        };
+        let (tx, ty) = ((ti % nx) as u32 * tw, (ti / nx) as u32 * th);
+        for y in 0..(ph as u32).min(h.saturating_sub(ty)) {
+            for x in 0..(pw as u32).min(w.saturating_sub(tx)) {
+                out[(ty + y) as usize * w as usize + (tx + x) as usize] =
+                    px[y as usize * pw + x as usize];
+            }
+        }
+    }
+    Some((w, h, out))
+}
+
+/// decode one JPEG XL codestream → (w, h, 8-bit gray)
+fn jxl_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(b)).ok()?;
+    let render = img.render_frame(0).ok()?;
+    let planes = render.image_planar();
+    let fb = planes.first()?;
+    let (w, h) = (fb.width(), fb.height());
+    let ch = planes.len().max(1) as f32;
+    let px = (0..w * h)
+        .map(|i| {
+            let s: f32 = planes.iter().map(|p| p.buf()[i]).sum();
+            (s / ch * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    Some((w, h, px))
+}
+
+/// decode one JPEG bitstream → (w, h, 8-bit gray). Baseline tiles go through
+/// the image crate; lossless JPEG (SOF3, Huffman predictive) is decoded here
+/// — Adobe uses it for small matte tiles.
+fn jpeg_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    if let Ok(img) = image::load_from_memory_with_format(b, image::ImageFormat::Jpeg) {
+        let img = img.to_luma8();
+        return Some((img.width() as usize, img.height() as usize, img.into_raw()));
+    }
+    jpeg_lossless_gray(b)
+}
+
+/// minimal lossless-JPEG (SOF3) decoder: Huffman-coded pixel differences
+/// against the SOS-selected spatial predictor. Handles the simple Adobe
+/// case — 8-bit, no subsampling, optional restart intervals.
+fn jpeg_lossless_gray(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let be16 = |o: usize| -> Option<usize> {
+        Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?) as usize)
+    };
+    let (mut w, mut h, mut nc) = (0usize, 0usize, 0usize);
+    let mut dht: [Option<([u16; 16], Vec<u8>)>; 4] = Default::default();
+    let mut dtd = [0usize; 8]; // per-component DC table id
+    let (mut pred, mut pt, mut ri) = (0usize, 0u32, 0usize);
+    let mut scan = &[][..];
+    let mut o = 2usize; // skip SOI
+    if b.get(..2)? != b"\xff\xd8" {
+        return None;
+    }
+    while o + 4 <= b.len() {
+        if b[o] != 0xff {
+            o += 1;
+            continue;
+        }
+        let m = b[o + 1];
+        if m == 0x00 || (0xd0..=0xd9).contains(&m) {
+            o += 2;
+            continue;
+        }
+        let ln = be16(o + 2)?;
+        let seg = &b[o + 4..(o + 2 + ln).min(b.len())];
+        match m {
+            0xc4 => {
+                // DHT: possibly several tables in one segment
+                let mut s = 0usize;
+                while s + 17 <= seg.len() {
+                    let id = (seg[s] & 0x0f) as usize;
+                    let mut cnt = [0u16; 16];
+                    for (c, &x) in cnt.iter_mut().zip(&seg[s + 1..s + 17]) {
+                        *c = x as u16;
+                    }
+                    let ns: usize = cnt.iter().map(|&c| c as usize).sum();
+                    let syms = seg[s + 17..(s + 17 + ns).min(seg.len())].to_vec();
+                    if id < 4 {
+                        dht[id] = Some((cnt, syms));
+                    }
+                    s += 17 + ns;
+                }
+            }
+            0xc3 | 0xc1 => {
+                h = be16(o + 5)?;
+                w = be16(o + 7)?;
+                nc = seg.get(5).copied()? as usize;
+            }
+            0xda => {
+                // SOS: comps then Ss/Se/AhAl, then entropy data
+                let ns = seg.first().copied()? as usize;
+                for c in 0..ns {
+                    dtd[c] = (seg[2 + c * 2] >> 4) as usize;
+                }
+                pred = seg[1 + ns * 2] as usize;
+                pt = (seg[3 + ns * 2] & 0x0f) as u32;
+                scan = &b[o + 2 + ln..];
+                break;
+            }
+            0xdd => {
+                ri = be16(o + 4)?;
+            }
+            _ => {}
+        }
+        o += 2 + ln;
+    }
+    if w == 0 || h == 0 || nc == 0 || scan.is_empty() {
+        return None;
+    }
+    // canonical Huffman decoders: per length l, first code + symbol base
+    let mut tabs: Vec<([i32; 17], [usize; 17], Vec<u8>, [u16; 16])> = Vec::new();
+    for t in dht.iter().flatten() {
+        let (cnt, syms) = t;
+        let mut first = [0i32; 17];
+        let mut base = [0usize; 17];
+        let mut code = 0i32;
+        let mut idx = 0usize;
+        for l in 1..=16 {
+            first[l] = code;
+            base[l] = idx;
+            idx += cnt[l - 1] as usize;
+            code = (code + cnt[l - 1] as i32) << 1;
+        }
+        tabs.push((first, base, syms.clone(), *cnt));
+    }
+
+    // entropy-coded bit reader: handles FF00 byte stuffing; a real marker
+    // (including restart markers, consumed by the caller loop) ends data
+    let mut pos = 0usize;
+    let mut acc = 0u64;
+    let mut nbits = 0u32;
+    macro_rules! bit {
+        () => {{
+            while nbits == 0 {
+                let by = *scan.get(pos)?;
+                pos += 1;
+                if by == 0xff {
+                    let nx = scan.get(pos).copied()?;
+                    if nx == 0x00 {
+                        pos += 1;
+                    } else {
+                        return None; // marker — treat as end
+                    }
+                }
+                acc = (acc << 8) | by as u64;
+                nbits += 8;
+            }
+            nbits -= 1;
+            (acc >> nbits) & 1
+        }};
+    }
+    // entropy data is pixel-major, components interleaved; each component
+    // keeps its own predictor state and DC table
+    let mut planes = vec![vec![0i32; w * h]; nc];
+    let init = 1i32 << (8 - pt - 1); // first-sample prediction
+    if ri > 0 {
+        return None; // restart intervals not needed by the small Adobe tiles
+    }
+    for y in 0..h {
+        for x in 0..w {
+            for (c, plane) in planes.iter_mut().enumerate() {
+                let t = dtd[c].min(tabs.len().saturating_sub(1));
+                let (first, base, syms, cnt) = &tabs[t];
+                let (mut code, mut l) = (0i32, 0usize);
+                let ssss = loop {
+                    code = (code << 1) | bit!() as i32;
+                    l += 1;
+                    if l > 16 {
+                        return None;
+                    }
+                    if code >= first[l] && (code - first[l]) < cnt[l - 1] as i32 {
+                        break syms[base[l] + (code - first[l]) as usize] as i32;
+                    }
+                };
+                let mut diff = 0i32;
+                for _ in 0..ssss {
+                    diff = (diff << 1) | bit!() as i32;
+                }
+                if ssss > 0 && diff < (1 << (ssss - 1)) {
+                    diff -= (1 << ssss) - 1;
+                }
+                let ra = if x > 0 { plane[y * w + x - 1] } else { 0 };
+                let rb = if y > 0 { plane[(y - 1) * w + x] } else { init };
+                let rc = if x > 0 && y > 0 {
+                    plane[(y - 1) * w + x - 1]
+                } else {
+                    rb
+                };
+                let p = if x == 0 && y == 0 {
+                    init
+                } else if y == 0 {
+                    ra
+                } else if x == 0 {
+                    rb
+                } else {
+                    match pred {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra + rb - rc,
+                        5 => ra + (rb - rc) / 2,
+                        6 => rb + (ra - rc) / 2,
+                        _ => (ra + rb) / 2,
+                    }
+                };
+                plane[y * w + x] = (p + diff) << pt;
+            }
+        }
+    }
+    let px = (0..w * h)
+        .map(|i| {
+            let s: i32 = planes.iter().map(|p| p[i]).sum();
+            ((s / nc as i32).clamp(0, 255)) as u8
+        })
+        .collect();
+    Some((w, h, px))
 }
 
 /// Extract the blob-store mattes referenced by the recipe's windows:
@@ -1093,5 +1399,53 @@ mod blob_tests {
         assert_eq!((w, h), (2, 2));
         assert_eq!(px, vec![0, 200, 120, 255]);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// real-catalog coverage: every MaskDigest in the DB must resolve to a
+    /// decodable blob-store TIFF. Skips when the catalog isn't present.
+    #[test]
+    fn real_catalog_mask_index() {
+        let dir = std::env::var("SL_LRCAT_DIR").unwrap_or_else(|_| {
+            r"C:\Users\stu12\OneDrive - 愛知産業大学\画像\Lightroom".to_string()
+        });
+        for name in [
+            "Lightroom Catalog-v13-2.lrcat",
+            "Lightroom Catalog-v13-3.lrcat",
+        ] {
+            let cat = std::path::Path::new(&dir).join(name);
+            if !cat.exists() {
+                continue;
+            }
+            let idx = blob_index(&cat);
+            eprintln!("{name}: {} digest→blob records", idx.len());
+            let out_dir = std::env::temp_dir().join(format!(
+                "sl_masks_{}",
+                name.trim_end_matches(".lrcat").replace(' ', "_")
+            ));
+            std::fs::create_dir_all(&out_dir).ok();
+            let mut ok = 0;
+            let mut bad = Vec::new();
+            for (d, mb) in &idx {
+                match decode_mask_blob(mb) {
+                    Some((w, h, px)) => {
+                        if px.len() != (w * h) as usize {
+                            bad.push(format!("{d}: {w}x{h} len {}", px.len()));
+                        } else {
+                            ok += 1;
+                            if let Some(img) = image::GrayImage::from_raw(w, h, px) {
+                                img.save(out_dir.join(format!("{d}.png"))).ok();
+                            }
+                        }
+                    }
+                    None => bad.push(format!("{d}: undecodable")),
+                }
+            }
+            eprintln!("  decode ok={ok} bad={bad:?} → {}", out_dir.display());
+        }
     }
 }

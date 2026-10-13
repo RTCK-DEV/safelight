@@ -27,3 +27,4 @@ roxmltree = "0.21.1"
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "coreml"] }
 ureq = "3"
 miniz_oxide = "0.8"
+jxl-oxide = "0.12.6"
