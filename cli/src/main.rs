@@ -164,7 +164,8 @@ fn main() -> Result<()> {
                 let importable = e.has_edits
                     || e.sidecar.rating != 0
                     || e.sidecar.flag != 0
-                    || !e.sidecar.label.is_empty();
+                    || !e.sidecar.label.is_empty()
+                    || !e.sidecar.keywords.is_empty();
                 if !importable {
                     continue;
                 }

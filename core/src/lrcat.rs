@@ -29,12 +29,17 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
     let mut st = db.prepare(
         "SELECT rf.absolutePath, fo.pathFromRoot, \
                 COALESCE(f.idx_filename, f.baseName || '.' || f.extension), \
-                i.rating, i.pick, COALESCE(i.colorLabels,''), COALESCE(ds.text,'') \
+                i.rating, i.pick, COALESCE(i.colorLabels,''), COALESCE(ds.text,''), \
+                COALESCE(kw.kws,'') \
          FROM Adobe_images i \
          JOIN AgLibraryFile f ON i.rootFile = f.id_local \
          JOIN AgLibraryFolder fo ON f.folder = fo.id_local \
          JOIN AgLibraryRootFolder rf ON fo.rootFolder = rf.id_local \
-         LEFT JOIN Adobe_imageDevelopSettings ds ON ds.image = i.id_local",
+         LEFT JOIN Adobe_imageDevelopSettings ds ON ds.image = i.id_local \
+         LEFT JOIN (SELECT ki.image, GROUP_CONCAT(k.lc_name, char(1)) AS kws \
+                    FROM AgLibraryKeywordImage ki \
+                    JOIN AgLibraryKeyword k ON k.id_local = ki.tag \
+                    GROUP BY ki.image) kw ON kw.image = i.id_local",
     )?;
     let mut out = Vec::new();
     let mut rows = st.query([])?;
@@ -47,6 +52,13 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
         sc.rating = r.get::<_, i64>(3).unwrap_or(0) as i32;
         sc.flag = r.get::<_, i64>(4).unwrap_or(0) as i32;
         sc.label = r.get(5)?;
+        sc.keywords = r
+            .get::<_, String>(7)
+            .unwrap_or_default()
+            .split('\x01')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
         // a blob that parses to the same recipe as an empty blob means the
         // image was imported but never edited — still carries rating etc.
         let mut has_edits = false;

@@ -456,6 +456,27 @@ fn parse_xmp_body(body: &str) -> Sidecar {
     if let Some(l) = attr_str(body, "xmp:Label") {
         sc.label = l;
     }
+    // dc:subject <rdf:Bag><rdf:li>…</rdf:li></rdf:Bag> — LR keywords
+    if let Some(i) = body.find("<dc:subject") {
+        let end = body[i..]
+            .find("</dc:subject>")
+            .map(|j| i + j)
+            .unwrap_or(body.len());
+        let seg = &body[i..end];
+        let mut p = 0;
+        while let Some(s) = seg[p..].find("<rdf:li") {
+            let s = p + s;
+            let Some(gt) = seg[s..].find('>') else { break };
+            let Some(e) = seg[s..].find("</rdf:li>") else {
+                break;
+            };
+            let k = unescape(seg[s + gt + 1..s + e].trim());
+            if !k.is_empty() {
+                sc.keywords.push(k);
+            }
+            p = s + e + 9;
+        }
+    }
     sc
 }
 
@@ -1869,6 +1890,20 @@ mod tests {
         write_xmp(&asset, &sc).unwrap();
         let xml = std::fs::read_to_string(xmp_path_for(&asset)).unwrap();
         assert!(xml.contains("crs:ProcessVersion=\"11.0\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keywords_roundtrip_dc_subject() {
+        let dir = std::env::temp_dir().join(format!("xmp_test_kw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = dir.join("kw.arw");
+        std::fs::write(&asset, b"fake").unwrap();
+        let mut sc = Sidecar::default();
+        sc.keywords = vec!["ポートレート".into(), "raw & co".into()];
+        write_xmp(&asset, &sc).unwrap();
+        let back = read_xmp(&asset).unwrap();
+        assert_eq!(back.keywords, sc.keywords);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
