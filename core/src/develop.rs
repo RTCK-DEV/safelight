@@ -164,6 +164,11 @@ pub struct Params {
     /// shadows/highlights/whites/blacks + rolloff into one luminance-preserving
     /// curve with an extended-Reinhard shoulder and soft-knee toe.
     pub tone_lut: [f32; 512],
+    /// split tone LUTs for the spatial (masked) model: shadow-side sliders
+    /// only / highlight-side sliders only — the regional deviation of each
+    /// is exponentiated separately.
+    pub tone_sh: [f32; 512],
+    pub tone_hl: [f32; 512],
     pub has_tone: bool,
     /// serial correction stages (DaVinci serial nodes): (params, opacity,
     /// invert_key) per enabled stage, max 4. Each stage re-runs adjust() +
@@ -1598,6 +1603,18 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         key_h: r.key_h.clamp(-0.4, 0.4),
         lens_corr_amt: r.lens_corr.min(1.0),
         tone_lut: build_tone_lut(r),
+        tone_sh: build_tone_lut(&Recipe {
+            highlights: 0.0,
+            whites: 0.0,
+            highlight_rolloff: 1.0,
+            ..r.clone()
+        }),
+        tone_hl: build_tone_lut(&Recipe {
+            shadows: 0.0,
+            blacks: 0.0,
+            shadow_rolloff: 1.0,
+            ..r.clone()
+        }),
         has_tone: r.shadows != 0.0
             || r.highlights != 0.0
             || r.whites != 0.0
@@ -2140,14 +2157,65 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params) -> [f32; 3] {
 /// ratio so hue stays put. Constants are fitted against digest-fresh LR
 /// previews — the low evaluation floor + hard gain cap reproduce LR's
 /// deep-shadow lift without runaway noise amplification.
-fn tone_gain(x: [f32; 3], p: &Params) -> f32 {
-    let c = tone_fit_consts();
-    let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
-    let le = l.max(c[8]);
-    (tone_lut_at(&p.tone_lut, le / 1.6) / le).min(c[9])
+/// LR's shadows/highlights are spatially adaptive: the tone gain for a
+/// pixel depends on its surround (masked adjustment). We reproduce this by
+/// evaluating the tone LUT at an effective luma blended toward a heavily
+/// blurred luma guide. SL_SPAT="mode,w,sigma" (env): mode 1 = eval toward
+/// guide, 2 = away from guide, 4 = gain-space blend.
+fn spatial_tone() -> (i32, f32, f32, f32) {
+    static V: std::sync::OnceLock<(i32, f32, f32, f32)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let s = std::env::var("SL_SPAT").unwrap_or_default();
+        let mut it = s.split(',').map(|v| v.trim().parse::<f32>().unwrap_or(0.0));
+        (
+            it.next().unwrap_or(0.0) as i32,
+            it.next().unwrap_or(0.0),
+            it.next().unwrap_or(0.0),
+            it.next().unwrap_or(0.0),
+        )
+    })
 }
 
+fn tone_gain(x: [f32; 3], p: &Params, guide: f32) -> f32 {
+    let c = tone_fit_consts();
+    let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
+    let (mode, w, w_hl, _sig) = spatial_tone();
+    let le = l.max(c[8]);
+    let base = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+    if !guide.is_finite() || (w == 0.0 && w_hl == 0.0) {
+        return base.min(c[9]);
+    }
+    let g = guide.clamp(0.0, 1.6).max(c[8]);
+    let gg = tone_lut_at(&p.tone_lut, g / 1.6) / g;
+    let gain = match mode {
+        1 => tone_lut_at(&p.tone_lut, ((l + w * (guide - l)).max(c[8])).min(1.6) / 1.6)
+            / (l + w * (guide - l)).max(c[8]).min(1.6),
+        2 => tone_lut_at(&p.tone_lut, ((l + w * (l - guide)).max(c[8])).min(1.6) / 1.6)
+            / (l + w * (l - guide)).max(c[8]).min(1.6),
+        // regional deviation, split: shadow-band deviation and
+        // highlight-band deviation exponentiated separately
+        5 => {
+            let gsh = tone_lut_at(&p.tone_sh, g / 1.6) / g;
+            let ghl = tone_lut_at(&p.tone_hl, g / 1.6) / g;
+            base * gsh.powf(w) * ghl.powf(w_hl)
+        }
+        // masked delta: l + (1-w)·D(l) + w·D(g), D = T−identity
+        6 => {
+            let dl = base * le - le;
+            let dg = gg * g - g;
+            (le + (1.0 - w) * dl + w * dg) / le
+        }
+        _ => base * (1.0 - w) + gg * w,
+    };
+    gain.min(c[9])
+}
+
+#[allow(dead_code)] // tests use the guide-free entry point
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
+    adjust_g(rgb, p, f32::NAN)
+}
+
+fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32) -> [f32; 3] {
     let mut x = pre_tone_rgb(rgb, p);
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dbg = std::env::var_os("SL_PROBE2").is_some()
@@ -2161,7 +2229,7 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     // whites/blacks + rolloff into one curve — hue stays put, highlights
     // roll off on an extended-Reinhard shoulder instead of clipping
     if p.has_tone {
-        let g = tone_gain(x, p);
+        let g = tone_gain(x, p, guide);
         for c in &mut x {
             *c *= g;
         }
@@ -4176,6 +4244,72 @@ fn finish_linear(
         }
         let _ = std::fs::write(&dp, &bytes);
     }
+    // spatial tone guide: coarse grid of pretone luma, heavily blurred —
+    // shadows/highlights respond to the surround, not just the pixel.
+    let (gmode, gw_blend, gw_hl, gsigma) = spatial_tone();
+    let guide = if p.has_tone && gmode > 0 && (gw_blend != 0.0 || gw_hl != 0.0) {
+        let gw = (dw / 8).clamp(16, 512);
+        let gh = (dh / 8).clamp(16, 512);
+        let mut g = vec![0.0f32; gw * gh];
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let nx = (gx as f32 + 0.5) / gw as f32;
+                let ny = (gy as f32 + 0.5) / gh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p);
+                g[gy * gw + gx] = 0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2];
+            }
+        }
+        // 3-pass separable box blur ≈ gaussian; sigma in output-px fraction
+        let r = (gsigma * gw as f32 * 0.5).max(1.0) as usize;
+        let mut t = vec![0.0f32; gw * gh];
+        for _ in 0..3 {
+            for y in 0..gh {
+                for x in 0..gw {
+                    let x0 = x.saturating_sub(r);
+                    let x1 = (x + r).min(gw - 1);
+                    let mut acc = 0.0f32;
+                    for xx in x0..=x1 {
+                        acc += g[y * gw + xx];
+                    }
+                    t[y * gw + x] = acc / (x1 - x0 + 1) as f32;
+                }
+            }
+            for y in 0..gh {
+                for x in 0..gw {
+                    let y0 = y.saturating_sub(r);
+                    let y1 = (y + r).min(gh - 1);
+                    let mut acc = 0.0f32;
+                    for yy in y0..=y1 {
+                        acc += t[yy * gw + x];
+                    }
+                    g[y * gw + x] = acc / (y1 - y0 + 1) as f32;
+                }
+            }
+        }
+        Some((g, gw, gh))
+    } else {
+        None
+    };
+    let guide_at = |nx: f32, ny: f32| -> f32 {
+        match &guide {
+            Some((g, gw, gh)) => {
+                let gx = (nx * *gw as f32 - 0.5).clamp(0.0, *gw as f32 - 1.0);
+                let gy = (ny * *gh as f32 - 0.5).clamp(0.0, *gh as f32 - 1.0);
+                let x0 = gx as usize;
+                let y0 = gy as usize;
+                let x1 = (x0 + 1).min(*gw - 1);
+                let y1 = (y0 + 1).min(*gh - 1);
+                let fx = gx - x0 as f32;
+                let fy = gy - y0 as f32;
+                (g[y0 * gw + x0] * (1.0 - fx) + g[y0 * gw + x1] * fx) * (1.0 - fy)
+                    + (g[y1 * gw + x0] * (1.0 - fx) + g[y1 * gw + x1] * fx) * fy
+            }
+            None => f32::NAN,
+        }
+    };
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
@@ -4218,13 +4352,13 @@ fn finish_linear(
             }
             if std::env::var_os("SL_PROBE").is_some() && (dx * 7 + dy * 13) % 97 == 0 {
                 let pt = pre_tone_rgb(col, p);
-                let mut a0 = adjust(col, p);
+                let mut a0 = adjust_g(col, p, guide_at(nx, ny));
                 local_ops(&mut a0, col, p, nx, ny, dw as f32 / dh as f32, subj, sky, veg);
                 eprintln!(
                     "[probe] {nx:.3},{ny:.3} cam={col:?} pretone={pt:?} adj={a0:?}"
                 );
             }
-            let mut adj = adjust(col, p);
+            let mut adj = adjust_g(col, p, guide_at(nx, ny));
             let aspect = dw as f32 / dh as f32;
             local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
             // serial correction stages (DaVinci serial nodes): full adjust +
@@ -4263,7 +4397,7 @@ fn finish_linear(
                 if key <= 0.001 {
                     continue;
                 }
-                let mut a2 = adjust(col, sp);
+                let mut a2 = adjust_g(col, sp, guide_at(nx, ny));
                 local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky, veg);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;
@@ -6265,11 +6399,16 @@ mod tests {
             lift15 > 0.0 && lift15 < lift11,
             "pv15 weaker: {lift15} vs {lift11}"
         );
-        // exposure taper: +2EV shrinks the compensation
+        // no exposure taper: the blend is constant over |Exposure| — fits
+        // showed attenuation loses the compensation exactly where the big
+        // pushes need it
         let mut r11e = r11.clone();
         r11e.exposure = 2.0;
         let lift11e = lut_at(&r11e) - base;
-        assert!(lift11e < lift11, "exposure taper: {lift11e} vs {lift11}");
+        assert!(
+            (lift11e - lift11).abs() < 1e-6,
+            "exposure must not taper the blend: {lift11e} vs {lift11}"
+        );
     }
 
     /// LR "Linear" maps to an endpoint-only curve [[0,0],[1,1]] — the
