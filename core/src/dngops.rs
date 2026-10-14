@@ -661,21 +661,35 @@ mod tests {
 
     #[test]
     fn jxl_tile93() {
-        let p = std::path::Path::new(r"C:\Users\stu12\AppData\Local\Temp\tile93.jxl");
-        if !p.exists() {
-            return;
-        }
-        let b = std::fs::read(p).unwrap();
-        let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&b));
-        match img {
-            Ok(mut i) => {
-                eprintln!("image {}x{} frames_loaded={}", i.width(), i.height(), i.num_loaded_frames());
-                match i.render_frame(0) {
-                    Ok(_) => eprintln!("render ok"),
-                    Err(e) => eprintln!("render err: {e}"),
-                }
+        for p in [
+            r"C:\Users\stu12\AppData\Local\Temp\tile92.jxl",
+            r"C:\Users\stu12\AppData\Local\Temp\tile93.jxl",
+            r"C:\Users\stu12\AppData\Local\Temp\03B7DAA4.jxl",
+            r"C:\Users\stu12\AppData\Local\Temp\2E785609.jxl",
+            r"C:\Users\stu12\AppData\Local\Temp\8FC906B3.jxl",
+        ] {
+            let p = std::path::Path::new(p);
+            if !p.exists() {
+                continue;
             }
-            Err(e) => eprintln!("header err: {e}"),
+            let b = std::fs::read(p).unwrap();
+            let img = jxl_oxide::JxlImage::read_with_defaults(std::io::Cursor::new(&b));
+            match img {
+                Ok(mut i) => {
+                    eprintln!(
+                        "{}: {}x{} frames={}",
+                        p.display(),
+                        i.width(),
+                        i.height(),
+                        i.num_loaded_frames()
+                    );
+                    match i.render_frame(0) {
+                        Ok(_) => eprintln!("  render ok"),
+                        Err(e) => eprintln!("  render err: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("{}: header err: {e}", p.display()),
+            }
         }
     }
 
