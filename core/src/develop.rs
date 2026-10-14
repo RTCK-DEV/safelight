@@ -292,7 +292,7 @@ const BASE_TONE_CURVE: &[[f32; 2]] = &[
     [1.0, 1.0],
 ];
 
-fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
+pub(crate) fn catmull_lut(points: &[[f32; 2]]) -> Vec<f32> {
     curve_lut(points, |x| x, 1.0)
 }
 
@@ -2225,10 +2225,12 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
         let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, luma)) * p.shadow_sat;
         let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, luma) * p.high_sat;
         let wm = (1.0 - (luma - sp).abs() * 2.0 / bw).max(0.0) * p.mid_sat;
+        // colorize semantics (LR): blend toward the tint at the pixel's own
+        // luma — additive (col-luma) lifts blacks and creates a floor
         for c in 0..3 {
-            x[c] += ws * (p.shadow_col[c] - luma) * 0.5
-                + wh * (p.high_col[c] - luma) * 0.5
-                + wm * (p.mid_col[c] - luma) * 0.5;
+            x[c] += ws * (p.shadow_col[c] * luma - x[c]) * 0.5
+                + wh * (p.high_col[c] * luma - x[c]) * 0.5
+                + wm * (p.mid_col[c] * luma - x[c]) * 0.5;
         }
     }
     // HDR zone wheels: per-band [hue, amt, ev, sat]
@@ -2514,8 +2516,15 @@ fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32;
                 let mut px = [0.0f32; 3];
                 for c in 0..3 {
                     if let Some(p) = lr.planes.get(c) {
-                        px[c] = ((p[i] as f32 - lr.black[c]) / (lr.white - lr.black[c]).max(1.0))
+                        let v = ((p[i] as f32 - lr.black[c]) / (lr.white - lr.black[c]).max(1.0))
                             .max(0.0);
+                        // SAFELIGHT_LINEAR_SRGB=1: treat stored values as
+                        // sRGB-encoded rather than scene-linear (diagnostic)
+                        px[c] = if std::env::var_os("SAFELIGHT_LINEAR_SRGB").is_some() {
+                            srgb_decode(v)
+                        } else {
+                            v
+                        };
                     }
                 }
                 out[vy * vw + vx] = px;
@@ -3185,8 +3194,12 @@ fn demosaic_pixel(m: &Mosaic, vx: usize, vy: usize, stride: usize, norm: &[f32; 
             }
         }
         if n > 0 {
+            let srgb_in = std::env::var_os("SAFELIGHT_LINEAR_SRGB").is_some();
             for c in &mut out {
                 *c = (*c / n as f32).max(0.0);
+                if srgb_in {
+                    *c = srgb_decode(*c);
+                }
             }
         }
         return out;

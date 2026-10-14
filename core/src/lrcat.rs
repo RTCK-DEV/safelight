@@ -1499,6 +1499,21 @@ mod tests {
     }
 
     #[test]
+    fn lua_point_curve_and_parametric() {
+        // real catalog row: interior point curve + nonzero parametric sliders
+        let xmp = lua_to_xmp(
+            "s = { ParametricShadows = -28, ParametricDarks = 39, \
+             ParametricHighlights = -29, \
+             ToneCurvePV2012 = { 0, 0, 22, 16, 40, 35, 127, 127, 224, 230, 240, 246, 255, 255 } }",
+        );
+        eprintln!("XMP: {xmp}");
+        let r = crate::xmp::crs_to_recipe(&xmp);
+        eprintln!("curve: {:?}", r.curve);
+        assert!(!r.curve.is_empty());
+        assert!(r.curve.len() >= 3, "interior points must survive");
+    }
+
+    #[test]
     fn lua_mask_correction() {
         let r = crate::xmp::crs_to_recipe(&lua_to_xmp(
             "s = { MaskGroupBasedCorrections = { { CorrectionActive = true, \

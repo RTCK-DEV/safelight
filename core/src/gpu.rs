@@ -1748,9 +1748,10 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, lum)) * pg.st0.w;
         let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, lum) * pg.st1.w;
         let wm = max(1.0 - abs(lum - sp) * 2.0 / bw, 0.0) * pg.mt0.w;
-        x = x + ws * (pg.st0.xyz - vec3<f32>(lum)) * 0.5
-            + wh * (pg.st1.xyz - vec3<f32>(lum)) * 0.5
-            + wm * (pg.mt0.xyz - vec3<f32>(lum)) * 0.5;
+        // colorize semantics — blend toward tint*luma, mirrors develop.rs
+        x = x + ws * (pg.st0.xyz * vec3<f32>(lum) - x) * 0.5
+            + wh * (pg.st1.xyz * vec3<f32>(lum) - x) * 0.5
+            + wm * (pg.mt0.xyz * vec3<f32>(lum) - x) * 0.5;
     }
     // HDR zone wheels
     let zones = array<vec4<f32>, 4>(pg.z0, pg.z1, pg.z2, pg.z3);

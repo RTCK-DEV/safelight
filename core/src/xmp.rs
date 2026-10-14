@@ -969,12 +969,20 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(v) = attr(&body, "crs:CropAngle") {
             r.rotation_deg = v;
         }
-        if attr_str(&body, "crs:HasCrop").as_deref() == Some("true") {
+        {
             let l = attr(&body, "crs:CropLeft").unwrap_or(0.0);
             let t = attr(&body, "crs:CropTop").unwrap_or(0.0);
             let b = attr(&body, "crs:CropBottom").unwrap_or(1.0);
             let rr = attr(&body, "crs:CropRight").unwrap_or(1.0);
-            r.crop = [l, t, 1.0 - rr, 1.0 - b];
+            // catalog Lua omits HasCrop — non-full-frame extents are the signal
+            if attr_str(&body, "crs:HasCrop").as_deref() == Some("true")
+                || l > 0.0
+                || t > 0.0
+                || rr < 1.0
+                || b < 1.0
+            {
+                r.crop = [l, t, 1.0 - rr, 1.0 - b];
+            }
         }
         // lens corrections
         if let Some(v) = attr(&body, "crs:LensProfileEnable") {
@@ -1081,9 +1089,21 @@ pub fn crs_to_recipe(body: &str) -> Recipe {
         if let Some(curve_pts) = parametric_curve(&body) {
             r.curve = curve_pts;
         }
-        // explicit point curves (rdf:Seq of "x, y" strings)
+        // explicit point curves (rdf:Seq of "x, y" strings) — LR composes
+        // them on top of the parametric curve, so evaluate
+        // eff(x) = point(parametric(x)) when both are present.
         if let Some(pts) = curve_seq(&body, "crs:ToneCurvePV2012") {
-            r.curve = pts;
+            let interior = pts.iter().any(|p| p[0] > 0.0 && p[0] < 1.0);
+            if interior && !r.curve.is_empty() {
+                let plut = crate::develop::catmull_lut(&pts);
+                for p in r.curve.iter_mut() {
+                    p[1] = plut[(p[1].clamp(0.0, 1.0) * 255.0) as usize];
+                }
+            } else if interior || r.curve.is_empty() {
+                // an endpoint-only point curve ("Linear") does not reset the
+                // parametric curve — keep it when present
+                r.curve = pts;
+            }
         }
         // named tone curve when no custom points were given ("Linear"
         // must defeat our default medium-contrast base curve)
@@ -1485,7 +1505,9 @@ pub fn merge_profile_under(dst: &mut Recipe, pr: &Recipe, amt: f32) {
         dst.lut_amount *= amt * pr.lut_amount;
     }
     // profile tone curve applies under the user's — take it when the
-    // user's curve is the default identity
+    // user's curve is the default identity. (Measured: composing
+    // profile∘parametric over-darkens vs LR previews — a non-default
+    // user curve *replaces* the profile's baked curve.)
     let ident = |c: &Vec<[f32; 2]>| {
         c.len() == 2 && (c[0][0] - c[0][1]).abs() < 1e-4 && (c[1][0] - c[1][1]).abs() < 1e-4
     };
