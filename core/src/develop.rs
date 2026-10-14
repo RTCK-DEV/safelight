@@ -2254,7 +2254,17 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
     let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
     let (mode, w, w_hl, _sig) = spatial_tone();
     let le = l.max(c[8]);
-    let base = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+    // SL_GAMMA_T: evaluate the LUT in a gamma-encoded (Melissa-style) domain —
+    // LR's PV2012 sliders operate on ProPhoto-with-sRGB-TRC data, so the
+    // slider bands pivot on encoded luminance, not linear.
+    let gamma_t = std::env::var_os("SL_GAMMA_T").is_some();
+    let base = if gamma_t {
+        let enc = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        let dec = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        dec(tone_lut_at(&p.tone_lut, enc(le) / 1.6).clamp(0.0, 1.6)) / le
+    } else {
+        tone_lut_at(&p.tone_lut, le / 1.6) / le
+    };
     if mode == 9 {
         // LR-style tone-map mask: neutral gain + edge-aware upsampled
         // slider delta (a·l + b from the coarse guided-filter fit)
