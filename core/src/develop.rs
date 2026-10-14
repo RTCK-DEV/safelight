@@ -887,7 +887,41 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             1.0 / wb[2].max(1e-4),
         ];
         if let Some(prof) = &prof {
-            if let Some(mtx) = prof.cam_to_xyz_d50(wb_neutral) {
+            // SL_NFWD: force the ColorMatrix-inversion path even when the DCP
+            // ships ForwardMatrix (diagnostic: matrix selection residual)
+            let mtx = if std::env::var_os("SL_NFWD").is_some() {
+                let w = prof.illuminant_weight(wb_neutral);
+                let cm = match (prof.color_matrix1, prof.color_matrix2) {
+                    (Some(c1), Some(c2)) => Some({
+                        let mut m = [[0f32; 3]; 3];
+                        for r in 0..3 {
+                            for c in 0..3 {
+                                m[r][c] = c1[r][c] * (1.0 - w) + c2[r][c] * w;
+                            }
+                        }
+                        m
+                    }),
+                    (Some(c1), None) => Some(c1),
+                    _ => None,
+                };
+                cm.and_then(crate::dcp::invert).map(|inv| {
+                    crate::dcp::mat_mul(
+                        crate::dcp::bradford(
+                            crate::dcp::illum_xy(if w > 0.5 {
+                                prof.illuminant2
+                            } else {
+                                prof.illuminant1
+                            })
+                            .unwrap_or(crate::dcp::D65_XY),
+                            crate::dcp::D50_XY,
+                        ),
+                        inv,
+                    )
+                })
+            } else {
+                prof.cam_to_xyz_d50(wb_neutral)
+            };
+            if let Some(mtx) = mtx {
                 cam2srgb = crate::dcp::mat_mul(crate::dcp::xyz_d50_to_srgb(), mtx);
                 // ACR runs its profile stage (look table + tone curve) in
                 // the profile working space — ProPhoto for DCPs. Render the
@@ -2125,8 +2159,18 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
         }
     }
     if !p.profile_tone_lut.is_empty() {
-        for c in &mut x {
-            *c = lut_at(&p.profile_tone_lut, c.clamp(0.0, 1.0));
+        // SL_PTC_LUMA: apply the profile tone curve as a hue-preserving luma
+        // gain instead of per-channel (diagnostic: LR's hue rotation)
+        if std::env::var_os("SL_PTC_LUMA").is_some() {
+            let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.0);
+            let g = lut_at(&p.profile_tone_lut, l) / l.max(1e-4);
+            for c in &mut x {
+                *c *= g;
+            }
+        } else {
+            for c in &mut x {
+                *c = lut_at(&p.profile_tone_lut, c.clamp(0.0, 1.0));
+            }
         }
     }
     // exit the profile working space (ProPhoto -> sRGB when a DCP was
@@ -2270,9 +2314,19 @@ fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) 
     // whites/blacks + rolloff into one curve — hue stays put, highlights
     // roll off on an extended-Reinhard shoulder instead of clipping
     if p.has_tone {
-        let g = tone_gain(x, p, guide, ab);
-        for c in &mut x {
-            *c *= g;
+        // SL_TCHAN: apply the tone LUT per-channel (LR's ExtendedToneCurve
+        // applies to R/G/B independently — rotates hue on saturated colours)
+        // instead of a hue-preserving luma gain.
+        if std::env::var_os("SL_TCHAN").is_some() {
+            for c in &mut x {
+                let v = c.clamp(0.0, 1.6).max(1e-3);
+                *c = tone_lut_at(&p.tone_lut, v / 1.6) * (*c / v).max(0.0);
+            }
+        } else {
+            let g = tone_gain(x, p, guide, ab);
+            for c in &mut x {
+                *c *= g;
+            }
         }
     }
     if dbg {

@@ -825,7 +825,7 @@ fn illum_cct(code: u16) -> f32 {
 }
 
 /// DNG calibration illuminant -> white-point xy
-fn illum_xy(code: u16) -> Option<[f32; 2]> {
+pub(crate) fn illum_xy(code: u16) -> Option<[f32; 2]> {
     Some(match code {
         17 | 18 => [0.44757, 0.40745], // A
         21 => D65_XY,
