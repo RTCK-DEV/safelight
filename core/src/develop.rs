@@ -1691,18 +1691,15 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
 /// Tone-map constants — defaults fitted against digest-fresh Lightroom
 /// previews; SL_TONE_LUT="8 or 10 comma floats" overrides for offline fits
 /// (last two: eval-luma floor, gain cap — the WGSL mirror is hardcoded).
-fn tone_fit_consts() -> [f32; 10] {
-    static C: std::sync::OnceLock<[f32; 10]> = std::sync::OnceLock::new();
+fn tone_fit_consts() -> [f32; 11] {
+    static C: std::sync::OnceLock<[f32; 11]> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
-        let mut c = [0.0488f32, 0.9349, 3.0063, 0.6151, 1.6655, 1.5514, 0.3064, 0.0463, 0.04, 32.0];
+        let mut c = [0.0488f32, 0.9349, 3.0063, 0.6151, 1.6655, 1.5514, 0.3064, 0.0463, 0.04, 32.0, 1.5];
         if let Ok(v) = std::env::var("SL_TONE_LUT") {
             let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             if p.len() >= 8 {
-                c[..8].copy_from_slice(&p[..8]);
-                if p.len() >= 10 {
-                    c[8] = p[8];
-                    c[9] = p[9];
-                }
+                let n = p.len().min(11);
+                c[..n].copy_from_slice(&p[..n]);
             }
         }
         c
@@ -1773,6 +1770,17 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
     for i in 1..512 {
         if out[i] < out[i - 1] {
             out[i] = out[i - 1];
+        }
+    }
+    // exposure-push headroom compression: past +1EV, LR crushes the whole
+    // above-white range far below the shoulder — measured on digest-matched
+    // previews (+2.4EV maps l≈1.1→0.13 lin where the shoulder alone gives
+    // ~0.5). Applied AFTER the monotone pass because LR's recovered-
+    // highlight mapping is genuinely non-monotone in extreme pushes.
+    if c[10] != 0.0 && r.exposure > 1.0 {
+        for (i, v) in out.iter_mut().enumerate() {
+            let y0 = 1.6 * i as f32 / 511.0;
+            *v /= (1.0 + (r.exposure - 1.0) * c[10] * sstep(0.8, 1.8, y0)).max(0.15);
         }
     }
     out
