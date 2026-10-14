@@ -1709,9 +1709,14 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let tl = clamp(luma(x), 0.0, 1.6);
         // clamp evaluation luma to bound the y/l gain — mirrors develop.rs
         let le = max(tl, 0.04);
-        x = x * (tone_at(le / 1.6) / le);
+        x = x * min(tone_at(le / 1.6) / le, 32.0);
     }
-    x = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
+    // contrast about pivot + soft-limit ~[0,1.35] — mirrors develop.rs
+    if (pg.a1.y != 0.0) {
+        let v = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
+        let s = (v + sqrt(v * v + vec3<f32>(0.0016))) * 0.5;
+        x = vec3<f32>(1.35) - (vec3<f32>(1.35) - s + sqrt((vec3<f32>(1.35) - s) * (vec3<f32>(1.35) - s) + vec3<f32>(0.0016))) * 0.5;
+    }
     if (pg.a2.z != 0.0 || pg.a2.w != 0.0) {
         let luma2 = luma(x);
         let mx = max(x.x, max(x.y, x.z));
@@ -2426,10 +2431,10 @@ fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex:
             adj = adj * (1.0 + 0.08 * f) - vec3<f32>(0.015 * f * (1.0 - l));
         }
         if (ex2.y != 0.0) {
-            adj = adj + vec3<f32>(ex2.y * mask * 0.22 * (1.0 - sstep(0.0, 0.5, l)) * max(1.0 - l / 1.6, 0.0));
+            adj = adj + vec3<f32>(ex2.y * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * max(1.0 - l / 1.6, 0.0));
         }
         if (ex2.x != 0.0) {
-            adj = adj / (1.0 - ex2.x * mask * 0.9 * sstep(0.45, 1.2, l));
+            adj = adj / max(1.0 - ex2.x * mask * 2.19 * sstep(0.60, 1.49, l), 0.15);
         }
         if (ex2.z != 0.0) {
             adj = adj * (1.0 + ex2.z * mask * 0.35 * sstep(0.5, 1.0, l));

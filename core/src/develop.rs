@@ -798,10 +798,12 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // crs:Temperature semantics): find the camera-space neutral for
         // the target illuminant through the active color matrix, WB gains
         // are its per-channel reciprocal normalized to green.
-        let t_k = r.temp_abs.clamp(1500.0, 40000.0);
+        let t_k = r.temp_abs.clamp(1500.0, 50000.0);
         let mut xy = crate::dcp::kelvin_to_xy(t_k);
-        // tint: slide along the perpendicular green/magenta axis (±150 LR)
-        xy[1] += r.tint_abs.clamp(-150.0, 150.0) * -0.0004;
+        // tint: slide the illuminant along the perpendicular green/magenta
+        // axis (±150 LR). LR Tint<0 renders greener => the illuminant moves
+        // magenta (lower chromaticity-y) so the WB boost green, and vice versa.
+        xy[1] += r.tint_abs.clamp(-150.0, 150.0) * 0.0004;
         let xyz = crate::dcp::xy_to_xyz(xy);
         let cam_neutral = if let Some(pr) = &prof {
             pr.color_matrix_at(t_k)
@@ -1668,10 +1670,41 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
 /// extra compression from Highlights and highlight_rolloff) plus a toe shaped
 /// by Blacks (soft-knee crush or fade lift), Shadows lift and shadow_rolloff.
 /// 512 samples over linear luma 0..1.6, monotone.
+/// Tone-map constants — defaults fitted against digest-fresh Lightroom
+/// previews; SL_TONE_LUT="8 or 10 comma floats" overrides for offline fits
+/// (last two: eval-luma floor, gain cap — the WGSL mirror is hardcoded).
+fn tone_fit_consts() -> [f32; 10] {
+    static C: std::sync::OnceLock<[f32; 10]> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let mut c = [0.10f32, 0.66, 2.19, 0.60, 1.49, 1.53, 0.588, 0.104, 0.04, 32.0];
+        if let Ok(v) = std::env::var("SL_TONE_LUT") {
+            let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if p.len() >= 8 {
+                c[..8].copy_from_slice(&p[..8]);
+                if p.len() >= 10 {
+                    c[8] = p[8];
+                    c[9] = p[9];
+                }
+            }
+        }
+        c
+    })
+}
+
 fn build_tone_lut(r: &Recipe) -> [f32; 512] {
     let sh = r.shadows;
     let hl = r.highlights;
-    let mut wl = (1.0 + r.whites * 1.4).clamp(0.35, 3.0);
+    // diagnostic override: SL_TONE_LUT="sh_mul,sh_band,hl_mul,hl_lo,hl_hi,
+    // wh_scale,wl_min,bk_mul" replaces the fitted constants for offline
+    // fitting against Lightroom previews.
+    let c = tone_fit_consts();
+    let (sh_mul, sh_band, hl_mul, hl_lo, hl_hi) = (c[0], c[1], c[2], c[3], c[4]);
+    // constants fitted against digest-fresh Lightroom preview renders
+    // across 13 slider-diverse images (differential evolution on the full
+    // downstream chain): LR's Highlights recovery compresses ~2.4x harder
+    // than the original constants, its Shadows band is wider but weaker,
+    // and the whites shoulder keeps a higher minimum white point.
+    let mut wl = (1.0 + r.whites * c[5]).clamp(c[6], 3.0);
     // highlight_rolloff > 1 compresses harder (smaller white point)
     if r.highlight_rolloff > 1.0 {
         wl /= 1.0 + 0.8 * (r.highlight_rolloff - 1.0);
@@ -1687,7 +1720,7 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
             let mut y = y0;
             // shadows lift (low band gain, linear domain)
             if sh != 0.0 {
-                y += sh * 0.22 * (1.0 - sstep(0.0, 0.5, y0)) * (1.0 - y0 / 1.6).max(0.0);
+                y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0);
             }
             // shadow rolloff shaping
             if shr != 1.0 {
@@ -1700,7 +1733,7 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
                 let k = b * 0.10;
                 y = k + (1.0 - k) * y;
             } else if b < 0.0 {
-                let k = -b * 0.05;
+                let k = -b * c[7];
                 let e = 0.004f32;
                 let soft = |v: f32| ((v - k) + ((v - k) * (v - k) + e * e).sqrt()) * 0.5;
                 y = (soft(y) - soft(0.0)) / (soft(1.0) - soft(0.0));
@@ -1711,7 +1744,7 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
             // highlights recovery: LR slider <0 recovers (compresses the
             // upper band), >0 brightens — extra compression in the upper band
             if hl != 0.0 {
-                y /= 1.0 - hl * 0.9 * sstep(0.45, 1.2, y);
+                y /= (1.0 - hl * hl_mul * sstep(hl_lo, hl_hi, y)).max(0.15);
             }
             y.clamp(0.0, 1.0)
         })
@@ -2017,7 +2050,10 @@ pub fn pc_apply(x: [f32; 3], sw: &PcSwatch, var: f32) -> [f32; 3] {
     ]
 }
 
-fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
+/// Everything in adjust() that precedes the tone-map stage — factored out
+/// for diagnostics (SL_DUMP_PRETONE writes this stage's rgb per pixel).
+/// Returns rgb right before the tone LUT.
+fn pre_tone_rgb(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     let mut x = rgb;
     // camera calibration: primary hue/sat matrix + shadow green/magenta
     let ident = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -2096,23 +2132,55 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     for c in 0..3 {
         x[c] += p.offset[c];
     }
+    x
+}
+
+/// tone-map gain: evaluate the LUT at the pixel luma and apply it as a
+/// ratio so hue stays put. Constants are fitted against digest-fresh LR
+/// previews — the low evaluation floor + hard gain cap reproduce LR's
+/// deep-shadow lift without runaway noise amplification.
+fn tone_gain(x: [f32; 3], p: &Params) -> f32 {
+    let c = tone_fit_consts();
+    let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
+    let le = l.max(c[8]);
+    (tone_lut_at(&p.tone_lut, le / 1.6) / le).min(c[9])
+}
+
+fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
+    let mut x = pre_tone_rgb(rgb, p);
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dbg = std::env::var_os("SL_PROBE2").is_some()
+        && x[0] + x[1] + x[2] > 0.06
+        && x[0] + x[1] + x[2] < 0.30
+        && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40;
+    if dbg {
+        eprintln!("[adj] pretone={x:?} tone_lut0.1={:.4}", tone_lut_at(&p.tone_lut, 0.1 / 1.6));
+    }
     // EV-domain tone map (luminance-preserving): folds shadows/highlights/
     // whites/blacks + rolloff into one curve — hue stays put, highlights
     // roll off on an extended-Reinhard shoulder instead of clipping
     if p.has_tone {
-        let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
-        // clamp the evaluation luma so the y/l gain is bounded (~<=6x for
-        // extreme lifts) — below ~0.04 the LUT is affine anyway, and an
-        // unbounded gain would amplify the noise floor by 100x+
-        let le = l.max(0.04);
-        let g = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+        let g = tone_gain(x, p);
         for c in &mut x {
             *c *= g;
         }
     }
-    // contrast around adjustable pivot
-    for c in &mut x {
-        *c = (*c - p.pivot) * (1.0 + p.contrast * 0.9) + p.pivot;
+    if dbg {
+        eprintln!("[adj] tone={x:?}");
+    }
+    // contrast around adjustable pivot, then soft-limit into ~[0,1.35] —
+    // extreme pushes compress smoothly instead of hard-clipping at the
+    // curve LUT (LR's S-curve contrast preserves both ends)
+    let cm = 1.0 + p.contrast * 0.9;
+    if p.contrast != 0.0 {
+        for c in &mut x {
+            let v = (*c - p.pivot) * cm + p.pivot;
+            let s = |u: f32| (u + (u * u + 0.0016).sqrt()) * 0.5;
+            *c = 1.35 - s(1.35 - s(v));
+        }
+    }
+    if dbg {
+        eprintln!("[adj] contrast={x:?}");
     }
     // saturation / vibrance
     if p.saturation != 0.0 || p.vibrance != 0.0 {
@@ -2217,10 +2285,16 @@ fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
             }
         }
     }
+    if dbg {
+        eprintln!("[adj] pre-lut={x:?}");
+    }
     // tone curve lut
     for c in &mut x {
         let idx = (c.clamp(0.0, 1.0) * 255.0) as usize;
         *c = p.lut[idx.min(255)];
+    }
+    if dbg {
+        eprintln!("[adj] post-lut={x:?}");
     }
     // per-channel custom curves
     if !p.chan_luts.is_empty() {
@@ -2428,6 +2502,27 @@ pub fn build_demosaic_taps(cfa: &CfaPattern) -> DemosaicTaps {
 /// full-res demosaic → camera-space linear RGB plane (m.w × m.h)
 fn demosaic_plane(m: &Mosaic, norm: &[f32; 4], taps: &DemosaicTaps) -> Vec<[f32; 3]> {
     let (vw, vh) = (m.w, m.h);
+    if let Some(lr) = &m.linear {
+        // embedded demosaiced data (LR Denoise/SuperRes DNG): direct copy
+        // of the visible rect, normalized by the IFD's black/white levels
+        let mut out = vec![[0.0f32; 3]; vw * vh];
+        for vy in 0..vh {
+            let sy = (m.top + vy).min(lr.h - 1);
+            for vx in 0..vw {
+                let sx = (m.left + vx).min(lr.w - 1);
+                let i = sy * lr.w + sx;
+                let mut px = [0.0f32; 3];
+                for c in 0..3 {
+                    if let Some(p) = lr.planes.get(c) {
+                        px[c] = ((p[i] as f32 - lr.black[c]) / (lr.white - lr.black[c]).max(1.0))
+                            .max(0.0);
+                    }
+                }
+                out[vy * vw + vx] = px;
+            }
+        }
+        return out;
+    }
     let (rw, rh) = (m.raw_w as i32, m.raw_h as i32);
     let (pw, ph) = (m.cfa.w, m.cfa.h);
     let nv = |sx: i32, sy: i32| -> f32 {
@@ -3070,6 +3165,32 @@ fn bilinear3(plane: &[[f32; 3]], w: usize, h: usize, sx: f32, sy: f32, ch: usize
 /// When a channel has no samples inside the block (small stride), the
 /// window is widened until every channel is covered.
 fn demosaic_pixel(m: &Mosaic, vx: usize, vy: usize, stride: usize, norm: &[f32; 4]) -> [f32; 3] {
+    if let Some(lr) = &m.linear {
+        let x0 = m.left + vx * stride;
+        let y0 = m.top + vy * stride;
+        let xe = (x0 + stride).min(lr.w.min(m.left + m.w));
+        let ye = (y0 + stride).min(lr.h.min(m.top + m.h));
+        let mut out = [0.0f32; 3];
+        let mut n = 0u32;
+        for sy in y0..ye {
+            for sx in x0..xe {
+                let i = sy * lr.w + sx;
+                for c in 0..3 {
+                    if let Some(p) = lr.planes.get(c) {
+                        out[c] += (p[i] as f32 - lr.black[c])
+                            / (lr.white - lr.black[c]).max(1.0);
+                    }
+                }
+                n += 1;
+            }
+        }
+        if n > 0 {
+            for c in &mut out {
+                *c = (*c / n as f32).max(0.0);
+            }
+        }
+        return out;
+    }
     let cfa = &m.cfa;
     let x0 = m.left + vx * stride;
     let y0 = m.top + vy * stride;
@@ -3515,6 +3636,7 @@ fn develop_raster(
             flip,
         },
         dng_ops: None,
+        linear: None,
     };
     // raster: histogram on the decoded image feeds auto-exposure/contrast
     let stats = if Stats::needs(r) {
@@ -4015,6 +4137,28 @@ fn finish_linear(
     } else {
         None
     };
+    // diagnostic dump: pre-tone rgb buffer for offline fitting
+    if let Ok(dp) = std::env::var("SL_DUMP_PRETONE") {
+        let mut buf = Vec::with_capacity(dw * dh * 3);
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let nx = (dx as f32 + 0.5) / dw as f32;
+                let ny = (dy as f32 + 0.5) / dh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip,
+                    w, h,
+                );
+                buf.extend_from_slice(&pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p));
+            }
+        }
+        let mut bytes = Vec::with_capacity(8 + buf.len() * 4);
+        bytes.extend_from_slice(&(dw as u32).to_le_bytes());
+        bytes.extend_from_slice(&(dh as u32).to_le_bytes());
+        for v in &buf {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let _ = std::fs::write(&dp, &bytes);
+    }
     let mut out = vec![0u8; dw * dh * 4];
     for dy in 0..dh {
         for dx in 0..dw {
@@ -4024,6 +4168,7 @@ fn finish_linear(
             let (sx, sy) = dst_to_src(
                 nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
             );
+
             // chromatic-aberration fix: radial per-channel sample offsets
             let mut col = if p.ca_fix != 0.0 {
                 let wcx = w as f32 * 0.5;
@@ -4053,6 +4198,14 @@ fn finish_linear(
                         col[c] += (bilinear3(b, *bw, *bh, bx, by, c) - col[c]) * bm;
                     }
                 }
+            }
+            if std::env::var_os("SL_PROBE").is_some() && (dx * 7 + dy * 13) % 97 == 0 {
+                let pt = pre_tone_rgb(col, p);
+                let mut a0 = adjust(col, p);
+                local_ops(&mut a0, col, p, nx, ny, dw as f32 / dh as f32, subj, sky, veg);
+                eprintln!(
+                    "[probe] {nx:.3},{ny:.3} cam={col:?} pretone={pt:?} adj={a0:?}"
+                );
             }
             let mut adj = adjust(col, p);
             let aspect = dw as f32 / dh as f32;
@@ -4482,13 +4635,13 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
         }
         // tone-band offsets: same band weights as build_tone_lut
         if sh != 0.0 {
-            let s = sh * mask * 0.22 * (1.0 - sstep(0.0, 0.5, l)) * (1.0 - l / 1.6).max(0.0);
+            let s = sh * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * (1.0 - l / 1.6).max(0.0);
             for c in adj.iter_mut() {
                 *c += s;
             }
         }
         if hi != 0.0 {
-            let d = 1.0 - hi * mask * 0.9 * sstep(0.45, 1.2, l);
+            let d = (1.0 - hi * mask * 2.19 * sstep(0.60, 1.49, l)).max(0.15);
             for c in adj.iter_mut() {
                 *c /= d;
             }
@@ -6042,6 +6195,7 @@ mod tests {
                 flip: 0,
             },
             dng_ops: None,
+            linear: None,
         }
     }
 
