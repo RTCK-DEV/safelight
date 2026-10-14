@@ -2108,7 +2108,9 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
     // then ProfileToneCurve — the profile's base rendering, applied before
     // user edits (dcpsim order: matrix -> looktable -> tonecurve -> user).
     if let Some(lt) = &p.profile_look {
-        x = lt.apply(x);
+        if std::env::var_os("SL_NOLOOK").is_none() {
+            x = lt.apply(x);
+        }
     }
     if !p.profile_tone_lut.is_empty() {
         for c in &mut x {
