@@ -1629,12 +1629,13 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // converging to a mild highlight compression — fitted empirically from
     // digest-matched Lightroom previews and composed on top of the recipe's
     // tone LUT. PV15 uses a weaker variant (blend 0.5 toward identity) —
-    // its residual has the same shape but smaller magnitude. The strength
-    // also tapers with |Exposure2012|: the adaptive lift is part of the
-    // baseline, and a large user exposure push already relocates the scene.
+    // its residual has the same shape but smaller magnitude.
     if r.process_version > 0.0 {
-        let base = if r.process_version < 12.0 { 1.0 } else { 0.5 };
-        let k = (base / (1.0 + r.exposure.abs() * 0.7)).clamp(0.0, 1.0);
+        // fitted against digest-matched previews: the blend does NOT
+        // attenuate with |Exposure2012| — a constant ~0.5 beats every
+        // tested exposure-dependent falloff (LR's adaptive tone keeps
+        // working even under a big user push)
+        let k = if r.process_version < 12.0 { 1.0 } else { 0.5 };
         if k > 0.0 {
             for v in &mut p.lut {
                 *v = *v + (pv2012_tone(*v) - *v) * k;
@@ -1676,7 +1677,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
 fn tone_fit_consts() -> [f32; 10] {
     static C: std::sync::OnceLock<[f32; 10]> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
-        let mut c = [0.10f32, 0.66, 2.19, 0.60, 1.49, 1.53, 0.588, 0.104, 0.04, 32.0];
+        let mut c = [0.0488f32, 0.9349, 3.0063, 0.6151, 1.6655, 1.5514, 0.3064, 0.0463, 0.04, 32.0];
         if let Ok(v) = std::env::var("SL_TONE_LUT") {
             let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             if p.len() >= 8 {
@@ -3537,16 +3538,19 @@ pub fn colorize_plane(
                 (cam[1] * p.wb[1]).clamp(0.0, 1.0),
                 (cam[2] * p.wb[2]).clamp(0.0, 1.0),
             ];
-            // DNG ProfileHueSatMap: per-hue sat/val shifts in camera space,
-            // applied between WB and the color matrix (DNG spec order).
-            let cw = match &p.profile_hsm {
-                Some(h) => h.apply(cw),
-                None => cw,
-            };
             let mut out = [0.0f32; 3];
             for c in 0..3 {
                 out[c] = p.m[c][0] * cw[0] + p.m[c][1] * cw[1] + p.m[c][2] * cw[2];
             }
+            // DNG ProfileHueSatMap: per-hue sat/val shifts in the profile
+            // working space (ProPhoto), AFTER the camera->working matrix —
+            // dng_render.cpp order: ABCDtoRGB -> HueSatMap -> exposure ->
+            // LookTable. Applying it in camera space (pre-matrix) samples
+            // the map at the wrong hue/sat coordinates.
+            let out = match &p.profile_hsm {
+                Some(h) => h.apply(out),
+                None => out,
+            };
             lin[vy * vw + vx] = out;
         }
     }
