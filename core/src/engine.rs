@@ -120,7 +120,20 @@ impl Engine {
         };
         self.with_decoded(path, |d| {
             let mut gpu = self.gpu.lock().unwrap();
-            if let (Decoded::Mosaic(m), Some(g)) = (d, gpu.as_ref()) {
+            if std::env::var_os("SL_CPU").is_some() {
+                drop(gpu);
+                return Ok(develop::develop_cpu_ctx(
+                    d,
+                    recipe,
+                    max_px,
+                    den.as_ref(),
+                    subj.as_ref(),
+                ));
+            }
+            // embedded LinearRaw (LR Denoise/SuperRes DNG) has no GPU path
+            // yet — render those through the CPU pipeline
+            let gpu_ok = !matches!(d, Decoded::Mosaic(m) if m.linear.is_some());
+            if let (Decoded::Mosaic(m), Some(g), true) = (d, gpu.as_ref(), gpu_ok) {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     g.develop(m, recipe, max_px, den.as_ref(), subj.as_ref())
                 }));

@@ -87,6 +87,10 @@ pub struct Mosaic {
     pub info: CameraInfo,
     /// DNG embedded lens-correction opcodes (GainMap / WarpRectilinear)
     pub dng_ops: Option<crate::dngops::DngOps>,
+    /// LR "Denoise"/"SuperRes" DNGs embed a demosaiced camera-space RGB
+    /// image (LinearRaw IFD, JPEG XL tiles) — when present this is what
+    /// Lightroom renders, superseding the CFA mosaic.
+    pub linear: Option<crate::dngops::LinearRaw>,
 }
 
 #[derive(Debug)]
@@ -233,13 +237,21 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         bail!("sl_raw_cfa failed ({rc})");
     }
     let data = unsafe { Vec::from_raw_parts(out, count as usize, count as usize) };
-    mosaic_decoded(
+    let mut dec = mosaic_decoded(
         &info,
         data,
         info.raw_width as usize,
         info.raw_height as usize,
         crate::dngops::parse(path),
-    )
+    )?;
+    if let Decoded::Mosaic(m) = &mut dec {
+        m.linear = crate::dngops::linear_raw(path);
+        if m.linear.is_some() && std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+            let l = m.linear.as_ref().unwrap();
+            eprintln!("[dng] LinearRaw {}x{} planes={}", l.w, l.h, l.planes.len());
+        }
+    }
+    Ok(dec)
 }
 
 /// Shared Mosaic construction for CFA decodes (libraw unpack or our own
@@ -300,6 +312,7 @@ fn mosaic_decoded(
         cfa,
         info: info_of(info),
         dng_ops,
+        linear: None,
     }))
 }
 

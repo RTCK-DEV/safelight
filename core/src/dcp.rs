@@ -764,7 +764,7 @@ pub fn mat_mul_vec(m: Mat3, v: [f32; 3]) -> [f32; 3] {
 /// kelvin -> white-point xy. Planckian locus below 4000 K, CIE D-series
 /// daylight locus above (matches how Adobe derives WB from Temperature).
 pub fn kelvin_to_xy(t: f32) -> [f32; 2] {
-    let t = t.clamp(1500.0, 40000.0);
+    let t = t.clamp(1500.0, 50000.0);
     let x = if t <= 4000.0 {
         // Planckian approximation (valid 1667..4000K)
         -0.2661239e9 / (t * t * t) - 0.2343589e6 / (t * t) + 0.8776956e3 / t + 0.179910

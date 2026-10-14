@@ -435,15 +435,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-queue"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1258,9 +1249,9 @@ dependencies = [
 
 [[package]]
 name = "nagoya"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7827a8230125fc884656326f38d6bef47249c13971a8b7ef80f4e360e1389fc5"
+checksum = "a1622246acc3b566e6244bc602c510ac40767da34d30d1804b40d4fba239f838"
 dependencies = [
  "async-task",
  "futures-io",
@@ -1724,14 +1715,11 @@ dependencies = [
 
 [[package]]
 name = "ps-st3"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a78c6922d75f35bd19b6904f10f394c59104f70d1e87f4519d3e62fc04f02ac6"
+checksum = "7b37e816d7b34fcd1b614294b19e09012d9cf4754e3694a581ddb1dbfe8b361f"
 dependencies = [
  "atomic-wait",
- "crossbeam-queue",
- "crossbeam-utils",
- "spin",
 ]
 
 [[package]]
