@@ -581,12 +581,14 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
 }
 
 fn wb_matrix(cam: vec3<f32>) -> vec3<f32> {
-    let cw = hsm_apply(clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0)));
-    return vec3<f32>(
+    let cw = clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+    // HueSatMap applies in the profile working space (ProPhoto), AFTER the
+    // camera->working matrix — mirrors develop.rs / dng_render.cpp order.
+    return hsm_apply(vec3<f32>(
         dot(pg.m0.xyz, cw),
         dot(pg.m1.xyz, cw),
         dot(pg.m2.xyz, cw),
-    );
+    ));
 }
 
 // x-dispatch is capped at 65535 workgroups; gid.y carries the overflow rows.
@@ -1571,8 +1573,8 @@ fn look_apply(x: vec3<f32>) -> vec3<f32> {
     return map_apply(0u, x);
 }
 
-// DNG ProfileHueSatMap — same trilinear map evaluated in camera space
-// between WB and the color matrix (DNG spec order, mirrors colorize_plane).
+// DNG ProfileHueSatMap — trilinear map evaluated in the profile working
+// space (ProPhoto) after the camera->working matrix (mirrors colorize_plane).
 fn hsm_apply(x: vec3<f32>) -> vec3<f32> {
     let base = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u + 256u;
     return map_apply(base, x);

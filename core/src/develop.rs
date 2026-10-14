@@ -2071,7 +2071,7 @@ pub fn pc_apply(x: [f32; 3], sw: &PcSwatch, var: f32) -> [f32; 3] {
 /// Everything in adjust() that precedes the tone-map stage — factored out
 /// for diagnostics (SL_DUMP_PRETONE writes this stage's rgb per pixel).
 /// Returns rgb right before the tone LUT.
-fn pre_tone_rgb(rgb: [f32; 3], p: &Params) -> [f32; 3] {
+fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
     let mut x = rgb;
     // camera calibration: primary hue/sat matrix + shadow green/magenta
     let ident = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -2125,7 +2125,14 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params) -> [f32; 3] {
     // dehaze (dark-channel prior): veil = dehaze * min(r,g,b); transmission
     // t = 1 - veil/A floored at 0.35; x' = (x - veil)/t — mirrors gpu.rs
     if p.dehaze > 0.0 {
-        let mn = x[0].min(x[1]).min(x[2]);
+        // dark-channel prior: the veil is a SPATIALLY SMOOTHED min-channel
+        // (patchwise min, blurred) — a per-pixel min underestimates haze on
+        // bright/chromatic surfaces, which is where LR's Dehaze bites.
+        let mn = if veil_min.is_finite() {
+            veil_min
+        } else {
+            x[0].min(x[1]).min(x[2])
+        };
         let t = (1.0 - p.dehaze * mn / p.dehaze_a).max(0.35);
         let v = p.dehaze * mn;
         for c in &mut x {
@@ -2199,6 +2206,9 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32) -> f32 {
             let ghl = tone_lut_at(&p.tone_hl, g / 1.6) / g;
             base * gsh.powf(w) * ghl.powf(w_hl)
         }
+        // base-detail split: the tone curve acts on the smooth base only,
+        // high-frequency detail is preserved: out = T(g) + w·(l − g)
+        7 | 8 => (tone_lut_at(&p.tone_lut, g / 1.6) + w * (l - guide)) / le,
         // masked delta: l + (1-w)·D(l) + w·D(g), D = T−identity
         6 => {
             let dl = base * le - le;
@@ -2207,16 +2217,16 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32) -> f32 {
         }
         _ => base * (1.0 - w) + gg * w,
     };
-    gain.min(c[9])
+    gain.max(0.0).min(c[9])
 }
 
 #[allow(dead_code)] // tests use the guide-free entry point
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
-    adjust_g(rgb, p, f32::NAN)
+    adjust_g(rgb, p, f32::NAN, f32::NAN)
 }
 
-fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32) -> [f32; 3] {
-    let mut x = pre_tone_rgb(rgb, p);
+fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32) -> [f32; 3] {
+    let mut x = pre_tone_rgb(rgb, p, veil_min);
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dbg = std::env::var_os("SL_PROBE2").is_some()
         && x[0] + x[1] + x[2] > 0.06
@@ -4233,7 +4243,7 @@ fn finish_linear(
                     nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip,
                     w, h,
                 );
-                buf.extend_from_slice(&pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p));
+                buf.extend_from_slice(&pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN));
             }
         }
         let mut bytes = Vec::with_capacity(8 + buf.len() * 4);
@@ -4258,34 +4268,58 @@ fn finish_linear(
                 let (sx, sy) = dst_to_src(
                     nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
                 );
-                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p);
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
                 g[gy * gw + gx] = 0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2];
             }
         }
-        // 3-pass separable box blur ≈ gaussian; sigma in output-px fraction
+        // 3-pass separable box blur ≈ gaussian; sigma in output-px fraction.
+        // mode 8 = edge-aware: coarse bilateral on the grid instead.
         let r = (gsigma * gw as f32 * 0.5).max(1.0) as usize;
-        let mut t = vec![0.0f32; gw * gh];
-        for _ in 0..3 {
+        if gmode == 8 {
+            let sigma_i = 0.12f32; // intensity sigma (linear luma units)
+            let src = g.clone();
             for y in 0..gh {
                 for x in 0..gw {
-                    let x0 = x.saturating_sub(r);
-                    let x1 = (x + r).min(gw - 1);
+                    let c0 = src[y * gw + x];
                     let mut acc = 0.0f32;
-                    for xx in x0..=x1 {
-                        acc += g[y * gw + xx];
+                    let mut ws = 0.0f32;
+                    for yy in y.saturating_sub(2 * r)..(y + 2 * r).min(gh - 1) {
+                        for xx in x.saturating_sub(2 * r)..(x + 2 * r).min(gw - 1) {
+                            let d2 = ((xx - x) * (xx - x) + (yy - y) * (yy - y)) as f32;
+                            let sp = (-d2 / (2.0 * r as f32 * r as f32)).exp();
+                            let di = src[yy * gw + xx] - c0;
+                            let wij = sp * (-di * di / (2.0 * sigma_i * sigma_i)).exp();
+                            acc += src[yy * gw + xx] * wij;
+                            ws += wij;
+                        }
                     }
-                    t[y * gw + x] = acc / (x1 - x0 + 1) as f32;
+                    g[y * gw + x] = if ws > 0.0 { acc / ws } else { c0 };
                 }
             }
-            for y in 0..gh {
-                for x in 0..gw {
-                    let y0 = y.saturating_sub(r);
-                    let y1 = (y + r).min(gh - 1);
-                    let mut acc = 0.0f32;
-                    for yy in y0..=y1 {
-                        acc += t[yy * gw + x];
+        } else {
+            let mut t = vec![0.0f32; gw * gh];
+            for _ in 0..3 {
+                for y in 0..gh {
+                    for x in 0..gw {
+                        let x0 = x.saturating_sub(r);
+                        let x1 = (x + r).min(gw - 1);
+                        let mut acc = 0.0f32;
+                        for xx in x0..=x1 {
+                            acc += g[y * gw + xx];
+                        }
+                        t[y * gw + x] = acc / (x1 - x0 + 1) as f32;
                     }
-                    g[y * gw + x] = acc / (y1 - y0 + 1) as f32;
+                }
+                for y in 0..gh {
+                    for x in 0..gw {
+                        let y0 = y.saturating_sub(r);
+                        let y1 = (y + r).min(gh - 1);
+                        let mut acc = 0.0f32;
+                        for yy in y0..=y1 {
+                            acc += t[yy * gw + x];
+                        }
+                        g[y * gw + x] = acc / (y1 - y0 + 1) as f32;
+                    }
                 }
             }
         }
@@ -4306,6 +4340,97 @@ fn finish_linear(
                 let fy = gy - y0 as f32;
                 (g[y0 * gw + x0] * (1.0 - fx) + g[y0 * gw + x1] * fx) * (1.0 - fy)
                     + (g[y1 * gw + x0] * (1.0 - fx) + g[y1 * gw + x1] * fx) * fy
+            }
+            None => f32::NAN,
+        }
+    };
+    // dehaze dark-channel prior: coarse grid of pretone min(r,g,b), then
+    // patchwise MIN (≈3% of frame) + blur — the veil varies smoothly and is
+    // driven by the darkest channel of the local surround, not the pixel.
+    let veil = if p.dehaze > 0.0 {
+        let vw = (dw / 8).clamp(16, 512);
+        let vh = (dh / 8).clamp(16, 512);
+        let mut vg = vec![0.0f32; vw * vh];
+        for gy in 0..vh {
+            for gx in 0..vw {
+                let nx = (gx as f32 + 0.5) / vw as f32;
+                let ny = (gy as f32 + 0.5) / vh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
+                vg[gy * vw + gx] = pt[0].min(pt[1]).min(pt[2]);
+            }
+        }
+        // patchwise minimum (morphological erosion over ~3% of the frame)
+        let rp = ((vw as f32) * 0.03).max(2.0) as usize;
+        let mut t = vec![0.0f32; vw * vh];
+        for y in 0..vh {
+            for x in 0..vw {
+                let x0 = x.saturating_sub(rp);
+                let x1 = (x + rp).min(vw - 1);
+                let mut m = f32::MAX;
+                for xx in x0..=x1 {
+                    m = m.min(vg[y * vw + xx]);
+                }
+                t[y * vw + x] = m;
+            }
+        }
+        for y in 0..vh {
+            for x in 0..vw {
+                let y0 = y.saturating_sub(rp);
+                let y1 = (y + rp).min(vh - 1);
+                let mut m = f32::MAX;
+                for yy in y0..=y1 {
+                    m = m.min(t[yy * vw + x]);
+                }
+                vg[y * vw + x] = m;
+            }
+        }
+        // soften the patch quantization (2 box-blur passes)
+        for _ in 0..2 {
+            let r = rp.max(1);
+            let mut t2 = vec![0.0f32; vw * vh];
+            for y in 0..vh {
+                for x in 0..vw {
+                    let x0 = x.saturating_sub(r);
+                    let x1 = (x + r).min(vw - 1);
+                    let mut acc = 0.0f32;
+                    for xx in x0..=x1 {
+                        acc += vg[y * vw + xx];
+                    }
+                    t2[y * vw + x] = acc / (x1 - x0 + 1) as f32;
+                }
+            }
+            for y in 0..vh {
+                for x in 0..vw {
+                    let y0 = y.saturating_sub(r);
+                    let y1 = (y + r).min(vh - 1);
+                    let mut acc = 0.0f32;
+                    for yy in y0..=y1 {
+                        acc += t2[yy * vw + x];
+                    }
+                    vg[y * vw + x] = acc / (y1 - y0 + 1) as f32;
+                }
+            }
+        }
+        Some((vg, vw, vh))
+    } else {
+        None
+    };
+    let veil_at = |nx: f32, ny: f32| -> f32 {
+        match &veil {
+            Some((g, vw, vh)) => {
+                let gx = (nx * *vw as f32 - 0.5).clamp(0.0, *vw as f32 - 1.0);
+                let gy = (ny * *vh as f32 - 0.5).clamp(0.0, *vh as f32 - 1.0);
+                let x0 = gx as usize;
+                let y0 = gy as usize;
+                let x1 = (x0 + 1).min(*vw - 1);
+                let y1 = (y0 + 1).min(*vh - 1);
+                let fx = gx - x0 as f32;
+                let fy = gy - y0 as f32;
+                (g[y0 * vw + x0] * (1.0 - fx) + g[y0 * vw + x1] * fx) * (1.0 - fy)
+                    + (g[y1 * vw + x0] * (1.0 - fx) + g[y1 * vw + x1] * fx) * fy
             }
             None => f32::NAN,
         }
@@ -4351,14 +4476,14 @@ fn finish_linear(
                 }
             }
             if std::env::var_os("SL_PROBE").is_some() && (dx * 7 + dy * 13) % 97 == 0 {
-                let pt = pre_tone_rgb(col, p);
-                let mut a0 = adjust_g(col, p, guide_at(nx, ny));
+                let pt = pre_tone_rgb(col, p, f32::NAN);
+                let mut a0 = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny));
                 local_ops(&mut a0, col, p, nx, ny, dw as f32 / dh as f32, subj, sky, veg);
                 eprintln!(
                     "[probe] {nx:.3},{ny:.3} cam={col:?} pretone={pt:?} adj={a0:?}"
                 );
             }
-            let mut adj = adjust_g(col, p, guide_at(nx, ny));
+            let mut adj = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny));
             let aspect = dw as f32 / dh as f32;
             local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
             // serial correction stages (DaVinci serial nodes): full adjust +
@@ -4397,7 +4522,7 @@ fn finish_linear(
                 if key <= 0.001 {
                     continue;
                 }
-                let mut a2 = adjust_g(col, sp, guide_at(nx, ny));
+                let mut a2 = adjust_g(col, sp, guide_at(nx, ny), veil_at(nx, ny));
                 local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky, veg);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;
