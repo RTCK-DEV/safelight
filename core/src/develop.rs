@@ -29,6 +29,9 @@ pub struct Params {
     pub m: [[f32; 3]; 3],
     pub lut: Vec<f32>,
     pub exposure_mul: f32,
+    /// user EV slider (for exposure-gated behaviour, e.g. Melissa-domain
+    /// tone eval on extreme pushes)
+    pub exposure_ev: f32,
     pub contrast: f32,
     pub highlights: f32,
     pub shadows: f32,
@@ -1462,6 +1465,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             catmull_lut(&r.curve)
         },
         exposure_mul,
+        exposure_ev: r.exposure,
         contrast: r.contrast,
         highlights: r.highlights,
         shadows: r.shadows,
@@ -2257,13 +2261,28 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
     // SL_GAMMA_T: evaluate the LUT in a gamma-encoded (Melissa-style) domain —
     // LR's PV2012 sliders operate on ProPhoto-with-sRGB-TRC data, so the
     // slider bands pivot on encoded luminance, not linear.
-    let gamma_t = std::env::var_os("SL_GAMMA_T").is_some();
-    let base = if gamma_t {
-        let enc = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
-        let dec = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
-        dec(tone_lut_at(&p.tone_lut, enc(le) / 1.6).clamp(0.0, 1.6)) / le
+    // extreme pushes: evaluate the LUT in the sRGB-encoded (Melissa-like)
+    // domain — LR's slider bands pivot on encoded luminance. Gated to
+    // >+1EV pushes where the compressed shoulder region dominates.
+    let gamma_t = std::env::var("SL_GAMMA_T").ok().or(if p.exposure_ev > 1.0 {
+        Some("1".to_string())
     } else {
-        tone_lut_at(&p.tone_lut, le / 1.6) / le
+        None
+    });
+    let enc = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    let dec = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let base = match gamma_t.as_deref() {
+        Some("1") | Some("") => {
+            dec(tone_lut_at(&p.tone_lut, enc(le) / 1.6).clamp(0.0, 1.6)) / le
+        }
+        // "2": neutral part linear, slider delta in gamma domain
+        Some("2") => {
+            let tn = tone_lut_at(&p.tone_neu, le / 1.6) / le;
+            tn + (dec(tone_lut_at(&p.tone_lut, enc(le) / 1.6).clamp(0.0, 1.6))
+                - dec(tone_lut_at(&p.tone_neu, enc(le) / 1.6).clamp(0.0, 1.6)))
+                / le
+        }
+        _ => tone_lut_at(&p.tone_lut, le / 1.6) / le,
     };
     if mode == 9 {
         // LR-style tone-map mask: neutral gain + edge-aware upsampled
