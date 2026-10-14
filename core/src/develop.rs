@@ -169,6 +169,9 @@ pub struct Params {
     /// is exponentiated separately.
     pub tone_sh: [f32; 512],
     pub tone_hl: [f32; 512],
+    /// slider-free LUT (base curve + exposure/pv blend only) — reference for
+    /// the spatially-varying slider delta in mode 9
+    pub tone_neu: [f32; 512],
     pub has_tone: bool,
     /// serial correction stages (DaVinci serial nodes): (params, opacity,
     /// invert_key) per enabled stage, max 4. Each stage re-runs adjust() +
@@ -1609,6 +1612,15 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             highlight_rolloff: 1.0,
             ..r.clone()
         }),
+        tone_neu: build_tone_lut(&Recipe {
+            shadows: 0.0,
+            highlights: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            highlight_rolloff: 1.0,
+            shadow_rolloff: 1.0,
+            ..r.clone()
+        }),
         tone_hl: build_tone_lut(&Recipe {
             shadows: 0.0,
             blacks: 0.0,
@@ -2193,12 +2205,21 @@ fn spatial_tone() -> (i32, f32, f32, f32) {
     })
 }
 
-fn tone_gain(x: [f32; 3], p: &Params, guide: f32) -> f32 {
+fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
     let c = tone_fit_consts();
     let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
     let (mode, w, w_hl, _sig) = spatial_tone();
     let le = l.max(c[8]);
     let base = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+    if mode == 9 {
+        // LR-style tone-map mask: neutral gain + edge-aware upsampled
+        // slider delta (a·l + b from the coarse guided-filter fit)
+        if w == 0.0 || (ab[0] == 0.0 && ab[1] == 0.0) {
+            return base.min(c[9]);
+        }
+        let tn = tone_lut_at(&p.tone_neu, le / 1.6) / le;
+        return (tn + w * (ab[0] * l + ab[1])).max(0.0).min(c[9]);
+    }
     if !guide.is_finite() || (w == 0.0 && w_hl == 0.0) {
         return base.min(c[9]);
     }
@@ -2232,10 +2253,10 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32) -> f32 {
 
 #[allow(dead_code)] // tests use the guide-free entry point
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
-    adjust_g(rgb, p, f32::NAN, f32::NAN)
+    adjust_g(rgb, p, f32::NAN, f32::NAN, [0.0; 2])
 }
 
-fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32) -> [f32; 3] {
+fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) -> [f32; 3] {
     let mut x = pre_tone_rgb(rgb, p, veil_min);
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dbg = std::env::var_os("SL_PROBE2").is_some()
@@ -2249,7 +2270,7 @@ fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32) -> [f32; 3] {
     // whites/blacks + rolloff into one curve — hue stays put, highlights
     // roll off on an extended-Reinhard shoulder instead of clipping
     if p.has_tone {
-        let g = tone_gain(x, p, guide);
+        let g = tone_gain(x, p, guide, ab);
         for c in &mut x {
             *c *= g;
         }
@@ -4267,7 +4288,84 @@ fn finish_linear(
     // spatial tone guide: coarse grid of pretone luma, heavily blurred —
     // shadows/highlights respond to the surround, not just the pixel.
     let (gmode, gw_blend, gw_hl, gsigma) = spatial_tone();
-    let guide = if p.has_tone && gmode > 0 && (gw_blend != 0.0 || gw_hl != 0.0) {
+    // mode 9 (LR tone-map mask): coarse luma grid → per-cell slider-induced
+    // gain delta D = T(L)/L − Tn(L)/L → guided-filter local linear fit
+    // delta ≈ a·l + b per cell → bilinear-upsampled a,b applied at full res.
+    let ab_grid = if p.has_tone && gmode == 9 && gw_blend != 0.0 {
+        let gw = (dw / 16).clamp(16, 256);
+        let gh = (dh / 16).clamp(16, 256);
+        let mut lg = vec![0.0f32; gw * gh];
+        let mut dg = vec![0.0f32; gw * gh];
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let nx = (gx as f32 + 0.5) / gw as f32;
+                let ny = (gy as f32 + 0.5) / gh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
+                let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
+                let le = l.max(1e-3);
+                lg[gy * gw + gx] = le;
+                dg[gy * gw + gx] =
+                    tone_lut_at(&p.tone_lut, le / 1.6) / le - tone_lut_at(&p.tone_neu, le / 1.6) / le;
+            }
+        }
+        // guided-filter local regression over ~4-cell windows
+        let rw = 4usize;
+        let mut ab = vec![0.0f32; gw * gh * 2];
+        for y in 0..gh {
+            for x in 0..gw {
+                let (mut n, mut sl, mut sd, mut sll, mut sld) = (0.0f32, 0.0, 0.0, 0.0, 0.0);
+                for yy in y.saturating_sub(rw)..=(y + rw).min(gh - 1) {
+                    for xx in x.saturating_sub(rw)..=(x + rw).min(gw - 1) {
+                        let l = lg[yy * gw + xx];
+                        let d = dg[yy * gw + xx];
+                        n += 1.0;
+                        sl += l;
+                        sd += d;
+                        sll += l * l;
+                        sld += l * d;
+                    }
+                }
+                let ml = sl / n;
+                let var = sll / n - ml * ml;
+                let a = (sld / n - ml * sd / n) / (var + 0.001);
+                let b = sd / n - a * ml;
+                ab[(y * gw + x) * 2] = a;
+                ab[(y * gw + x) * 2 + 1] = b;
+            }
+        }
+        Some((ab, gw, gh))
+    } else {
+        None
+    };
+    let ab_at = |nx: f32, ny: f32| -> [f32; 2] {
+        match &ab_grid {
+            Some((ab, gw, gh)) => {
+                let gx = (nx * *gw as f32 - 0.5).clamp(0.0, *gw as f32 - 1.0);
+                let gy = (ny * *gh as f32 - 0.5).clamp(0.0, *gh as f32 - 1.0);
+                let x0 = gx as usize;
+                let y0 = gy as usize;
+                let x1 = (x0 + 1).min(*gw - 1);
+                let y1 = (y0 + 1).min(*gh - 1);
+                let fx = gx - x0 as f32;
+                let fy = gy - y0 as f32;
+                let mut out = [0.0f32; 2];
+                for k in 0..2 {
+                    out[k] = (ab[(y0 * gw + x0) * 2 + k] * (1.0 - fx)
+                        + ab[(y0 * gw + x1) * 2 + k] * fx)
+                        * (1.0 - fy)
+                        + (ab[(y1 * gw + x0) * 2 + k] * (1.0 - fx)
+                            + ab[(y1 * gw + x1) * 2 + k] * fx)
+                            * fy;
+                }
+                out
+            }
+            None => [0.0; 2],
+        }
+    };
+    let guide = if p.has_tone && gmode > 0 && gmode != 9 && (gw_blend != 0.0 || gw_hl != 0.0) {
         let gw = (dw / 8).clamp(16, 512);
         let gh = (dh / 8).clamp(16, 512);
         let mut g = vec![0.0f32; gw * gh];
@@ -4487,13 +4585,13 @@ fn finish_linear(
             }
             if std::env::var_os("SL_PROBE").is_some() && (dx * 7 + dy * 13) % 97 == 0 {
                 let pt = pre_tone_rgb(col, p, f32::NAN);
-                let mut a0 = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny));
+                let mut a0 = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny), ab_at(nx, ny));
                 local_ops(&mut a0, col, p, nx, ny, dw as f32 / dh as f32, subj, sky, veg);
                 eprintln!(
                     "[probe] {nx:.3},{ny:.3} cam={col:?} pretone={pt:?} adj={a0:?}"
                 );
             }
-            let mut adj = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny));
+            let mut adj = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny), ab_at(nx, ny));
             let aspect = dw as f32 / dh as f32;
             local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
             // serial correction stages (DaVinci serial nodes): full adjust +
@@ -4532,7 +4630,7 @@ fn finish_linear(
                 if key <= 0.001 {
                     continue;
                 }
-                let mut a2 = adjust_g(col, sp, guide_at(nx, ny), veil_at(nx, ny));
+                let mut a2 = adjust_g(col, sp, guide_at(nx, ny), veil_at(nx, ny), [0.0; 2]);
                 local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky, veg);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;
