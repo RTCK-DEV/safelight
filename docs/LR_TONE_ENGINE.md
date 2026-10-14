@@ -44,3 +44,18 @@ deltas are evaluated per-region, then the mask is edge-aware upsampled
 This is the fast-local-laplacian family: coarse adaptive tone + joint
 edge-preserving upsample. Fill light and highlight recovery have their own
 mask/guide caches warped by geometry (crop/upright).
+
+## Follow-up findings (measured, verified)
+
+- GPU mirror of exposure-gated tone terms confirmed (GPU 0.1470 vs CPU 0.1480
+  on _73S5402; tone_lut shared via uniform buffer).
+- Melissa domain: dng_space_ProPhoto_sRGBGamma present in binary. Evaluating
+  the tone LUT in sRGB-encoded domain improves extreme pushes; default-on for
+  exposure_ev>1.0 (CPU + GPU mirrored).
+- Rejected by measurement: per-channel user tone curve, ColorMatrix-inverse
+  path, luma-applied profile tone curve, base/detail splits (mode 7/8),
+  regional deviation scaling (5), masked delta (6), derivative-scaled detail
+  local-laplacian-lite (10). All spatial model variants improve _73S5402 in
+  isolation but regress the corpus — residual floor ~0.10 median is a
+  smooth low-frequency color/tone error needing the full masked engine or
+  a Melissa-domain curve refit rather than post-hoc gain modulation.

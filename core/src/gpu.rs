@@ -1711,7 +1711,14 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let tl = clamp(luma(x), 0.0, 1.6);
         // clamp evaluation luma to bound the y/l gain — mirrors develop.rs
         let le = max(tl, 0.04);
-        x = x * min(tone_at(le / 1.6) / le, 32.0);
+        var g = tone_at(le / 1.6) / le;
+        // mirrors develop.rs: >+1EV pushes evaluate the LUT in the
+        // sRGB-encoded (Melissa) domain — slider bands pivot on encoded luma
+        if (pg.qh.w > 1.0) {
+            let e = srgb_encode(min(le, 1.0));
+            g = srgb_decode(clamp(tone_at(e / 1.6), 0.0, 1.6)) / le;
+        }
+        x = x * min(g, 32.0);
     }
     // contrast about pivot + soft-limit ~[0,1.35] — mirrors develop.rs
     if (pg.a1.y != 0.0) {
@@ -3008,7 +3015,7 @@ impl Gpu {
                 p.sh_roll,
                 if p.chan_luts.is_empty() { 0.0 } else { 1.0 },
             ],
-            qh: [p.qh[0], p.qh[1], p.qh[2], 0.0],
+            qh: [p.qh[0], p.qh[1], p.qh[2], p.exposure_ev],
             qs: [p.qs[0], p.qs[1], p.qs[2], 0.0],
             ql: [p.ql[0], p.ql[1], p.ql[2], 0.0],
             qadj: p.qadj,

@@ -2313,6 +2313,14 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
         // base-detail split: the tone curve acts on the smooth base only,
         // high-frequency detail is preserved: out = T(g) + w·(l − g)
         7 | 8 => (tone_lut_at(&p.tone_lut, g / 1.6) + w * (l - guide)) / le,
+        // local-laplacian edge handling: detail scaled by the LUT's local
+        // derivative at the guide luma — out = T(g) + T'(g)·(l − g)
+        10 => {
+            let gi = (g / 1.6 * 511.0).clamp(0.0, 511.0) as usize;
+            let slope = (p.tone_lut[(gi + 1).min(511)] - p.tone_lut[gi.max(1) - 1])
+                / (2.0 * 1.6 / 511.0);
+            (tone_lut_at(&p.tone_lut, g / 1.6) + slope.max(0.05) * (l - guide)) / le
+        }
         // masked delta: l + (1-w)·D(l) + w·D(g), D = T−identity
         6 => {
             let dl = base * le - le;
