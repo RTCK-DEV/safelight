@@ -2408,6 +2408,12 @@ fn tone_gain(
         }
         return base.min(c[9]);
     }
+    if mode == 14 {
+        // faithful LR t11 form: out_log2L = log2(L) + t11(x,y) where t11 is
+        // the coarse-grid log2 gain of the full tone response. ab[0] carries
+        // the bilinearly upsampled log2 gain.
+        return (2.0f32).powf(ab[0]).clamp(0.0, c[9]);
+    }
     if !guide.is_finite() || (w == 0.0 && w_hl == 0.0) {
         return base.min(c[9]);
     }
@@ -4799,7 +4805,54 @@ fn finish_linear(
     } else {
         None
     };
+    // mode 14 (faithful LR t11): coarse grid of the FULL tone response delta
+    // in log2 domain — LR's t11 tone-map mask equals eval_lowres − logL_lowres
+    // upsampled additively, i.e. out_log2L = log2L + t11(x,y). The full-res
+    // pixel keeps its own detail (multiplied by the coarse gain ratio).
+    let t11_grid = if p.has_tone && gmode == 14 {
+        let gw = (dw / 16).clamp(16, 256);
+        let gh = (dh / 16).clamp(16, 256);
+        let mut dg = vec![0.0f32; gw * gh];
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let nx = (gx as f32 + 0.5) / gw as f32;
+                let ny = (gy as f32 + 0.5) / gh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
+                let l = (0.30 * pt[0] + 0.59 * pt[1] + 0.11 * pt[2])
+                    .clamp(0.0, 1.6)
+                    .max(1e-3);
+                let t = tone_lut_at(&p.tone_lut, l / 1.6);
+                dg[gy * gw + gx] = (t / l).max(1e-4).log2();
+            }
+        }
+        Some((dg, gw, gh))
+    } else {
+        None
+    };
+    let t11_at = |nx: f32, ny: f32| -> f32 {
+        match &t11_grid {
+            Some((dg, gw, gh)) => {
+                let gx = (nx * *gw as f32 - 0.5).clamp(0.0, *gw as f32 - 1.0);
+                let gy = (ny * *gh as f32 - 0.5).clamp(0.0, *gh as f32 - 1.0);
+                let x0 = gx as usize;
+                let y0 = gy as usize;
+                let x1 = (x0 + 1).min(*gw - 1);
+                let y1 = (y0 + 1).min(*gh - 1);
+                let fx = gx - x0 as f32;
+                let fy = gy - y0 as f32;
+                (dg[y0 * gw + x0] * (1.0 - fx) + dg[y0 * gw + x1] * fx) * (1.0 - fy)
+                    + (dg[y1 * gw + x0] * (1.0 - fx) + dg[y1 * gw + x1] * fx) * fy
+            }
+            None => 0.0,
+        }
+    };
     let ab_at = |nx: f32, ny: f32| -> [f32; 2] {
+        if gmode == 14 {
+            return [t11_at(nx, ny), 0.0];
+        }
         match &ab_grid {
             Some((ab, gw, gh)) => {
                 let gx = (nx * *gw as f32 - 0.5).clamp(0.0, *gw as f32 - 1.0);
