@@ -1702,7 +1702,14 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // attenuate with |Exposure2012| — a constant ~0.5 beats every
         // tested exposure-dependent falloff (LR's adaptive tone keeps
         // working even under a big user push)
-        let k = if r.process_version < 12.0 { 1.0 } else { 0.5 };
+        let (k11, k15) = std::env::var("SL_PV_K")
+            .ok()
+            .and_then(|s| {
+                let mut it = s.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+                Some((it.next()?, it.next()?))
+            })
+            .unwrap_or((0.4, 0.4));
+        let k = if r.process_version < 12.0 { k11 } else { k15 };
         if k > 0.0 {
             for v in &mut p.lut {
                 *v = *v + (pv2012_tone(*v) - *v) * k;
@@ -1828,9 +1835,13 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
     // ~0.5). Applied AFTER the monotone pass because LR's recovered-
     // highlight mapping is genuinely non-monotone in extreme pushes.
     if c[10] != 0.0 && r.exposure > 1.0 {
-        for (i, v) in out.iter_mut().enumerate() {
-            let y0 = 1.6 * i as f32 / 511.0;
-            *v /= (1.0 + (r.exposure - 1.0) * c[10] * sstep(0.8, 1.8, y0)).max(0.15);
+        let hw_pull = (-r.highlights).max(-r.whites).clamp(0.0, 1.0);
+        let k = (r.exposure - 1.0) * c[10] * hw_pull;
+        if k > 0.0 {
+            for (i, v) in out.iter_mut().enumerate() {
+                let y0 = 1.6 * i as f32 / 511.0;
+                *v /= (1.0 + k * sstep(0.8, 1.8, y0)).max(0.15);
+            }
         }
     }
     out
@@ -2163,28 +2174,40 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
         }
     }
     if !p.profile_tone_lut.is_empty() {
-        // SL_PTC_LUMA: apply the profile tone curve as a hue-preserving luma
-        // gain instead of per-channel (diagnostic: LR's hue rotation)
+        // ACR / DNG RefBaselineRGBTone: evaluate ProfileToneCurve via the
+        // hue-preserving (max, mid, min) sorted operator so mid-channel hue
+        // ratio (mid-min)/(max-min) stays invariant.
         if std::env::var_os("SL_PTC_LUMA").is_some() {
             let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.0);
             let g = lut_at(&p.profile_tone_lut, l) / l.max(1e-4);
             for c in &mut x {
                 *c *= g;
             }
-        } else {
+        } else if std::env::var("SL_PTC_SORT").as_deref() == Ok("per_ch") {
             for c in &mut x {
                 *c = lut_at(&p.profile_tone_lut, c.clamp(0.0, 1.0));
             }
+        } else {
+            let smooth = std::env::var("SL_PTC_SORT").as_deref() == Ok("1");
+            x = rgb_tone_eval(x, &p.profile_tone_lut, smooth);
         }
     }
     // exit the profile working space (ProPhoto -> sRGB when a DCP was
-    // resolved; identity otherwise) — everything below is output-referred.
-    if p.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+    // resolved; identity otherwise) — unless SL_PP_LATE keeps tone curves in
+    // ProPhoto RGB (ACR/Melissa style) and converts to sRGB after p.lut.
+    if std::env::var_os("SL_PP_LATE").is_none()
+        && p.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    {
         x = [
             p.post_profile[0][0] * x[0] + p.post_profile[0][1] * x[1] + p.post_profile[0][2] * x[2],
             p.post_profile[1][0] * x[0] + p.post_profile[1][1] * x[1] + p.post_profile[1][2] * x[2],
             p.post_profile[2][0] * x[0] + p.post_profile[2][1] * x[1] + p.post_profile[2][2] * x[2],
         ];
+        if let Ok(v) = std::env::var("SL_GAMUT_K") {
+            if let Ok(k) = v.parse::<f32>() {
+                x = gamut_compress_luma(x, k);
+            }
+        }
     }
     // auto-contrast percentile remap
     if p.white_pt - p.black_pt < 0.999 || p.black_pt > 0.001 {
@@ -2330,6 +2353,98 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
         _ => base * (1.0 - w) + gg * w,
     };
     gain.max(0.0).min(c[9])
+}
+
+#[allow(dead_code)] // tests use the guide-free entry point
+/// Lightroom `cr_stage_rgb_tone` hue-preserving RGB-sorted curve evaluation
+/// (disassembled from CameraRaw.dll DXBC shader 288, lines 1227..1324):
+/// sorts (R,G,B) into (max_c, mid_c, min_c), evaluates the 1-D curve on the
+/// (optionally smooth) max/min pair with odd-symmetric negative extension
+/// `-C(|x|)`, and reconstructs `mid_c' = min_c' + w*(max_c' - min_c')` so the
+/// hue ratio `w = (mid_c - min_c)/(max_c - min_c)` is strictly invariant.
+fn rgb_tone_eval(rgb: [f32; 3], lut: &[f32], smooth: bool) -> [f32; 3] {
+    let mut idx = [0usize, 1, 2];
+    if rgb[idx[1]] < rgb[idx[2]] {
+        idx.swap(1, 2);
+    }
+    if rgb[idx[0]] < rgb[idx[2]] {
+        idx.swap(0, 2);
+    }
+    if rgb[idx[0]] < rgb[idx[1]] {
+        idx.swap(0, 1);
+    }
+    let (hi, mid, lo) = (rgb[idx[0]], rgb[idx[1]], rgb[idx[2]]);
+    let span = hi - lo;
+    let w = if span > 1e-6 { (mid - lo) / span } else { 0.0 };
+    let eval1 = |v: f32| -> f32 { lut_at(lut, v.clamp(0.0, 1.0)) };
+    let (hi_out, lo_out) = if smooth && span > 1e-6 {
+        let w2 = w * w;
+        let omw = 1.0 - w;
+        let u_hi = hi - 0.5 * w2 * (hi - mid);
+        let u_lo = lo + 0.5 * omw * omw * (mid - lo);
+        let c_hi = eval1(u_hi);
+        let c_lo = eval1(u_lo);
+        let inv_det = 1.0 / (w2 - w + 2.0);
+        let a_hi = ((w * w2 - 2.0 * w2 + w - 2.0) * c_hi + w2 * (w - 1.0) * c_lo) * (-inv_det);
+        let a_lo = ((w * w2 - w2 + 2.0) * c_lo - w * omw * omw * c_hi) * inv_det;
+        (a_hi, a_lo)
+    } else {
+        (eval1(hi), eval1(lo))
+    };
+    let mid_out = lo_out + w * (hi_out - lo_out);
+    let mut out = [0.0f32; 3];
+    out[idx[0]] = hi_out;
+    out[idx[1]] = mid_out;
+    out[idx[2]] = lo_out;
+    // DXBC shader 288 lines 1152..1179: blend sorted RGB curve `out` toward
+    // luma-delta + gamut-compressed curve by `fBlendAmount01` when set.
+    if let Ok(bs) = std::env::var("SL_RGB_BLEND") {
+        if let Ok(b) = bs.trim().parse::<f32>() {
+            if b != 0.0 {
+                let c3 = [eval1(rgb[0]), eval1(rgb[1]), eval1(rgb[2])];
+                let y_in = 0.30 * rgb[0].max(0.0) + 0.59 * rgb[1].max(0.0) + 0.11 * rgb[2].max(0.0);
+                let y_out = 0.30 * c3[0] + 0.59 * c3[1] + 0.11 * c3[2];
+                let dy = y_out - y_in;
+                let mut l3 = [rgb[0].max(0.0) + dy, rgb[1].max(0.0) + dy, rgb[2].max(0.0) + dy];
+                let mn = l3[0].min(l3[1]).min(l3[2]);
+                if mn < 0.0 && y_out > 0.0 {
+                    let s = y_out / (y_out - mn);
+                    for v in &mut l3 {
+                        *v = y_out + s * (*v - y_out);
+                    }
+                }
+                let mx = l3[0].max(l3[1]).max(l3[2]);
+                if mx > 1.0 && mx > y_out {
+                    let s = (1.0 - y_out).max(0.0) / (mx - y_out);
+                    for v in &mut l3 {
+                        *v = y_out + s * (*v - y_out);
+                    }
+                }
+                for c in 0..3 {
+                    out[c] = out[c] + b * (l3[c] - out[c]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lightroom luma-preserving gamut compression (DXBC shader 288, lines
+/// 1156..1166): when a linear working-space -> sRGB matrix produces negative
+/// channels (out-of-sRGB-gamut saturated colors), desaturate toward positive
+/// luma `Y / (Y - k*min_c)` instead of hard-clipping the negative channel to 0.
+fn gamut_compress_luma(rgb: [f32; 3], k: f32) -> [f32; 3] {
+    let mn = rgb[0].min(rgb[1]).min(rgb[2]);
+    if mn >= 0.0 || k <= 0.0 {
+        return rgb;
+    }
+    let y = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).max(1e-4);
+    let s = (y / (y - k * mn)).clamp(0.0, 1.0);
+    [
+        y + s * (rgb[0] - y),
+        y + s * (rgb[1] - y),
+        y + s * (rgb[2] - y),
+    ]
 }
 
 #[allow(dead_code)] // tests use the guide-free entry point
@@ -2491,10 +2606,36 @@ fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) 
     if dbg {
         eprintln!("[adj] pre-lut={x:?}");
     }
-    // tone curve lut
-    for c in &mut x {
-        let idx = (c.clamp(0.0, 1.0) * 255.0) as usize;
-        *c = p.lut[idx.min(255)];
+    // tone curve lut — ACR/Lightroom evaluates both ProfileToneCurve and the
+    // base/user tone curve in ProPhoto RGB via the hue-preserving (max,mid,min)
+    // sorted operator (dng_tone_curve_acr3_default / cr_stage_rgb_tone).
+    if std::env::var_os("SL_PP_LUT").is_some()
+        && p.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    {
+        const SRGB_TO_PROPHOTO: [[f32; 3]; 3] = [
+            [0.5293459, 0.3300728, 0.1405813],
+            [0.0983744, 0.8734610, 0.0281647],
+            [0.0168832, 0.1176725, 0.8654443],
+        ];
+        let pp = [
+            SRGB_TO_PROPHOTO[0][0] * x[0] + SRGB_TO_PROPHOTO[0][1] * x[1] + SRGB_TO_PROPHOTO[0][2] * x[2],
+            SRGB_TO_PROPHOTO[1][0] * x[0] + SRGB_TO_PROPHOTO[1][1] * x[1] + SRGB_TO_PROPHOTO[1][2] * x[2],
+            SRGB_TO_PROPHOTO[2][0] * x[0] + SRGB_TO_PROPHOTO[2][1] * x[1] + SRGB_TO_PROPHOTO[2][2] * x[2],
+        ];
+        let pp = rgb_tone_eval(pp, &p.lut, false);
+        x = [
+            p.post_profile[0][0] * pp[0] + p.post_profile[0][1] * pp[1] + p.post_profile[0][2] * pp[2],
+            p.post_profile[1][0] * pp[0] + p.post_profile[1][1] * pp[1] + p.post_profile[1][2] * pp[2],
+            p.post_profile[2][0] * pp[0] + p.post_profile[2][1] * pp[1] + p.post_profile[2][2] * pp[2],
+        ];
+    } else if std::env::var("SL_LUT_SORT").as_deref() == Ok("per_ch") {
+        for c in &mut x {
+            let idx = (c.clamp(0.0, 1.0) * 255.0) as usize;
+            *c = p.lut[idx.min(255)];
+        }
+    } else {
+        let smooth = std::env::var("SL_LUT_SORT").as_deref() == Ok("1");
+        x = rgb_tone_eval(x.map(|v| v.max(0.0)), &p.lut, smooth);
     }
     if dbg {
         eprintln!("[adj] post-lut={x:?}");
@@ -2503,6 +2644,20 @@ fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) 
     if !p.chan_luts.is_empty() {
         for c in 0..3 {
             x[c] = lut_at(&p.chan_luts[c * 256..], x[c]);
+        }
+    }
+    if std::env::var_os("SL_PP_LATE").is_some()
+        && p.post_profile != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    {
+        x = [
+            p.post_profile[0][0] * x[0] + p.post_profile[0][1] * x[1] + p.post_profile[0][2] * x[2],
+            p.post_profile[1][0] * x[0] + p.post_profile[1][1] * x[1] + p.post_profile[1][2] * x[2],
+            p.post_profile[2][0] * x[0] + p.post_profile[2][1] * x[1] + p.post_profile[2][2] * x[2],
+        ];
+        if let Ok(v) = std::env::var("SL_GAMUT_K") {
+            if let Ok(k) = v.parse::<f32>() {
+                x = gamut_compress_luma(x, k);
+            }
         }
     }
     // hue-domain curves (DaVinci Hue-vs-* and Lum/Sat-vs-Sat)

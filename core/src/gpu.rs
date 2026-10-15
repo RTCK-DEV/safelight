@@ -1666,13 +1666,32 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     x = x * pg.a1.x;
     // profile look table (DCP/XMP)
     x = look_apply(x);
-    // DCP ProfileToneCurve — appended to lookbuf after the look cells
+    // DCP ProfileToneCurve — appended to lookbuf after the look cells;
+    // evaluated via DNG RefBaselineRGBTone (max, mid, min) sorted operator
+    // so mid-channel hue ratio (mid-min)/(max-min) stays invariant.
     if (pg.bmisc.w > 0.5) {
         let pto = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u;
-        x = vec3<f32>(
-            lookbuf[pto + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-            lookbuf[pto + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-            lookbuf[pto + u32(clamp(x.z, 0.0, 1.0) * 255.0)]);
+        let hi = max(x.x, max(x.y, x.z));
+        let lo = min(x.x, min(x.y, x.z));
+        let mid = x.x + x.y + x.z - hi - lo;
+        let span = hi - lo;
+        var w = 0.0;
+        if (span > 1e-6) { w = (mid - lo) / span; }
+        let hi_o = lookbuf[pto + u32(clamp(hi, 0.0, 1.0) * 255.0)];
+        let lo_o = lookbuf[pto + u32(clamp(lo, 0.0, 1.0) * 255.0)];
+        let mid_o = lo_o + w * (hi_o - lo_o);
+        var ox = vec3<f32>(mid_o);
+        if (x.x >= x.y && x.x >= x.z) {
+            ox.x = hi_o;
+            if (x.y >= x.z) { ox.z = lo_o; } else { ox.y = lo_o; }
+        } else if (x.y >= x.x && x.y >= x.z) {
+            ox.y = hi_o;
+            if (x.x >= x.z) { ox.z = lo_o; } else { ox.x = lo_o; }
+        } else {
+            ox.z = hi_o;
+            if (x.x >= x.y) { ox.y = lo_o; } else { ox.x = lo_o; }
+        }
+        x = ox;
     }
     // exit the profile working space (ProPhoto -> sRGB; identity when
     // no profile resolved) — mirrors develop.rs post_profile
@@ -1807,11 +1826,31 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
             }
         }
     }
-    x = vec3<f32>(
-        lut[u32(pg.misc3.x) + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-        lut[u32(pg.misc3.x) + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-        lut[u32(pg.misc3.x) + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
-    );
+    {
+        let xc = max(x, vec3<f32>(0.0));
+        let hi = max(xc.x, max(xc.y, xc.z));
+        let lo = min(xc.x, min(xc.y, xc.z));
+        let mid = xc.x + xc.y + xc.z - hi - lo;
+        let span = hi - lo;
+        var w = 0.0;
+        if (span > 1e-6) { w = (mid - lo) / span; }
+        let lb = u32(pg.misc3.x);
+        let hi_o = lut[lb + u32(clamp(hi, 0.0, 1.0) * 255.0)];
+        let lo_o = lut[lb + u32(clamp(lo, 0.0, 1.0) * 255.0)];
+        let mid_o = lo_o + w * (hi_o - lo_o);
+        var ox = vec3<f32>(mid_o);
+        if (xc.x >= xc.y && xc.x >= xc.z) {
+            ox.x = hi_o;
+            if (xc.y >= xc.z) { ox.z = lo_o; } else { ox.y = lo_o; }
+        } else if (xc.y >= xc.x && xc.y >= xc.z) {
+            ox.y = hi_o;
+            if (xc.x >= xc.z) { ox.z = lo_o; } else { ox.x = lo_o; }
+        } else {
+            ox.z = hi_o;
+            if (xc.x >= xc.y) { ox.y = lo_o; } else { ox.x = lo_o; }
+        }
+        x = ox;
+    }
     // per-channel custom curves (lut offsets 256/512/768)
     if (pg.fx0.w > 0.5) {
         x = vec3<f32>(
