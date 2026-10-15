@@ -6606,11 +6606,25 @@ fn sharpen_clarity(
             } else {
                 [0.0; 3]
             };
-            for c in 0..3 {
-                let mut v = lin[i][c];
-                if sharpen != 0.0 {
-                    v += sharpen * 0.8 * sd[c];
+            // LR Sharpen3 operates on the luma (Y) plane only and applies the
+            // delta as a multiplicative gain to all channels — sharpening RGB
+            // independently causes chroma ringing (SL_SHLUM=0 disables).
+            let shlum = std::env::var("SL_SHLUM").map_or(true, |s| s != "0");
+            if sharpen != 0.0 && shlum {
+                let dy = 0.2126 * sd[0] + 0.7152 * sd[1] + 0.0722 * sd[2];
+                let g = 1.0 + sharpen * 0.8 * dy / lum.max(1e-3);
+                for c in 0..3 {
+                    out[i][c] = (lin[i][c] * g.max(0.0)).min(4.0);
                 }
+            }
+            for c in 0..3 {
+                let mut v = if sharpen != 0.0 && shlum {
+                    out[i][c]
+                } else if sharpen != 0.0 {
+                    lin[i][c] + sharpen * 0.8 * sd[c]
+                } else {
+                    lin[i][c]
+                };
                 if clarity != 0.0 {
                     v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));
                 }
