@@ -2278,7 +2278,13 @@ fn spatial_tone() -> (i32, f32, f32, f32) {
 
 fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
     let c = tone_fit_consts();
-    let l = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6);
+    // SL_LUMAW: LR's tone-map luma weights are 0.30/0.59/0.11 (DXBC shader
+    // 288 line 1889), not Rec.709 — evaluate slider bands on that luma.
+    let l = if std::env::var_os("SL_LUMAW").is_some() {
+        (0.30 * x[0] + 0.59 * x[1] + 0.11 * x[2]).clamp(0.0, 1.6)
+    } else {
+        (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).clamp(0.0, 1.6)
+    };
     let (mode, w, w_hl, _sig) = spatial_tone();
     let le = l.max(c[8]);
     // SL_GAMMA_T: evaluate the LUT in a gamma-encoded (Melissa-style) domain —
@@ -2315,6 +2321,31 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
         }
         let tn = tone_lut_at(&p.tone_neu, le / 1.6) / le;
         return (tn + w * (ab[0] * l + ab[1])).max(0.0).min(c[9]);
+    }
+    if mode == 11 {
+        // log-domain variant: delta in ln-gain, regressed against ln-luma,
+        // applied as exp — mirrors the shader's log-lum band accumulation
+        if w == 0.0 || (ab[0] == 0.0 && ab[1] == 0.0) {
+            return base.min(c[9]);
+        }
+        let tn = (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+        return (tn + w * (ab[0] * l.max(1e-3).ln() + ab[1]))
+            .exp()
+            .clamp(0.0, c[9]);
+    }
+    if mode == 12 {
+        // LR local Shadows/Highlights: the slider's log-gain delta is
+        // amplified where the pixel deviates from its blurred surround —
+        // locally-dark pixels get extra shadow lift, locally-bright extra
+        // highlight compression. guide = blurred luma at this pixel.
+        if !guide.is_finite() || w == 0.0 {
+            return base.min(c[9]);
+        }
+        let dlog = (tone_lut_at(&p.tone_lut, le / 1.6) / le).ln()
+            - (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+        let s_local = ((guide - l) / 0.25).clamp(-1.0, 1.0);
+        let tn = (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+        return (tn + (1.0 + w * s_local) * dlog).exp().clamp(0.0, c[9]);
     }
     if !guide.is_finite() || (w == 0.0 && w_hl == 0.0) {
         return base.min(c[9]);
@@ -4537,7 +4568,7 @@ fn finish_linear(
     // mode 9 (LR tone-map mask): coarse luma grid → per-cell slider-induced
     // gain delta D = T(L)/L − Tn(L)/L → guided-filter local linear fit
     // delta ≈ a·l + b per cell → bilinear-upsampled a,b applied at full res.
-    let ab_grid = if p.has_tone && gmode == 9 && gw_blend != 0.0 {
+    let ab_grid = if p.has_tone && (gmode == 9 || gmode == 11) && gw_blend != 0.0 {
         let gw = (dw / 16).clamp(16, 256);
         let gh = (dh / 16).clamp(16, 256);
         let mut lg = vec![0.0f32; gw * gh];
@@ -4552,9 +4583,17 @@ fn finish_linear(
                 let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
                 let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
                 let le = l.max(1e-3);
-                lg[gy * gw + gx] = le;
-                dg[gy * gw + gx] =
-                    tone_lut_at(&p.tone_lut, le / 1.6) / le - tone_lut_at(&p.tone_neu, le / 1.6) / le;
+                if gmode == 11 {
+                    // log-domain delta (LR tone-map math runs in ln units:
+                    // shader's sgn(d)*(e^|d|-1) + log-lum band masks)
+                    lg[gy * gw + gx] = le.ln();
+                    dg[gy * gw + gx] = (tone_lut_at(&p.tone_lut, le / 1.6) / le).ln()
+                        - (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+                } else {
+                    lg[gy * gw + gx] = le;
+                    dg[gy * gw + gx] =
+                        tone_lut_at(&p.tone_lut, le / 1.6) / le - tone_lut_at(&p.tone_neu, le / 1.6) / le;
+                }
             }
         }
         // guided-filter local regression over ~4-cell windows
@@ -4611,7 +4650,7 @@ fn finish_linear(
             None => [0.0; 2],
         }
     };
-    let guide = if p.has_tone && gmode > 0 && gmode != 9 && (gw_blend != 0.0 || gw_hl != 0.0) {
+    let guide = if p.has_tone && gmode > 0 && gmode != 9 && gmode != 11 && (gw_blend != 0.0 || gw_hl != 0.0) {
         let gw = (dw / 8).clamp(16, 512);
         let gh = (dh / 8).clamp(16, 512);
         let mut g = vec![0.0f32; gw * gh];
