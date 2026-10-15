@@ -581,7 +581,10 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
 }
 
 fn wb_matrix(cam: vec3<f32>) -> vec3<f32> {
-    let cw = clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+    // wb.w = 1.0 -> exposure gain applied in camera space before the
+    // matrix+HSM (dng_render order; mirrors CPU expo_early)
+    let eg = select(1.0, pg.a1.x, pg.wb.w > 0.5);
+    let cw = clamp(cam * pg.wb.xyz * eg, vec3<f32>(0.0), vec3<f32>(1.0));
     // HueSatMap applies in the profile working space (ProPhoto), AFTER the
     // camera->working matrix — mirrors develop.rs / dng_render.cpp order.
     return hsm_apply(vec3<f32>(
@@ -1663,7 +1666,7 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     }
     // exposure — scene-linear gain before the profile's nonlinear ops
     // (ACR pushes hot data into the tone shoulder, mirrors develop.rs)
-    x = x * pg.a1.x;
+    x = x * select(pg.a1.x, 1.0, pg.wb.w > 0.5);
     // profile look table (DCP/XMP)
     x = look_apply(x);
     // DCP ProfileToneCurve — appended to lookbuf after the look cells;
@@ -3014,7 +3017,12 @@ impl Gpu {
         let mk_uni = |p: &Params, samp_step: u32| Uni {
             black: m.black,
             norm: norm_factors(m),
-            wb: [p.wb[0], p.wb[1], p.wb[2], 0.0],
+            wb: [
+                p.wb[0],
+                p.wb[1],
+                p.wb[2],
+                if p.expo_early { 1.0 } else { 0.0 },
+            ],
             m0: [p.m[0][0], p.m[0][1], p.m[0][2], 0.0],
             m1: [p.m[1][0], p.m[1][1], p.m[1][2], 0.0],
             m2: [p.m[2][0], p.m[2][1], p.m[2][2], 0.0],

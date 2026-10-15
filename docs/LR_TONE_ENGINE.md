@@ -158,3 +158,9 @@ LRのclarity/textureは softsqrt輝度域のアンシャープマスク:
   (5716 +0.0002, 5271 +0.0003 の微小悪化は許容)
 - raster経路はカメラ空間ステージが無いため expo_early=false で従来動作
 - SL_EXPO_EARLY=0 で旧動作に戻せる
+
+## GPU expo_early ミラー
+
+- wb.w フラグで WGSL の wb_matrix 内でも cam*wb*exposure→matrix→HSM
+- parity: 5702 mean 0.0022 / max 0.325 — guide/seed統計が露出後linで
+  動くCPU側との微差。要追加調査 (0953系の旧基準 1e-5 から悪化)
