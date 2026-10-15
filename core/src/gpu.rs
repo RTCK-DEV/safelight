@@ -1773,13 +1773,31 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         // widens/narrows the overlap — mirrors develop.rs
         let sp = 0.5 + pg.gb0.x * 0.2;
         let bw = 0.7 + pg.gb0.y * 0.6;
-        let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, lum)) * pg.st0.w;
-        let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, lum) * pg.st1.w;
-        let wm = max(1.0 - abs(lum - sp) * 2.0 / bw, 0.0) * pg.mt0.w;
-        // colorize semantics — blend toward tint*luma, mirrors develop.rs
-        x = x + ws * (pg.st0.xyz * vec3<f32>(lum) - x) * 0.5
-            + wh * (pg.st1.xyz * vec3<f32>(lum) - x) * 0.5
-            + wm * (pg.mt0.xyz * vec3<f32>(lum) - x) * 0.5;
+        // LR fSplitTone semantics: per-channel gain operator
+        // x' = g*x/(x*(g-1)+1) in sRGB-encoded domain, weighted by maps
+        // computed on encoded luma — mirrors develop.rs (gk = 0.2).
+        let le = srgb_encode(clamp(lum, 0.0, 1.0));
+        let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, le)) * pg.st0.w;
+        let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, le) * pg.st1.w;
+        let wm = max(1.0 - abs(le - sp) * 2.0 / bw, 0.0) * pg.mt0.w;
+        var xd = vec3<f32>(
+            srgb_encode(clamp(x.x, 0.0, 1.0)),
+            srgb_encode(clamp(x.y, 0.0, 1.0)),
+            srgb_encode(clamp(x.z, 0.0, 1.0)));
+        let wheels = array<vec4<f32>, 3>(pg.st0, pg.mt0, pg.st1);
+        let wts = array<f32, 3>(ws, wm, wh);
+        for (var wi = 0u; wi < 3u; wi = wi + 1u) {
+            let w = wts[wi];
+            if (w <= 0.0) { continue; }
+            let col = wheels[wi].xyz;
+            let cl = 0.2126 * col.x + 0.7152 * col.y + 0.0722 * col.z;
+            let g = max(exp(vec3<f32>(w * 0.2) * (col - vec3<f32>(cl))), vec3<f32>(0.05));
+            xd = g * xd / (xd * (g - vec3<f32>(1.0)) + vec3<f32>(1.0));
+        }
+        x = vec3<f32>(
+            srgb_decode(clamp(xd.x, 0.0, 1.0)),
+            srgb_decode(clamp(xd.y, 0.0, 1.0)),
+            srgb_decode(clamp(xd.z, 0.0, 1.0)));
     }
     // HDR zone wheels
     let zones = array<vec4<f32>, 4>(pg.z0, pg.z1, pg.z2, pg.z3);

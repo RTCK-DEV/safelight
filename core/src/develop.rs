@@ -2642,10 +2642,57 @@ fn adjust_g(
         let wm = (1.0 - (luma - sp).abs() * 2.0 / bw).max(0.0) * p.mid_sat;
         // colorize semantics (LR): blend toward the tint at the pixel's own
         // luma — additive (col-luma) lifts blacks and creates a floor
-        for c in 0..3 {
-            x[c] += ws * (p.shadow_col[c] * luma - x[c]) * 0.5
-                + wh * (p.high_col[c] * luma - x[c]) * 0.5
-                + wm * (p.mid_col[c] * luma - x[c]) * 0.5;
+        // LR shader-style grading (fSplitTone): per-channel gain operator
+        // x' = g*x/(x*(g-1)+1) applied in sRGB-encoded domain, weighted by
+        // luma maps. g derived from the wheel tint so hue rotates the color
+        // rather than lerping toward tint*luma (which drags darks magenta).
+        // SL_GRADE_LR=gk overrides the gain constant; SL_GRADE_LR=old
+        // restores the legacy lerp.
+        let gr = std::env::var("SL_GRADE_LR").unwrap_or_default();
+        if gr != "old" {
+            let enc = |v: f32| -> f32 {
+                if v <= 0.003131 {
+                    12.92 * v
+                } else {
+                    1.055 * v.max(0.0).powf(1.0 / 2.4) - 0.055
+                }
+            };
+            let dec = |v: f32| -> f32 {
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let gk = gr.parse::<f32>().unwrap_or(0.2);
+            let le = enc(luma.clamp(0.0, 1.0));
+            let ws2 = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, le)) * p.shadow_sat;
+            let wh2 = sstep(sp - 0.05 * bw, sp + 0.5 * bw, le) * p.high_sat;
+            let wm2 = (1.0 - (le - sp).abs() * 2.0 / bw).max(0.0) * p.mid_sat;
+            for c in 0..3 {
+                let xe = enc(x[c].clamp(0.0, 1.0));
+                let mut xd = xe;
+                for (col, w) in [
+                    (p.shadow_col, ws2),
+                    (p.mid_col, wm2),
+                    (p.high_col, wh2),
+                ] {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let cl = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+                    let g = (w * gk * (col[c] - cl)).exp().max(0.05);
+                    let go = g * xd / (xd * (g - 1.0) + 1.0);
+                    xd = xd + (go - xd);
+                }
+                x[c] = dec(xd.clamp(0.0, 1.0));
+            }
+        } else {
+            for c in 0..3 {
+                x[c] += ws * (p.shadow_col[c] * luma - x[c]) * 0.5
+                    + wh * (p.high_col[c] * luma - x[c]) * 0.5
+                    + wm * (p.mid_col[c] * luma - x[c]) * 0.5;
+            }
         }
     }
     // HDR zone wheels: per-band [hue, amt, ev, sat]
