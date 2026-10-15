@@ -2752,6 +2752,26 @@ fn adjust_g(
     if dbg {
         eprintln!("[adj] pre-lut={x:?}");
     }
+    // LR runs the HSL/luminance tuner (cb0[7], after exposure, in YCC space)
+    // BEFORE the RGBTone2 curve block (cb0[8]) — hue curves before the tone
+    // LUT. SL_HSL_FIRST=0 restores the legacy post-curve ordering.
+    let hsl_first = std::env::var("SL_HSL_FIRST").as_deref() != Ok("0");
+    if !p.hue_luts.is_empty() && hsl_first {
+        let (h, s, v) = rgb_to_hsv(x);
+        let lum = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+        let h2 = lut_at(&p.hue_luts[0..], h);
+        let mut s2 = s * lut_at(&p.hue_luts[256..], h) * lut_at(&p.hue_luts[768..], lum);
+        s2 = lut_at(&p.hue_luts[1024..], s2.clamp(0.0, 1.0));
+        let l2 = lum * lut_at(&p.hue_luts[512..], lum);
+        let mut x2 = hsv_to_rgb(h2, s2.clamp(0.0, 1.0), v);
+        let l3 = 0.2126 * x2[0] + 0.7152 * x2[1] + 0.0722 * x2[2];
+        if l3 > 1e-5 {
+            for c in 0..3 {
+                x2[c] *= l2 / l3;
+            }
+        }
+        x = x2;
+    }
     // tone curve lut — ACR/Lightroom evaluates both ProfileToneCurve and the
     // base/user tone curve in ProPhoto RGB via the hue-preserving (max,mid,min)
     // sorted operator (dng_tone_curve_acr3_default / cr_stage_rgb_tone).
@@ -2807,7 +2827,7 @@ fn adjust_g(
         }
     }
     // hue-domain curves (DaVinci Hue-vs-* and Lum/Sat-vs-Sat)
-    if !p.hue_luts.is_empty() {
+    if !p.hue_luts.is_empty() && !hsl_first {
         let (h, s, v) = rgb_to_hsv(x);
         let lum = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
         let h2 = lut_at(&p.hue_luts[0..], h);

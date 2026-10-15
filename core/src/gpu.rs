@@ -1844,6 +1844,21 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
             }
         }
     }
+    // hue-domain curves BEFORE the tone LUT — LR order (HSL tuner at cb0[7]
+    // precedes RGBTone2 at cb0[8]); mirrors develop.rs hsl_first.
+    if (pg.misc2.z > 0.5) {
+        let hsv = rgb_to_hsv(x);
+        let lum = luma(x);
+        let h2 = lut[u32(pg.misc3.x) + 1024u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)];
+        var s2 = hsv.y * lut[u32(pg.misc3.x) + 1280u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)]
+            * lut[u32(pg.misc3.x) + 1792u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        s2 = lut[u32(pg.misc3.x) + 2048u + u32(clamp(s2, 0.0, 1.0) * 255.0)];
+        let l2 = lum * lut[u32(pg.misc3.x) + 1536u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
+        var x2 = hsv_to_rgb(h2, clamp(s2, 0.0, 1.0), hsv.z);
+        let l3 = luma(x2);
+        if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
+        x = x2;
+    }
     {
         let xc = max(x, vec3<f32>(0.0));
         let hi = max(xc.x, max(xc.y, xc.z));
@@ -1876,20 +1891,6 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
             lut[u32(pg.misc3.x) + 512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
             lut[u32(pg.misc3.x) + 768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
         );
-    }
-    // hue-domain curves (lut offsets 1024 hh | 1280 hs | 1536 hl | 1792 ls | 2048 ss)
-    if (pg.misc2.z > 0.5) {
-        let hsv = rgb_to_hsv(x);
-        let lum = luma(x);
-        let h2 = lut[u32(pg.misc3.x) + 1024u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)];
-        var s2 = hsv.y * lut[u32(pg.misc3.x) + 1280u + u32(clamp(hsv.x, 0.0, 1.0) * 255.0)]
-            * lut[u32(pg.misc3.x) + 1792u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
-        s2 = lut[u32(pg.misc3.x) + 2048u + u32(clamp(s2, 0.0, 1.0) * 255.0)];
-        let l2 = lum * lut[u32(pg.misc3.x) + 1536u + u32(clamp(lum, 0.0, 1.0) * 255.0)];
-        var x2 = hsv_to_rgb(h2, clamp(s2, 0.0, 1.0), hsv.z);
-        let l3 = luma(x2);
-        if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
-        x = x2;
     }
     // ColorSlice (7 hue wedges) + ColorWarper — mirrors develop.rs
     if (pg.csn.y > 0.5 || pg.csn.x > 0.5) {
