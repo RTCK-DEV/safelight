@@ -2627,14 +2627,70 @@ fn adjust_g(
     }
     // saturation / vibrance
     if p.saturation != 0.0 || p.vibrance != 0.0 {
-        let luma = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
-        let mx = x[0].max(x[1]).max(x[2]);
-        let mn = x[0].min(x[1]).min(x[2]);
-        let sat_now = if mx > 1e-5 { (mx - mn) / mx } else { 0.0 };
-        let vib = p.vibrance * (1.0 - sat_now);
-        let s = 1.0 + p.saturation + vib;
-        for c in &mut x {
-            *c = luma + (*c - luma) * s.max(0.0);
+        if p.vibrance > 0.0
+            && std::env::var("SL_VIB").as_deref() == Ok("lr")
+            && p.saturation == 0.0
+        {
+            // LR HSLTuner vibrance (positive branch, PV6+), from the
+            // Sequence1 shader disassembly: smoothed (max,min,mid) HSV,
+            // skin-hue window, shadow fade, sat^2 weighting; RGB rebuilt
+            // preserving channel order so hue is invariant.
+            let mx = x[0].max(x[1]).max(x[2]);
+            let mn = x[0].min(x[1]).min(x[2]);
+            let mid = x[0] + x[1] + x[2] - mx - mn;
+            let c_rng = (mx - mn).max(1e-6);
+            let t = ((mid - mn) / c_rng).clamp(0.0, 1.0);
+            let vp = mx - 0.5 * t * t * (mx - mid); // smoothed max
+            let mnp = mn + 0.5 * (1.0 - t) * (1.0 - t) * (mid - mn); // smoothed min
+            if vp > 1e-5 {
+                let s = ((vp - mnp) / vp).clamp(0.0, 1.0);
+                // hue of the max channel (0-6), shifted: h' = (h+1) mod 6
+                let h: f32 = if x[0] >= x[1] && x[0] >= x[2] {
+                    0.0
+                } else if x[1] >= x[2] {
+                    2.0
+                } else {
+                    4.0
+                };
+                let hp: f32 = (h + 1.0) % 6.0;
+                let w_hue = (7.0 - 4.0 * hp).clamp(0.0, 1.0).min(hp.clamp(0.0, 1.0));
+                let w = w_hue * (1.0 - s * s);
+                let v = p.vibrance;
+                let a = v * (1.0 + w * (v - 1.0)) * (0.833_333 - 0.404_762 * w);
+                let fv = {
+                    let u = (vp * 16.0).min(1.0);
+                    u * (2.0 - u)
+                };
+                let a_eff = a * fv;
+                let ratio = s / (1.0 - a_eff * (1.0 - s)).max(1e-4);
+                let q = v * (1.0 + w * (v - 1.0)) * fv
+                    * s
+                    * (1.0 - s)
+                    * (2.0 - s * (1.0 - s));
+                let vp_new = vp * (1.0 + 0.25 * q * (1.0 - vp.min(1.0)));
+                let mnp_new = vp_new * (1.0 - ratio);
+                let mid_new = mnp_new + t * (vp_new - mnp_new);
+                // rebuild: max->vp_new, min->mnp_new, mid->mid_new (hue kept)
+                for c in &mut x {
+                    if *c == mx {
+                        *c = vp_new;
+                    } else if *c == mn {
+                        *c = mnp_new;
+                    } else {
+                        *c = mid_new;
+                    }
+                }
+            }
+        } else {
+            let luma = 0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2];
+            let mx = x[0].max(x[1]).max(x[2]);
+            let mn = x[0].min(x[1]).min(x[2]);
+            let sat_now = if mx > 1e-5 { (mx - mn) / mx } else { 0.0 };
+            let vib = p.vibrance * (1.0 - sat_now);
+            let s = 1.0 + p.saturation + vib;
+            for c in &mut x {
+                *c = luma + (*c - luma) * s.max(0.0);
+            }
         }
     }
     // defringe (LR): desaturate chromatic pixels inside the purple and

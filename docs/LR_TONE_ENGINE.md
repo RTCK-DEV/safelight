@@ -164,3 +164,18 @@ LRのclarity/textureは softsqrt輝度域のアンシャープマスク:
 - wb.w フラグで WGSL の wb_matrix 内でも cam*wb*exposure→matrix→HSM
 - parity: 5702 mean 0.0022 / max 0.325 — guide/seed統計が露出後linで
   動くCPU側との微差。要追加調査 (0953系の旧基準 1e-5 から悪化)
+
+## LR Vibrance (fHSLTuner正ブランチ) — SL_VIB=lr
+
+シェーダから完全解読・移植:
+  V'=max-0.5t²(max-mid), mn'=min+0.5(1-t)²(mid-min), S=(V'-mn')/V'
+  h'=(h+1)mod6の肌色窓 W=min(sat(7-4h'),sat(h'))
+  a=vib(1+w(vib-1))(0.833-0.405w), w=W(1-S²)
+  fV=min(16V',1)(2-…)暗部フェード, S比率=S/(1-a·fV·(1-S))
+  V'_new=V'(1+0.25·q·(1-V')), q=vib(1+w(vib-1))fV·S(1-S)(2-S(1-S))
+実測: 5271/3744/3767中立、3751 +0.006悪化 → env-gated (SL_VIB=lr)
+
+## GPU/CPU parity (再確認)
+
+- 0953: mean 0.0007/max 0.114 — SL_EXPO_EARLY=0でも同値 →
+  今回の変更由来ではなく既存差 (demosaic差等)。回帰なし
