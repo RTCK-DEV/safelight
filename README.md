@@ -43,6 +43,15 @@ and screenshot-driven verification:
 open mac/build/Safelight.app --args /path/to/raws
 ```
 
+A headless smoke test exercises the app's own engine calls (scan, thumbnail,
+render+scopes, sidecar round-trip, export JPEG with ICC) and writes
+`selftest.json` + `export.jpg` — useful on machines without accessibility
+access for UI automation:
+
+```sh
+SAFELIGHT_SELFTEST=/tmp/st mac/build/Safelight.app/Contents/MacOS/safelight /path/to/raws
+```
+
 ## CLI quickstart
 
 ```sh
