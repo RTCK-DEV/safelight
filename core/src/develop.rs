@@ -2455,6 +2455,21 @@ fn tone_gain(
             - (tone_lut_at(&p.tone_neu, g15 / 1.6) / g15).ln();
         return (tn + w.max(0.0) * dg).exp().clamp(0.0, c[9]);
     }
+    if mode == 16 {
+        // decoded samplesToneMask semantics: the coarse grid stores the
+        // normalized tone RESPONSE at the surround luma — i.e. the pixel's
+        // gain is tone(S)/L evaluated at the blurred luma S, not at the
+        // pixel's own luma. Direct form (not delta-additive).
+        if !guide.is_finite() {
+            return base.min(c[9]);
+        }
+        let s = guide.clamp(0.0, 1.6).max(c[8]);
+        let g_s = tone_lut_at(&p.tone_lut, s / 1.6) / s;
+        let g_l = tone_lut_at(&p.tone_lut, le / 1.6) / le;
+        // blend: w interpolates pixel-luma -> surround-luma evaluation
+        let wu = w.clamp(0.0, 1.0);
+        return (g_l * (1.0 - wu) + g_s * wu).clamp(0.0, c[9]);
+    }
     if mode == 14 {
         // faithful LR t11 form: out_log2L = log2(L) + t11(x,y) where t11 is
         // the coarse-grid log2 gain of the full tone response. ab[0] carries
