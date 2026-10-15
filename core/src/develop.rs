@@ -2276,7 +2276,58 @@ fn spatial_tone() -> (i32, f32, f32, f32) {
     })
 }
 
-fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
+/// LR's cr_stage_bilateral_downsample_3D: the tone-map's per-pixel slider
+/// amount lives on a (x, y, luma) lattice — trilinear-sampled back at full
+/// res, which is what makes the correction edge-aware.
+struct B3d {
+    a: Vec<f32>,
+    w: Vec<f32>,
+    gw: usize,
+    gh: usize,
+    gz: usize,
+}
+
+impl B3d {
+    fn sample(&self, nx: f32, ny: f32, l01: f32) -> f32 {
+        let gx = (nx * self.gw as f32 - 0.5).clamp(0.0, self.gw as f32 - 1.0);
+        let gy = (ny * self.gh as f32 - 0.5).clamp(0.0, self.gh as f32 - 1.0);
+        let gz = (l01 * (self.gz - 1) as f32).clamp(0.0, self.gz as f32 - 1.0);
+        let (x0, y0, z0) = (gx as usize, gy as usize, gz as usize);
+        let (x1, y1, z1) = (
+            (x0 + 1).min(self.gw - 1),
+            (y0 + 1).min(self.gh - 1),
+            (z0 + 1).min(self.gz - 1),
+        );
+        let (tx, ty, tz) = (gx - x0 as f32, gy - y0 as f32, gz - z0 as f32);
+        let mut acc = 0.0f32;
+        let mut ws = 0.0f32;
+        for (dz, wz) in [(z0, 1.0 - tz), (z1, tz)] {
+            for (dy, wy) in [(y0, 1.0 - ty), (y1, ty)] {
+                for (dx, wx) in [(x0, 1.0 - tx), (x1, tx)] {
+                    let w = wx * wy * wz;
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let i = (dy * self.gw + dx) * self.gz + dz;
+                    let cw = self.w[i];
+                    if cw > 0.0 {
+                        acc += (self.a[i] / cw) * w;
+                        ws += w;
+                    }
+                }
+            }
+        }
+        if ws > 0.0 { acc / ws } else { 0.0 }
+    }
+}
+
+fn tone_gain(
+    x: [f32; 3],
+    p: &Params,
+    guide: f32,
+    ab: [f32; 2],
+    lat: Option<(&B3d, f32, f32)>,
+) -> f32 {
     let c = tone_fit_consts();
     // SL_LUMAW: LR's tone-map luma weights are 0.30/0.59/0.11 (DXBC shader
     // 288 line 1889), not Rec.709 — evaluate slider bands on that luma.
@@ -2346,6 +2397,16 @@ fn tone_gain(x: [f32; 3], p: &Params, guide: f32, ab: [f32; 2]) -> f32 {
         let s_local = ((guide - l) / 0.25).clamp(-1.0, 1.0);
         let tn = (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
         return (tn + (1.0 + w * s_local) * dlog).exp().clamp(0.0, c[9]);
+    }
+    if mode == 13 {
+        // bilateral 3D lattice (x, y, luma): slider delta splatted into
+        // cells, trilinear-sampled back — the real LR mask mechanism
+        if let Some((b, nx, ny)) = lat {
+            let tn = (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+            let d = b.sample(nx, ny, l / 1.6);
+            return (tn + w.max(0.3) * d).exp().clamp(0.0, c[9]);
+        }
+        return base.min(c[9]);
     }
     if !guide.is_finite() || (w == 0.0 && w_hl == 0.0) {
         return base.min(c[9]);
@@ -2480,10 +2541,17 @@ fn gamut_compress_luma(rgb: [f32; 3], k: f32) -> [f32; 3] {
 
 #[allow(dead_code)] // tests use the guide-free entry point
 fn adjust(rgb: [f32; 3], p: &Params) -> [f32; 3] {
-    adjust_g(rgb, p, f32::NAN, f32::NAN, [0.0; 2])
+    adjust_g(rgb, p, f32::NAN, f32::NAN, [0.0; 2], None)
 }
 
-fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) -> [f32; 3] {
+fn adjust_g(
+    rgb: [f32; 3],
+    p: &Params,
+    guide: f32,
+    veil_min: f32,
+    ab: [f32; 2],
+    lat: Option<(&B3d, f32, f32)>,
+) -> [f32; 3] {
     let mut x = pre_tone_rgb(rgb, p, veil_min);
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dbg = std::env::var_os("SL_PROBE2").is_some()
@@ -2506,7 +2574,7 @@ fn adjust_g(rgb: [f32; 3], p: &Params, guide: f32, veil_min: f32, ab: [f32; 2]) 
                 *c = tone_lut_at(&p.tone_lut, v / 1.6) * (*c / v).max(0.0);
             }
         } else {
-            let g = tone_gain(x, p, guide, ab);
+            let g = tone_gain(x, p, guide, ab, lat);
             for c in &mut x {
                 *c *= g;
             }
@@ -4625,6 +4693,45 @@ fn finish_linear(
     } else {
         None
     };
+    // mode 13: bilateral 3D lattice — splat the slider's log-gain delta into
+    // (x, y, luma) cells from coarse samples, trilinear-sample at full res.
+    let b3d = if p.has_tone && gmode == 13 {
+        let gw = (dw / 16).clamp(16, 128);
+        let gh = (dh / 16).clamp(16, 128);
+        let gz = 16usize;
+        let mut b = B3d {
+            a: vec![0.0; gw * gh * gz],
+            w: vec![0.0; gw * gh * gz],
+            gw,
+            gh,
+            gz,
+        };
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let nx = (gx as f32 + 0.5) / gw as f32;
+                let ny = (gy as f32 + 0.5) / gh as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, p.key_v, p.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), p, f32::NAN);
+                let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
+                let le = l.max(1e-3);
+                let d = (tone_lut_at(&p.tone_lut, le / 1.6) / le).ln()
+                    - (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+                let zf = (l / 1.6 * (gz - 1) as f32).clamp(0.0, gz as f32 - 1.0);
+                let z0 = zf as usize;
+                let z1 = (z0 + 1).min(gz - 1);
+                for (z, wz) in [(z0, 1.0 - (zf - z0 as f32)), (z1, zf - z0 as f32)] {
+                    let i = (gy * gw + gx) * gz + z;
+                    b.a[i] += d * wz;
+                    b.w[i] += wz;
+                }
+            }
+        }
+        Some(b)
+    } else {
+        None
+    };
     let ab_at = |nx: f32, ny: f32| -> [f32; 2] {
         match &ab_grid {
             Some((ab, gw, gh)) => {
@@ -4870,13 +4977,27 @@ fn finish_linear(
             }
             if std::env::var_os("SL_PROBE").is_some() && (dx * 7 + dy * 13) % 97 == 0 {
                 let pt = pre_tone_rgb(col, p, f32::NAN);
-                let mut a0 = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny), ab_at(nx, ny));
+                let mut a0 = adjust_g(
+                    col,
+                    p,
+                    guide_at(nx, ny),
+                    veil_at(nx, ny),
+                    ab_at(nx, ny),
+                    b3d.as_ref().map(|b| (b, nx, ny)),
+                );
                 local_ops(&mut a0, col, p, nx, ny, dw as f32 / dh as f32, subj, sky, veg);
                 eprintln!(
                     "[probe] {nx:.3},{ny:.3} cam={col:?} pretone={pt:?} adj={a0:?}"
                 );
             }
-            let mut adj = adjust_g(col, p, guide_at(nx, ny), veil_at(nx, ny), ab_at(nx, ny));
+            let mut adj = adjust_g(
+                col,
+                p,
+                guide_at(nx, ny),
+                veil_at(nx, ny),
+                ab_at(nx, ny),
+                b3d.as_ref().map(|b| (b, nx, ny)),
+            );
             let aspect = dw as f32 / dh as f32;
             local_ops(&mut adj, col, p, nx, ny, aspect, subj, sky, veg);
             // serial correction stages (DaVinci serial nodes): full adjust +
@@ -4915,7 +5036,7 @@ fn finish_linear(
                 if key <= 0.001 {
                     continue;
                 }
-                let mut a2 = adjust_g(col, sp, guide_at(nx, ny), veil_at(nx, ny), [0.0; 2]);
+                let mut a2 = adjust_g(col, sp, guide_at(nx, ny), veil_at(nx, ny), [0.0; 2], None);
                 local_ops(&mut a2, col, sp, nx, ny, aspect, subj, sky, veg);
                 for c in 0..3 {
                     adj[c] += (a2[c] - adj[c]) * key;

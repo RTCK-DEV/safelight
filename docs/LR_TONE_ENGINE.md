@@ -59,3 +59,27 @@ mask/guide caches warped by geometry (crop/upright).
   isolation but regress the corpus — residual floor ~0.10 median is a
   smooth low-frequency color/tone error needing the full masked engine or
   a Melissa-domain curve refit rather than post-hoc gain modulation.
+
+## GPUシェーダ定数バッファから確定したステージ順序 (lr_shader_288.asm)
+
+1. fRGBTone1
+2. fABCtoRGB_local (camera→working + ハイライト回復 kColorThresh0-2)
+3. fDehaze / vignette系
+4. **fToneMap** (Shadows/Highlights/Clarity — 空間マスク t11-t14, luma weights 0.30/0.59/0.11, log2ドメインゲイン)
+5. **fExposure** (Exposure + Whites + Blacks + Rolloff)
+6. RGB→YCC → HSLTuner/Vibrance → LuminanceTuner → YCC→RGB
+7. fRGBTone2 (プロファイルカーブ+ポイントカーブ, RGBソート適用 + Lumaブレンド fBlendAmount01)
+8. fSplitTone → 出力色空間変換
+
+## 確定した残差の所在 (corpus検証済み)
+
+- LR暗部: 輝度保存型ガマット圧縮 + 暗部減彩 (Y≈0.017域でchroma 0.54x)
+- LR明部中間: chroma 1.2x (ソートRGB vs luma適用の差)
+- 空間適応トーン: 輝度ビン内ゲインstd 0.3-3.0 → 大域LUTでは原理的に説明不能。
+  mode 9-13 (guided filter upsample / log-domain delta / deviation amp / 3D bilateral lattice) 全試行 → 単画像改善・コーパス悪化でenv-gated
+- PV2012ブレンド定数: k11=0.4, k15=0.4 が最良 (median MAE 0.098)
+- Melissa RGBガンマ域トーン評価: 露出>+1EVのみ自動ゲートで有効
+
+## GPU/CPU parity
+
+- wb_matrix/demap_mat/gamut_compress/post_profile順序をGPU WGSLへ移植後、mean diff 0.0000 を確認 (_DSC6033, _73S5716)
