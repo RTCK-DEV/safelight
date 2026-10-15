@@ -366,6 +366,22 @@ final class LibraryStore: ObservableObject {
         guard let url = folder else { return }
         open(url)
     }
+
+    /// `open -a Safelight --args <folder>` or a bare path argument opens that
+    /// folder at launch — lets CLI/scripts drive the GUI without the panel.
+    private var didOpenLaunchArg = false
+    func openLaunchArg() {
+        guard !didOpenLaunchArg else { return }
+        didOpenLaunchArg = true
+        for arg in CommandLine.arguments.dropFirst() where !arg.hasPrefix("-") {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: arg, isDirectory: &isDir),
+               isDir.boolValue {
+                open(URL(fileURLWithPath: arg))
+                return
+            }
+        }
+    }
 }
 
 private extension Int {

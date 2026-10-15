@@ -6,6 +6,22 @@ cd "$(dirname "$0")/.."
 LIBRAW_PREFIX="${LIBRAW_PREFIX:-/opt/homebrew}"
 APP=mac/build/Safelight.app
 
+# SwiftUI property-wrapper macros (@State etc.) only ship with the full Xcode
+# toolchain. If xcode-select points at the Command Line Tools, fall back to any
+# Xcode.app so `xcrun --find swiftc` resolves a compiler with the plugins.
+if xcode-select -p 2>/dev/null | grep -q CommandLineTools; then
+  for app in /Applications/Xcode*.app; do
+    if [ -x "$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc" ]; then
+      export DEVELOPER_DIR="$app/Contents/Developer"
+      break
+    fi
+  done
+fi
+# invoke through xcrun so the SDK/sysroot resolves against the same
+# DEVELOPER_DIR (calling the toolchain binary directly can pick up the
+# Command Line Tools SDK and fail to load the stdlib)
+SWIFTC="${SWIFTC:-xcrun swiftc}"
+
 cargo build --release -p safelight-core
 
 rm -rf "$APP"
@@ -37,7 +53,7 @@ cp "$LIBRAW_DYLIB" "$APP/Contents/Frameworks/"
 DYLIB_BASE=$(basename "$LIBRAW_DYLIB")
 install_name_tool -id "@rpath/$DYLIB_BASE" "$APP/Contents/Frameworks/$DYLIB_BASE"
 
-swiftc -O \
+$SWIFTC -O \
   -import-objc-header mac/safelight.h \
   -o "$APP/Contents/MacOS/safelight" \
   mac/Sources/*.swift \

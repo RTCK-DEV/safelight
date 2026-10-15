@@ -33,6 +33,15 @@ mac/build.sh                   # -> mac/build/Safelight.app
 ```
 
 `LIBRAW_PREFIX` overrides the lib search path (default `/opt/homebrew`).
+`mac/build.sh` picks the Xcode toolchain automatically when xcode-select still
+points at the Command Line Tools (CLT swiftc lacks the SwiftUI macro plugins).
+
+Pass a folder path to open it straight into the library — handy for scripts
+and screenshot-driven verification:
+
+```sh
+open mac/build/Safelight.app --args /path/to/raws
+```
 
 ## CLI quickstart
 

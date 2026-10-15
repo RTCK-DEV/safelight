@@ -72,6 +72,7 @@ struct LibraryView: View {
         }
         .preferredColorScheme(.dark)
         .tint(Theme.accent)
+        .onAppear { store.openLaunchArg() }
         .sheet(isPresented: $showNewCollection) {
             CollectionNameSheet(title: "New Collection") { name in
                 store.addCollection(name: name, smart: false, rules: "")

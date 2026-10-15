@@ -3,6 +3,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use safelight_core::{Engine, Recipe};
 
+// accepts an inline JSON string, a recipe .json file, or a Lightroom
+// .xmp preset (crs:*) — a bad recipe must fail loudly rather than render
+// with the wrong settings and look like success
+fn parse_recipe(arg: &str) -> Result<Recipe> {
+    if arg.trim_start().starts_with('{') {
+        return Recipe::from_json(arg)
+            .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON"));
+    }
+    let s = std::fs::read_to_string(arg).with_context(|| format!("read recipe {arg}"))?;
+    if arg.ends_with(".xmp") {
+        Ok(safelight_core::xmp::crs_to_recipe(&s))
+    } else {
+        Recipe::from_json(&s)
+            .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {arg}"))
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
@@ -30,16 +47,7 @@ fn main() -> Result<()> {
             // render with the wrong settings and look like success.
             // .xmp files are parsed as Lightroom develop presets (crs:*).
             let recipe = match args.get(4) {
-                Some(p) => {
-                    let s =
-                        std::fs::read_to_string(p).with_context(|| format!("read recipe {p}"))?;
-                    if p.ends_with(".xmp") {
-                        safelight_core::xmp::crs_to_recipe(&s)
-                    } else {
-                        Recipe::from_json(&s)
-                            .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
-                    }
-                }
+                Some(r) => parse_recipe(r)?,
                 // no recipe arg: adopt any saved sidecar (.safelight.json,
                 // Lightroom .xmp, or embedded XMP in the file itself)
                 None => eng
@@ -200,10 +208,10 @@ fn main() -> Result<()> {
         }
         "aidn" => {
             let path = Path::new(&args[2]);
-            let recipe = args
-                .get(3)
-                .map(|r| Recipe::from_json(r).unwrap_or_default())
-                .unwrap_or_default();
+            let recipe = match args.get(3) {
+                Some(r) => parse_recipe(r)?,
+                None => Recipe::default(),
+            };
             let t = std::time::Instant::now();
             let (w, h) = eng.ai_denoise_prepare(path, &recipe)?;
             println!(
