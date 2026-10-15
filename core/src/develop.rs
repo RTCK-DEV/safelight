@@ -1805,7 +1805,21 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
                 let toe_edge: f32 = std::env::var("SL_SHTOE")
                     .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
                 let toe = if toe_edge <= 0.0 { 1.0 } else { sstep(0.0, toe_edge, y0) };
-                y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0) * toe;
+                if let Ok(k) = std::env::var("SL_SHM") {
+                    // LR form: log2-domain (multiplicative) shadows lift —
+                    // y' = y * 2^(sh*k*w), w on log2 luma, so black stays black
+                    // and mid-shadows get the full band gain.
+                    let k: f32 = k.parse().unwrap_or(0.0);
+                    if k != 0.0 {
+                        let ll = (y0.max(1e-5)).log2();
+                        let w = (1.0 - sstep(-6.0, -1.0, ll)) * toe;
+                        y *= (2.0f32).powf(sh * k * w);
+                    } else {
+                        y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0) * toe;
+                    }
+                } else {
+                    y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0) * toe;
+                }
             }
             // shadow rolloff shaping
             if shr != 1.0 {
