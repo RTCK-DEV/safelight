@@ -2408,6 +2408,20 @@ fn tone_gain(
         }
         return base.min(c[9]);
     }
+    if mode == 15 {
+        // adaptive-global hypothesis: the slider delta is evaluated at the
+        // *surround* (blurred) luma, not the pixel's own — LR's tone map
+        // applies global Shadows/Highlights through spatially-varying masks
+        // derived from the blurred luma field (t11-t14 mechanism).
+        if !guide.is_finite() {
+            return base.min(c[9]);
+        }
+        let g15 = guide.clamp(0.0, 1.6).max(c[8]);
+        let tn = (tone_lut_at(&p.tone_neu, le / 1.6) / le).ln();
+        let dg = (tone_lut_at(&p.tone_lut, g15 / 1.6) / g15).ln()
+            - (tone_lut_at(&p.tone_neu, g15 / 1.6) / g15).ln();
+        return (tn + w.max(0.0) * dg).exp().clamp(0.0, c[9]);
+    }
     if mode == 14 {
         // faithful LR t11 form: out_log2L = log2(L) + t11(x,y) where t11 is
         // the coarse-grid log2 gain of the full tone response. ab[0] carries
