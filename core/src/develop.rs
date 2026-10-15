@@ -163,6 +163,10 @@ pub struct Params {
     pub key_h: f32,
     /// lens profile correction amount (baked into virtual sampling)
     pub lens_corr_amt: f32,
+    /// dng_render order: apply the scene-linear exposure gain in camera
+    /// space BEFORE the profile matrix + HueSatMap so the HSM samples its
+    /// V coordinate on exposure-compensated data. SL_EXPO_EARLY=1.
+    pub expo_early: bool,
     /// EV-domain tone LUT (512 entries over linear y in 0..1.6): folds
     /// shadows/highlights/whites/blacks + rolloff into one luminance-preserving
     /// curve with an extended-Reinhard shoulder and soft-knee toe.
@@ -1640,6 +1644,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             }
         }),
         lut_amt: r.lut_amount.clamp(0.0, 1.0),
+        expo_early: !matches!(std::env::var("SL_EXPO_EARLY").as_deref(), Ok("0")),
         key_v: r.key_v.clamp(-0.4, 0.4),
         key_h: r.key_h.clamp(-0.4, 0.4),
         lens_corr_amt: r.lens_corr.min(1.0),
@@ -2162,8 +2167,11 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
     // exposure — a scene-linear gain (baseline + user EV) so it must
     // precede the profile's nonlinear ops: ACR pushes hot data into the
     // tone curve's shoulder rather than scaling the mapped output.
-    for c in &mut x {
-        *c *= p.exposure_mul;
+    // (skipped when expo_early already baked it into `lin` upstream)
+    if !p.expo_early {
+        for c in &mut x {
+            *c *= p.exposure_mul;
+        }
     }
     // .dcp profile "look": ProfileLookTable (HSV shift in working space)
     // then ProfileToneCurve — the profile's base rendering, applied before
@@ -4079,10 +4087,11 @@ pub fn colorize_plane(
             // restores the legacy hard clip.
             let ovr = matches!(std::env::var("SL_OVR").as_deref(), Ok("1"));
             let lim = if ovr { f32::INFINITY } else { 1.0 };
+            let eg = if p.expo_early { p.exposure_mul } else { 1.0 };
             let cw = [
-                (cam[0] * p.wb[0]).clamp(0.0, lim),
-                (cam[1] * p.wb[1]).clamp(0.0, lim),
-                (cam[2] * p.wb[2]).clamp(0.0, lim),
+                (cam[0] * p.wb[0] * eg).clamp(0.0, lim),
+                (cam[1] * p.wb[1] * eg).clamp(0.0, lim),
+                (cam[2] * p.wb[2] * eg).clamp(0.0, lim),
             ];
             let mut out = [0.0f32; 3];
             for c in 0..3 {
@@ -4223,6 +4232,8 @@ fn develop_raster(
     let mut rr = r.clone();
     rr.process_version = 0.0;
     let mut p = build_params(&fake, &rr, stats.as_ref());
+    // raster path has no camera-space stage: exposure must stay in pre_tone
+    p.expo_early = false;
     // pm coords for a raster (e.g. enhanced DNG) live in its own pixel frame
     p.pm_frame = [w as f32, h as f32];
     // raster is already sRGB-encoded u16: decode gamma to linear, adjust, re-encode

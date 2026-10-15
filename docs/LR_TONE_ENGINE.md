@@ -148,3 +148,13 @@ LRのclarity/textureは softsqrt輝度域のアンシャープマスク:
 - 残差は輝度カーブ差 + 色相依存色差 + 滑らかな空間変動の混合で、
   単一機構では説明不能。DCP HueSatMap/LookTableの適用ドメイン差が
   最有力の残存仮説 (profile解決自体は正しいことを確認済み)
+
+## 露出の適用位置をdng_render順序に修正 (デフォルト有効)
+
+- 旧: matrix→HSM→...→pre_tone内でexposure乗算 → HSMが露出前のVでサンプル
+- 新: カメラ空間で `cam*wb*exposure` → matrix→HSM (dng_render.cpp順序)
+  → HSMのV座標が露出補正後の値を参照し、プッシュ画像で色相ずれ解消
+- 実測: 5702 0.1247→0.1212, 5402 0.1506→0.1493, 他中立
+  (5716 +0.0002, 5271 +0.0003 の微小悪化は許容)
+- raster経路はカメラ空間ステージが無いため expo_early=false で従来動作
+- SL_EXPO_EARLY=0 で旧動作に戻せる
