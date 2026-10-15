@@ -68,24 +68,119 @@ struct CamEntry {
 /// Everything a develop call needs — plain floats, shader-ready.
 #[derive(Clone, Debug)]
 pub struct Correction {
-    /// 0 none, 1 ptlens, 2 poly3 (uniform-side model id)
+    /// 0 none, 1 ptlens, 2 poly3, 3 Adobe .lcp ACM (rd=ru(1+k1ru²+k2ru⁴+k3ru⁶))
     pub model: u32,
-    /// ptlens (a,b,c) or poly3 (k1,0,0)
+    /// ptlens (a,b,c) / poly3 (k1,0,0) / Adobe ACM (k1,k2,k3)
     pub abc: [f32; 3],
     /// TCA (vr,br) for red, (vb,bb) for blue; [1,0,1,0] = none
     pub tca: [f32; 4],
-    /// vignetting pa coeffs k1,k2,k3; [0,0,0] = none
+    /// vignetting coeffs k1,k2,k3; [0,0,0] = none
     pub vig: [f32; 3],
+    /// vignette evaluates on the distorted radius (Adobe convention)
+    /// instead of the display radius (lensfun PA convention)
+    pub vig_adobe: bool,
+    /// Adobe vignette: normalized focal (f35mm/35) — vignette radius is
+    /// dist_px/(vig_foc·Dmax); 0 or lensfun path → unused
+    pub vig_foc: f32,
     /// radius scaling camera-crop / lens-crop
     pub scale: f32,
     /// matched lens display name ("" = no match)
     pub lens_name: String,
+    /// full Adobe ACM payload when model == 3 (CPU path uses the complete
+    /// 2-D warp incl. tangential terms; GPU uses the radial approx above)
+    pub adobe: Option<Box<AdobeCor>>,
+    /// DNG embedded opcode corrections (GainMap + WarpRectilinear)
+    /// baked into the raw file — applied underneath any profile correction
+    pub dng: Option<crate::dngops::DngOps>,
+}
+
+/// Adobe Camera Model correction payload (from .lcp).
+#[derive(Clone, Debug)]
+pub struct AdobeCor {
+    /// normalized focal x,y (FocalLengthX/Y; fallback f35mm/35)
+    pub foc: [f32; 2],
+    /// image center fractions (ImageXCenter/Y)
+    pub center: [f32; 2],
+    /// PerspectiveModel ScaleFactor (α0)
+    pub sf: f32,
+    /// [k1,k2,k3 radial, t_y(param3), t_x(param4) tangential]
+    pub k: [f32; 5],
+    /// chromatic red→green warp [sf,k1,k2,k3,t_y,t_x]
+    pub chr: Option<[f32; 6]>,
+    /// chromatic blue→green warp
+    pub chb: Option<[f32; 6]>,
+    /// vignette residual-illumination coeffs α1..α3 (L = 1+Σα·r^{2i},
+    /// gain = 1/L), r in focal units
+    pub vig_a: [f32; 3],
+    /// vignette model's own normalized focal / center
+    pub vig_foc: [f32; 2],
+    pub vig_center: [f32; 2],
 }
 
 impl Correction {
     pub fn is_empty(&self) -> bool {
         self.model == 0 && self.tca == [1.0, 0.0, 1.0, 0.0] && self.vig == [0.0; 3]
     }
+
+    pub fn none() -> Correction {
+        Correction {
+            model: 0,
+            abc: [0.0; 3],
+            tca: [1.0, 0.0, 1.0, 0.0],
+            vig: [0.0; 3],
+            vig_adobe: false,
+            vig_foc: 0.0,
+            scale: 1.0,
+            lens_name: String::new(),
+            adobe: None,
+            dng: None,
+        }
+    }
+}
+
+/// resolve a correction for this shot: lensfun DB first, then the Adobe
+/// .lcp profiles (which cover e.g. E-mount glass lensfun lacks).
+pub fn correction_for(
+    exif_lens: &str,
+    make: &str,
+    model: &str,
+    focal: f32,
+    aperture: f32,
+) -> Option<Correction> {
+    // SAFELIGHT_LENS_BACKEND=adobe|lensfun forces one backend (testing/A-B)
+    let backend = std::env::var("SAFELIGHT_LENS_BACKEND").unwrap_or_default();
+    let use_lensfun = backend != "adobe";
+    let use_adobe = backend != "lensfun";
+    let cam_crop_hint = use_adobe
+        .then(|| db())
+        .flatten()
+        .and_then(|d| d.cam_crop_pub(make, model));
+    if use_adobe {
+        if let Some(l) = crate::lcp::db() {
+            if let Some(c) = l.correction(
+                exif_lens,
+                make,
+                model,
+                cam_crop_hint.unwrap_or(1.0),
+                focal,
+                aperture,
+            ) {
+                if !c.is_empty() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    if !use_lensfun {
+        return None;
+    }
+    if let Some(d) = db() {
+        let c = d.correction(exif_lens, make, model, focal, aperture);
+        if !c.is_empty() {
+            return Some(c);
+        }
+    }
+    None
 }
 
 pub struct LensDb {
@@ -374,6 +469,12 @@ impl LensDb {
         self.cam_entry(make, model).map(|c| c.crop)
     }
 
+    /// public crop-factor lookup so the LCP fallback can normalize radii
+    /// even when lensfun has no matching lens entry
+    pub fn cam_crop_pub(&self, make: &str, model: &str) -> Option<f32> {
+        self.cam_crop(make, model)
+    }
+
     /// fixed-lens compacts carry no EXIF lens name — resolve via the
     /// camera's mount to the matching lens entry. Only fires on
     /// proprietary pseudo-mounts (e.g. "panasonicFZ150"), never on real
@@ -444,14 +545,7 @@ impl LensDb {
         focal: f32,
         aperture: f32,
     ) -> Correction {
-        let none = Correction {
-            model: 0,
-            abc: [0.0; 3],
-            tca: [1.0, 0.0, 1.0, 0.0],
-            vig: [0.0; 3],
-            scale: 1.0,
-            lens_name: String::new(),
-        };
+        let none = Correction::none();
         // NOTE: never free-text match the *camera model* as a lens —
         // generic tokens ("mark", "iii") false-match unrelated lenses.
         // Empty EXIF lens is handled by fixed_lens() below.
@@ -540,8 +634,12 @@ impl LensDb {
             },
             tca,
             vig,
+            vig_adobe: false,
+            vig_foc: 0.0,
             scale,
             lens_name: name,
+            adobe: None,
+            dng: None,
         }
     }
 }
@@ -674,7 +772,7 @@ pub fn match_name(
     focal: f32,
     aperture: f32,
 ) -> Option<String> {
-    let c = db()?.correction(exif_lens, make, model, focal, aperture);
+    let c = correction_for(exif_lens, make, model, focal, aperture)?;
     if c.is_empty() {
         None
     } else {

@@ -46,7 +46,7 @@ impl Engine {
         // load-dynamic fallback reads that env var, so every ort code path
         // (including any that might run before ai::ort_ready) can dlopen it.
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-            let lib = crate::ai::ai_dir().join("libonnxruntime.dylib");
+            let lib = crate::ai::ai_dir().join(crate::ai::ORT_LIB_NAME);
             if lib.exists() {
                 unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib) };
             }
@@ -88,6 +88,19 @@ impl Engine {
 
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
+        // extracted LR mask bitmaps sit next to the image as
+        // <stem>.slmask-<digest>.png — make them absolute so the renderer
+        // can load them regardless of the caller's cwd.
+        let mut owned;
+        let recipe = if recipe_needs_mask_dir(recipe) {
+            owned = recipe.clone();
+            if let Some(dir) = path.parent() {
+                absolutize_mask_files(&mut owned, dir);
+            }
+            &owned
+        } else {
+            recipe
+        };
         // AI-denoised base (SCUNet): only loaded when the recipe asks for it.
         let den = if recipe.ai_denoise > 0.001 {
             load_denoise_cache(path)
@@ -95,10 +108,11 @@ impl Engine {
             None
         };
         // AI subject matte (U-2-Net): only needed by 'subject' power windows.
-        let subj = if recipe
-            .windows
-            .iter()
-            .any(|w| w.kind == "subject" && w.enabled)
+        let subj = if recipe.lens_blur > 0.001
+            || recipe
+                .windows
+                .iter()
+                .any(|w| (w.kind == "subject" || w.kind == "part") && w.enabled)
         {
             load_subject_cache(path)
         } else {
@@ -106,7 +120,20 @@ impl Engine {
         };
         self.with_decoded(path, |d| {
             let mut gpu = self.gpu.lock().unwrap();
-            if let (Decoded::Mosaic(m), Some(g)) = (d, gpu.as_ref()) {
+            if std::env::var_os("SL_CPU").is_some() {
+                drop(gpu);
+                return Ok(develop::develop_cpu_ctx(
+                    d,
+                    recipe,
+                    max_px,
+                    den.as_ref(),
+                    subj.as_ref(),
+                ));
+            }
+            // embedded LinearRaw (LR Denoise/SuperRes DNG) has no GPU path
+            // yet — render those through the CPU pipeline
+            let gpu_ok = !matches!(d, Decoded::Mosaic(m) if m.linear.is_some());
+            if let (Decoded::Mosaic(m), Some(g), true) = (d, gpu.as_ref(), gpu_ok) {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     g.develop(m, recipe, max_px, den.as_ref(), subj.as_ref())
                 }));
@@ -174,11 +201,26 @@ impl Engine {
     pub fn ai_subject_prepare(&self, path: &Path) -> Result<(usize, usize)> {
         let img = self.render(path, &Recipe::default(), 1024)?;
         let (w, h) = (img.width as usize, img.height as usize);
-        let rgb8: Vec<u8> = img
+        // exposure-normalize the inference input: U-2-Net was trained on
+        // normally-exposed photos, so lift dark previews toward p95≈0.85
+        // (the matte is brightness-invariant in intent, not in practice).
+        let mut rgb8: Vec<u8> = img
             .data
             .chunks_exact(4)
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
+        let mut lums: Vec<u16> = rgb8
+            .chunks_exact(3)
+            .map(|c| (54 * c[0] as u16 + 183 * c[1] as u16 + 19 * c[2] as u16) / 255)
+            .collect();
+        lums.sort_unstable();
+        let p95 = lums[(lums.len() * 95 / 100).min(lums.len() - 1)] as f32 / 255.0;
+        if p95 > 1e-3 && p95 < 0.7 {
+            let g = (0.85 / p95).min(8.0);
+            for c in rgb8.iter_mut() {
+                *c = ((*c as f32 * g).min(255.0)) as u8;
+            }
+        }
         let matte = crate::ai::subject_mask(&rgb8, w, h)?;
         let pix: Vec<u16> = matte
             .iter()
@@ -225,10 +267,7 @@ impl Engine {
     pub fn merge(&self, paths: &[std::path::PathBuf], mode: &str) -> Result<RgbaImage> {
         let mut imgs = Vec::with_capacity(paths.len());
         for p in paths {
-            let r = self
-                .read_sidecar(p)
-                .map(|sc| sc.recipe)
-                .unwrap_or_default();
+            let r = self.read_sidecar(p).map(|sc| sc.recipe).unwrap_or_default();
             imgs.push(self.export(p, &r)?);
         }
         crate::merge::merge(&imgs, mode)
@@ -530,6 +569,33 @@ impl Engine {
             "assets" => Ok(json!(self.catalog.assets(&path()?)?)),
             _ => anyhow::bail!("unknown library op: {op}"),
         }
+    }
+}
+
+/// any window (incl. serial-stage recipes) references an extracted LR mask
+/// bitmap that still needs path resolution
+fn recipe_needs_mask_dir(r: &Recipe) -> bool {
+    r.windows.iter().any(|w| !w.mask_file.is_empty())
+        || r.pm_spots.iter().any(|s| !s.file.is_empty())
+        || r.stages
+            .iter()
+            .any(|s| s.enabled && recipe_needs_mask_dir(&s.params))
+}
+
+/// make every window's relative mask_file absolute under `dir`
+fn absolutize_mask_files(r: &mut Recipe, dir: &Path) {
+    for w in &mut r.windows {
+        if !w.mask_file.is_empty() && !Path::new(&w.mask_file).is_absolute() {
+            w.mask_file = dir.join(&w.mask_file).to_string_lossy().into_owned();
+        }
+    }
+    for s in &mut r.pm_spots {
+        if !s.file.is_empty() && !Path::new(&s.file).is_absolute() {
+            s.file = dir.join(&s.file).to_string_lossy().into_owned();
+        }
+    }
+    for s in &mut r.stages {
+        absolutize_mask_files(&mut s.params, dir);
     }
 }
 

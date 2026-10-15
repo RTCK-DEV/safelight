@@ -44,6 +44,17 @@ pub struct Recipe {
     pub curve: Vec<[f32; 2]>,
     /// unsharp mask amount 0..1
     pub sharpen: f32,
+    /// sharpen edge masking 0..1 (LR "Masking"): attenuates the unsharp
+    /// delta on flat areas, leaving edges fully sharpened
+    #[serde(default)]
+    pub sharp_mask: f32,
+    /// sharpen radius in 3x3-box units 0.5..3.0 (LR 0.5..3.0, default 1.0)
+    #[serde(default = "default_one")]
+    pub sharp_radius: f32,
+    /// sharpen detail 0..1: blends the sharpening band between the
+    /// coarse-radius delta (0) and the fine 3x3 delta (1). LR default 25
+    #[serde(default)]
+    pub sharp_detail: f32,
     /// luminance noise reduction 0..1
     pub noise_luma: f32,
     /// straighten angle in degrees, -10..10
@@ -52,8 +63,27 @@ pub struct Recipe {
     pub clarity: f32,
     /// corner darkening -1..1 (positive darkens)
     pub vignette: f32,
+    /// post-crop vignette midpoint: normalized radius of the 50% mark,
+    /// 0..1 (LR 0..100). -1 = unset → legacy fixed ramp
+    #[serde(default = "neg_one")]
+    pub vig_mid: f32,
+    /// post-crop vignette roundness -1..1: -1 = frame-following square,
+    /// +1 = circle (LR -100..100). -2 = unset
+    #[serde(default = "neg_two")]
+    pub vig_round: f32,
+    /// post-crop vignette feather 0..1: transition width (LR 0..100).
+    /// -1 = unset
+    #[serde(default = "neg_one")]
+    pub vig_feather: f32,
     /// film grain 0..1
     pub grain: f32,
+    /// grain particle size 0..1 → 1..5 px cells (LR GrainSize 0..100)
+    #[serde(default)]
+    pub grain_size: f32,
+    /// grain roughness 0..1: blends low-frequency clumpy noise into the
+    /// white noise (LR GrainRoughness 0..100)
+    #[serde(default)]
+    pub grain_rough: f32,
     // ---- grading (DaVinci-style lift/gamma/gain + split tone + look) ----
     /// per-channel shadow offset, typically -0.25..0.25
     pub lift: [f32; 3],
@@ -89,6 +119,12 @@ pub struct Recipe {
     /// 3-way midtone tint: hue (0..1) + amount
     pub midtone_hue: f32,
     pub midtone_sat: f32,
+    /// LR SplitToningBalance -1..1: shifts the shadow↔highlight crossover
+    #[serde(default)]
+    pub grade_balance: f32,
+    /// LR ColorGradeBlending 0..1 (LR 0..100): range overlap width (0.5=LR50)
+    #[serde(default = "grade_blend_default")]
+    pub grade_blend: f32,
     /// per-channel custom curves (same [[x,y]] format as `curve`)
     pub curve_r: Vec<[f32; 2]>,
     pub curve_g: Vec<[f32; 2]>,
@@ -126,6 +162,33 @@ pub struct Recipe {
     pub highlight_rolloff: f32,
     /// shadow rolloff, 0..2 (1 = linear)
     pub shadow_rolloff: f32,
+    /// LR defringe: [amount 0..1, hue_lo_deg, hue_hi_deg] for the
+    /// purple band (desaturates saturated pixels in the hue range)
+    #[serde(default = "defringe_pu_default")]
+    pub defringe_pu: [f32; 3],
+    /// same for the green band
+    #[serde(default = "defringe_gr_default")]
+    pub defringe_gr: [f32; 3],
+    /// LR camera calibration: [shadow_tint, red_hue, red_sat, green_hue,
+    /// green_sat, blue_hue, blue_sat] all normalized -1..1. Applied as a
+    /// 3x3 chroma-rotation matrix + shadow green/magenta shift.
+    #[serde(default)]
+    pub calib: [f32; 7],
+    /// LR Texture: fine-scale midtone detail contrast, -1..1
+    #[serde(default)]
+    pub texture: f32,
+    /// LR Lens Blur amount 0..1 (depth-of-field defocus; blended by
+    /// 1-subject matte as the focus proxy)
+    #[serde(default)]
+    pub lens_blur: f32,
+    /// LR Lens Blur bokeh options: [highlight_boost, highlight_thresh,
+    /// aspect(-1..1 squash), shape(0=disc,1=ring), spherical_aberration]
+    #[serde(default)]
+    pub lens_blur_opts: [f32; 5],
+    /// LR Lens Blur bokeh options 2: [cat-eye amount, cat-eye scale,
+    /// bokeh rotation, bokeh shape detail] — all 0..1
+    #[serde(default)]
+    pub lens_blur_opts2: [f32; 4],
     // ---- channel mixer / clone stamp / beauty ----
     /// RGB mixer: 3x3 row-major (identity default)
     pub mixer: [f32; 9],
@@ -133,8 +196,23 @@ pub struct Recipe {
     pub mono: [f32; 3],
     /// clone stamps [sx, sy, dx, dy, radius, _] frame-normalized (max 8)
     pub clones: Vec<[f32; 6]>,
+    /// LR PatchMatch remove spots with extracted offset maps (max 12)
+    #[serde(default)]
+    pub pm_spots: Vec<PmSpot>,
     /// skin smoothing amount 0..1 (edge-aware, skin-hue weighted)
     pub beauty: f32,
+    /// LR HDR edit mode (HDREditMode=1): the develop edit was authored in
+    /// HDR space. SDR output is still just the SDR rendition — we preserve
+    /// the flag + SDR-rendition sliders for round-trip fidelity.
+    #[serde(default)]
+    pub hdr_edit: bool,
+    /// LR HDR display peak (HDRMaxValue, EV multiplier 1..16)
+    #[serde(default)]
+    pub hdr_max: f32,
+    /// LR SDR-rendition sliders [Blend, Brightness, Contrast, Highlights,
+    /// Shadows, Whites, Clarity] — 0..1
+    #[serde(default)]
+    pub sdr: [f32; 7],
     // ---- restoration + light fx ----
     /// chroma noise reduction 0..1 (spatial, pairs with noise_luma)
     pub noise_chroma: f32,
@@ -159,6 +237,15 @@ pub struct Recipe {
     pub lut_file: String,
     /// 0..1 blend amount of the LUT
     pub lut_amount: f32,
+    /// decoded Adobe `crs:Table_*` RGB LUT (from Look/enhanced profiles),
+    /// applied display-referred like `lut_file`. Not serialized — the
+    /// encoded payload lives in the source XMP.
+    #[serde(skip)]
+    pub rgb_lut: Option<crate::lut::CubeLut>,
+    /// decoded Adobe `crs:LookTable` HSV map (dng_look_table); replaces the
+    /// DCP profile's look table when the XMP carries one.
+    #[serde(skip)]
+    pub look_table: Option<crate::dcp::HsMap>,
     /// keystone correction: vertical trapezoid warp -0.4..0.4
     /// (>0 widens the bottom — fixes converging verticals shot from below)
     pub key_v: f32,
@@ -170,6 +257,10 @@ pub struct Recipe {
     /// distortion, lateral CA and vignetting at that strength.
     #[serde(default = "default_one")]
     pub lens_corr: f32,
+    /// crs:LensProfileName — a preset's explicit lens profile choice,
+    /// overriding the EXIF lens when matching the lens db.
+    #[serde(default)]
+    pub lens_name: String,
     /// adjustment-brush layers (LR-style): each layer carries its own
     /// ev/sat/temp + opacity and a list of painted strokes, applied
     /// inside the stroked mask. Up to 4 layers are honoured.
@@ -193,6 +284,47 @@ pub struct Recipe {
     /// max 8 honoured.
     #[serde(default)]
     pub warper: Vec<[f32; 5]>,
+    /// LR Point Color swatches: raw 19-float rows as serialized in
+    /// `crs:PointColors` — [SrcHue(0..6), SrcSat, SrcLum, HueShift,
+    /// SatScale, LumScale, RangeAmount, HueRange(LN,LF,UF,UN),
+    /// SatRange(...), LumRange(...)].
+    /// Entries of all -1 are LR's "empty swatch" sentinel.
+    #[serde(default)]
+    pub point_colors: Vec<[f32; 19]>,
+    /// `crs:ColorVariance`: per-swatch variance (-1..1, index-aligned with
+    /// point_colors). Negative pulls the selected colours toward the
+    /// "after" swatch colour; positive pushes them away.
+    #[serde(default)]
+    pub point_color_vars: Vec<f32>,
+    /// camera profile: "Adobe Standard", "Camera Standard", a .dcp path,
+    /// or "" for the built-in libraw matrix. Resolved against
+    /// ~/.safelight/profiles and (when installed) Lightroom's CameraProfiles.
+    #[serde(default)]
+    pub profile: String,
+    /// LR profile Amount slider (crs:Amount inside <crs:Look>) — scales the
+    /// resolved profile's baked-in grade; 1 = full.
+    #[serde(default = "default_one")]
+    pub profile_amount: f32,
+    /// Lightroom process version of the develop settings (crs:ProcessVersion,
+    /// catalog processVersion). 0 = unset/current. Matters because ACR's
+    /// base tone scale is version-dependent: PV11 (PV2012-era) uses an
+    /// image-adaptive tone mapping that PV15.x renders replaced.
+    #[serde(default)]
+    pub process_version: f32,
+    /// absolute white balance in kelvin (Lightroom crs:Temperature).
+    /// 0 = unset; when >0 it replaces the as-shot/auto/pick multipliers
+    /// entirely (the camera-neutral is derived from the illuminant's
+    /// chromaticity through the active color matrix).
+    #[serde(default)]
+    pub temp_abs: f32,
+    /// absolute tint along the magenta(+)/green(-) axis, LR scale ±150.
+    #[serde(default)]
+    pub tint_abs: f32,
+    /// skip the default filmic base tone curve (Adobe's renderer always
+    /// applies a medium-contrast display transform on scene-linear data;
+    /// we match that by default). Set true for unshaped linear output.
+    #[serde(default)]
+    pub linear_output: bool,
 }
 
 /// one serial correction stage. `params` reuses the Recipe struct — only the
@@ -276,6 +408,28 @@ pub struct BrushLayer {
     pub edge_aware: bool,
     /// similarity tolerance 0.05..1.0 — larger admits more pixels
     pub edge_tol: f32,
+    /// extended local adjustments (LR Local* fields), -1..1 each
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub clarity: f32,
+    #[serde(default)]
+    pub dehaze: f32,
+    /// green(-)/magenta(+) axis -1..1
+    #[serde(default)]
+    pub tint: f32,
+    /// tone-band offsets (LR Local{Highlights,Shadows,Whites,Blacks}), -1..1
+    #[serde(default)]
+    pub hi: f32,
+    #[serde(default)]
+    pub sh: f32,
+    #[serde(default)]
+    pub wh: f32,
+    #[serde(default)]
+    pub bl: f32,
+    /// LR LocalTexture: fine-detail midtone contrast, -1..1
+    #[serde(default)]
+    pub texture: f32,
     pub strokes: Vec<BrushStroke>,
 }
 
@@ -290,6 +444,15 @@ impl Default for BrushLayer {
             link_q: false,
             edge_aware: false,
             edge_tol: 0.5,
+            contrast: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            tint: 0.0,
+            hi: 0.0,
+            sh: 0.0,
+            wh: 0.0,
+            bl: 0.0,
+            texture: 0.0,
             strokes: Vec::new(),
         }
     }
@@ -316,13 +479,127 @@ pub struct PowerWindow {
     /// gate this window's mask by the HSL qualifier matte (intersect)
     #[serde(default)]
     pub link_q: bool,
+    /// transition midpoint (LR-style): for "gradient" the 50% mark's
+    /// position along the p1→p2 span, for "circle" the 50% mark's
+    /// normalized radius. 0 = legacy default (0.5 / 1-soft/2).
+    #[serde(default)]
+    pub mid: f32,
+    /// extended local adjustments (LR Local* fields), -1..1 each
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub clarity: f32,
+    #[serde(default)]
+    pub dehaze: f32,
+    /// green(-)/magenta(+) axis -1..1
+    #[serde(default)]
+    pub tint: f32,
+    /// tone-band offsets (LR Local{Highlights,Shadows,Whites,Blacks}), -1..1
+    #[serde(default)]
+    pub hi: f32,
+    #[serde(default)]
+    pub sh: f32,
+    #[serde(default)]
+    pub wh: f32,
+    #[serde(default)]
+    pub bl: f32,
+    /// LR LocalTexture: fine-detail midtone contrast, -1..1
+    #[serde(default)]
+    pub texture: f32,
+    /// LR range-mask refinement folded into this window (one slot —
+    /// additional components keep their own windows in add mode).
+    /// [mode, kind, p0..p3]: mode 1=subtract, 2=intersect; kind 1=color
+    /// (h01, sat, tol, inv), kind 2=lum (lo, hi, feather, inv).
+    #[serde(default)]
+    pub refine: [f32; 6],
+    /// LR LocalPointColors: masked point-colour swatches scoped to this
+    /// window — raw 19-float rows + per-swatch variance (LocalColorVariance).
+    #[serde(default)]
+    pub pcs: Vec<([f32; 19], f32)>,
+    /// LR AI-mask bitmap reference: MaskDigest identifies the computed
+    /// matte in the catalog's `.lrcat-data` blob store. During `lrcat`
+    /// import the blob is extracted to a PNG next to the sidecar and
+    /// `mask_file` names it (relative to the image). When set, the
+    /// renderer samples this real Adobe matte instead of the heuristic
+    /// subject/sky/etc. approximation.
+    #[serde(default)]
+    pub mask_digest: String,
+    #[serde(default)]
+    pub mask_file: String,
+    /// mask bitmap placement: origin (x,y) of the TIFF bbox and the
+    /// whole-image area (w,h), all in mask-space pixels.
+    #[serde(default)]
+    pub mask_org: [f32; 2],
+    #[serde(default)]
+    pub mask_area: [f32; 2],
+    /// LR MaskBlendMode for this mask member inside its correction:
+    /// 0 = add, 1 = subtract, 2 = intersect.
+    #[serde(default)]
+    pub blend: i32,
+    /// correction membership: windows sharing a nonzero group are mask
+    /// members of the same LR correction and their mattes combine with
+    /// `blend` before the correction's adjustments apply once.
+    #[serde(default)]
+    pub group: u32,
 }
 
+/// LR Remove/PatchMatch heal spot (`heal_patchmatch`): Lightroom stores the
+/// computed per-pixel source-offset map in the catalog `.lrcat-data` blob
+/// store keyed by the `pm_patch` digest; during import it is extracted to a
+/// 16-bit RGB PNG named by `file`. Coordinates are sensor px.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PmSpot {
+    /// destination rect in sensor px [l, t, r, b] — the patchmap covers it
+    pub target: [f32; 4],
+    /// search rect in sensor px [l, t, r, b]; patchmap channels normalize
+    /// to this rect (v/65535 * size + origin)
+    pub search: [f32; 4],
+    /// LR whole-image frame origin [l, t] (pm_whole_image_left/top)
+    pub frame_org: [f32; 2],
+    /// destination ellipse [cx, cy, rx, ry] in normalized post-flip frame
+    /// coords (the spot's feathered coverage)
+    pub ellipse: [f32; 4],
+    pub opacity: f32,
+    pub digest: String,
+    /// extracted patchmap PNG beside the image (16-bit RGB)
+    pub file: String,
+}
+
+impl Default for PmSpot {
+    fn default() -> Self {
+        PmSpot {
+            target: [0.0; 4],
+            search: [0.0; 4],
+            frame_org: [0.0; 2],
+            ellipse: [0.0; 4],
+            opacity: 1.0,
+            digest: String::new(),
+            file: String::new(),
+        }
+    }
+}
+
+fn defringe_pu_default() -> [f32; 3] {
+    [0.0, 246.0, 294.0]
+}
+fn defringe_gr_default() -> [f32; 3] {
+    [0.0, 108.0, 132.0]
+}
 fn default_true() -> bool {
     true
 }
 fn default_one() -> f32 {
     1.0
+}
+fn neg_one() -> f32 {
+    -1.0
+}
+fn neg_two() -> f32 {
+    -2.0
+}
+fn grade_blend_default() -> f32 {
+    0.5
 }
 
 impl Default for PowerWindow {
@@ -337,6 +614,24 @@ impl Default for PowerWindow {
             invert: false,
             enabled: true,
             opacity: 1.0,
+            mid: 0.0,
+            contrast: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            tint: 0.0,
+            hi: 0.0,
+            sh: 0.0,
+            wh: 0.0,
+            bl: 0.0,
+            texture: 0.0,
+            refine: [0.0; 6],
+            pcs: Vec::new(),
+            mask_digest: String::new(),
+            mask_file: String::new(),
+            mask_org: [0.0; 2],
+            mask_area: [0.0; 2],
+            blend: 0,
+            group: 0,
         }
     }
 }
@@ -357,11 +652,19 @@ impl Default for Recipe {
             wb_mode: WbMode::AsShot,
             curve: Vec::new(),
             sharpen: 0.0,
+            sharp_mask: 0.0,
+            sharp_radius: 1.0,
+            sharp_detail: 0.25,
             noise_luma: 0.0,
             rotation_deg: 0.0,
             clarity: 0.0,
             vignette: 0.0,
+            vig_mid: -1.0,
+            vig_round: -2.0,
+            vig_feather: -1.0,
             grain: 0.0,
+            grain_size: 0.25,
+            grain_rough: 0.5,
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
@@ -379,6 +682,8 @@ impl Default for Recipe {
             offset: [0.0; 3],
             midtone_hue: 0.33,
             midtone_sat: 0.0,
+            grade_balance: 0.0,
+            grade_blend: 0.5,
             curve_r: Vec::new(),
             curve_g: Vec::new(),
             curve_b: Vec::new(),
@@ -403,10 +708,21 @@ impl Default for Recipe {
             pivot: 0.18,
             highlight_rolloff: 1.0,
             shadow_rolloff: 1.0,
+            defringe_pu: [0.0, 246.0, 294.0],
+            defringe_gr: [0.0, 108.0, 132.0],
+            calib: [0.0; 7],
+            texture: 0.0,
+            lens_blur: 0.0,
+            lens_blur_opts: [0.0; 5],
+            lens_blur_opts2: [0.0; 4],
             mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             mono: [0.0; 3],
             clones: Vec::new(),
+            pm_spots: Vec::new(),
             beauty: 0.0,
+            hdr_edit: false,
+            hdr_max: 0.0,
+            sdr: [0.0; 7],
             noise_chroma: 0.2,
             dehaze: 0.0,
             ca_fix: 0.0,
@@ -417,24 +733,186 @@ impl Default for Recipe {
             wb_pick_size: 0.025,
             lut_file: String::new(),
             lut_amount: 1.0,
+            rgb_lut: None,
+            look_table: None,
             key_v: 0.0,
             key_h: 0.0,
             lens_corr: 1.0,
+            lens_name: String::new(),
             brushes: Vec::new(),
             ai_denoise: 0.0,
             stages: Vec::new(),
             color_slice: [[0.0; 4]; 7],
             warper: Vec::new(),
+            point_colors: Vec::new(),
+            point_color_vars: Vec::new(),
+            profile: String::new(),
+            profile_amount: 1.0,
+            process_version: 0.0,
+            temp_abs: 0.0,
+            tint_abs: 0.0,
+            linear_output: false,
         }
     }
 }
 
 impl Recipe {
     pub fn from_json(s: &str) -> Option<Recipe> {
-        serde_json::from_str(s).ok()
+        // accept either a bare Recipe or a .safelight.json Sidecar wrapper —
+        // serde would otherwise "successfully" deserialize the wrapper into
+        // an all-defaults Recipe and silently drop every edit.
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        if let Some(r) = v.get("recipe") {
+            serde_json::from_value(r.clone()).ok()
+        } else {
+            serde_json::from_value(v).ok()
+        }
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// LR `crs:Amount` / preset-strength scaling: every adjustment delta is
+    /// interpolated toward its default by factor `a` (0 = neutral, 1 = full,
+    /// up to 2 = boosted). Mask/brush geometry, WB pick, crop and transform
+    /// (keystone/rotation/lens) are left alone — Amount does not reshape
+    /// masks or straighten the horizon.
+    pub fn scale(&mut self, a: f32) {
+        if (a - 1.0).abs() < 1e-6 {
+            return;
+        }
+        let s = |v: &mut f32| *v *= a;
+        let s3 = |v: &mut [f32; 3]| v.iter_mut().for_each(|x| *x *= a);
+        // basic tone/colour
+        s(&mut self.exposure);
+        s(&mut self.contrast);
+        s(&mut self.highlights);
+        s(&mut self.shadows);
+        s(&mut self.whites);
+        s(&mut self.blacks);
+        s(&mut self.saturation);
+        s(&mut self.vibrance);
+        s(&mut self.temperature);
+        s(&mut self.tint);
+        // detail
+        s(&mut self.sharpen);
+        s(&mut self.noise_luma);
+        s(&mut self.noise_chroma);
+        s(&mut self.clarity);
+        s(&mut self.texture);
+        s(&mut self.dehaze);
+        // effects
+        s(&mut self.vignette);
+        s(&mut self.grain);
+        s(&mut self.glow);
+        s(&mut self.beauty);
+        s(&mut self.ca_fix);
+        s(&mut self.deband);
+        s(&mut self.lens_blur);
+        s(&mut self.flare[2]);
+        // lift/gamma/gain are multiplicative-1 defaults
+        s3(&mut self.lift);
+        s3(&mut self.offset);
+        for v in self.gamma.iter_mut().chain(self.gain.iter_mut()) {
+            *v = 1.0 + (*v - 1.0) * a;
+        }
+        // split toning / color grading sats + zone adjustments
+        s(&mut self.shadow_sat);
+        s(&mut self.highlight_sat);
+        s(&mut self.midtone_sat);
+        for z in [
+            &mut self.z_dark,
+            &mut self.z_shadow,
+            &mut self.z_light,
+            &mut self.z_global,
+        ] {
+            z[1] *= a;
+            z[2] *= a;
+            z[3] *= a;
+        }
+        for v in &mut self.qadj {
+            *v *= a;
+        }
+        for v in &mut self.zones_ev {
+            *v *= a;
+        }
+        // camera calibration + defringe amounts
+        for v in &mut self.calib {
+            *v *= a;
+        }
+        self.defringe_pu[0] *= a;
+        self.defringe_gr[0] *= a;
+        // channel mixer: scale the delta from identity
+        for (i, v) in self.mixer.iter_mut().enumerate() {
+            let id = if i % 4 == 0 { 1.0 } else { 0.0 };
+            *v = id + (*v - id) * a;
+        }
+        // tone curves: scale the y-delta (master/rgb) or the 1.0-gain
+        // (hue/lum/sat-domain curves)
+        for pts in [
+            &mut self.curve,
+            &mut self.curve_r,
+            &mut self.curve_g,
+            &mut self.curve_b,
+        ] {
+            for p in pts.iter_mut() {
+                p[1] = p[0] + (p[1] - p[0]) * a;
+            }
+        }
+        for p in self.hue_hue.iter_mut() {
+            p[1] = p[0] + (p[1] - p[0]) * a;
+        }
+        for pts in [
+            &mut self.hue_sat,
+            &mut self.hue_lum,
+            &mut self.lum_sat,
+            &mut self.sat_sat,
+        ] {
+            for p in pts.iter_mut() {
+                p[1] = 1.0 + (p[1] - 1.0) * a;
+            }
+        }
+        for sl in &mut self.color_slice {
+            sl[0] *= a;
+            sl[1] *= a;
+            sl[2] *= a;
+        }
+        for w in &mut self.warper {
+            w[2] *= a;
+            w[3] *= a;
+        }
+        // embedded/file LUT contribution
+        self.lut_amount *= a;
+        // local adjustments: scale the deltas, keep the mask geometry
+        for w in &mut self.windows {
+            w.ev *= a;
+            w.sat *= a;
+            w.temp *= a;
+            w.contrast *= a;
+            w.clarity *= a;
+            w.dehaze *= a;
+            w.tint *= a;
+            w.hi *= a;
+            w.sh *= a;
+            w.wh *= a;
+            w.bl *= a;
+            w.texture *= a;
+        }
+        for b in &mut self.brushes {
+            b.opacity *= a;
+            b.ev *= a;
+            b.sat *= a;
+            b.temp *= a;
+            b.contrast *= a;
+            b.clarity *= a;
+            b.dehaze *= a;
+            b.tint *= a;
+            b.hi *= a;
+            b.sh *= a;
+            b.wh *= a;
+            b.bl *= a;
+            b.texture *= a;
+        }
     }
 }
 
@@ -469,6 +947,10 @@ pub struct Sidecar {
     pub recipe: Recipe,
     /// saved grade versions (DaVinci stills/versions)
     pub versions: Vec<GradeVersion>,
+    /// unmodeled XMP attributes harvested on import ("ns:key", "value"),
+    /// re-emitted verbatim by write_xmp so foreign fields round-trip
+    #[serde(default)]
+    pub extras: Vec<(String, String)>,
 }
 
 impl Default for Sidecar {
@@ -481,6 +963,7 @@ impl Default for Sidecar {
             keywords: Vec::new(),
             recipe: Recipe::default(),
             versions: Vec::new(),
+            extras: Vec::new(),
         }
     }
 }
@@ -510,10 +993,7 @@ pub fn sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::Pat
 /// The same sidecar under the pre-rename `<stem>.araware.json` naming.
 /// Reads fall back to this so existing libraries keep their edits; new
 /// writes always go to the .safelight name.
-pub fn legacy_sidecar_path_for_v(
-    asset: &std::path::Path,
-    vslot: u32,
-) -> std::path::PathBuf {
+pub fn legacy_sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
     let mut p = asset.to_path_buf();
     let stem = asset
         .file_stem()
@@ -532,10 +1012,7 @@ pub fn legacy_sidecar_path_for_v(
 /// Path a reader should use: the .safelight sidecar if present, else the
 /// araware-era one if present, else the .safelight path (nonexistent) so
 /// callers' exists()/default handling still works.
-pub fn read_sidecar_path_for_v(
-    asset: &std::path::Path,
-    vslot: u32,
-) -> std::path::PathBuf {
+pub fn read_sidecar_path_for_v(asset: &std::path::Path, vslot: u32) -> std::path::PathBuf {
     let p = sidecar_path_for_v(asset, vslot);
     if p.exists() {
         return p;

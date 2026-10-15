@@ -88,8 +88,19 @@ struct Uni {
     fx0: [f32; 4],
     /// lens flare: cx, cy, strength, hue
     flare: [f32; 4],
+    /// defringe purple band: amount, lo_deg, hi_deg, 0
+    defr_pu: [f32; 4],
+    /// defringe green band: amount, lo_deg, hi_deg, 0
+    defr_gr: [f32; 4],
     /// power windows: [a,b,c,d]/[rot,soft,ev,sat]/[temp,kind(+2=invert),0,0]/pad
-    wins: [[f32; 4]; 16],
+    wins: [[f32; 4]; 96],
+    /// per-window LR range refine: 2 vec4 per window
+    /// [mode,kind,p0,p1] / [p2,p3,0,0] — kind 1=color(h,s,tol,inv), 2=lum
+    refines: [[f32; 4]; 32],
+    /// per-window LocalPointColors: 10 vec4 per window —
+    /// [n,0,0,0] then ≤2 swatches of 5 vec4:
+    /// [src3,var] [shift3,amt] [hr4] [sr4] [lr4]
+    lpcs: [[f32; 4]; 176],
     /// clone stamps: [sx,sy,r,0] / [dx,dy,0,0] per clone in virtual-src px
     clones: [[f32; 4]; 16],
     /// qualifier finesse: clean_black, clean_white, blur→soft dilation, highlight
@@ -111,6 +122,8 @@ struct Uni {
     /// misc = [n_strokes, link_q_bits, 0, 0], stroke records 3 entries
     /// each (params / seg range / normalized-space bbox)
     blayers: [[f32; 4]; 4],
+    /// brush layer extras (contrast,clarity,dehaze,tint,hi,sh,wh,bl)
+    blayers2: [[f32; 4]; 12],
     bmisc: [f32; 4],
     bstr: [[f32; 4]; 192],
     /// serial stages: [n_stages, 0, 0, 0]
@@ -125,8 +138,37 @@ struct Uni {
     cs: [[f32; 4]; 7],
     /// ColorWarper: 8 points × 2 vec4 ([h,s,dh,ds] then [radius,0,0,0])
     warp: [[f32; 4]; 16],
-    /// [n_warp, has_cs, 0, 0]
+    /// [n_warp, has_cs, sharp_mask, 0]
     csn: [f32; 4],
+    /// post-crop vignette shape [mid, round, feather, 0] (mid<0 = legacy)
+    extra0: [f32; 4],
+    /// [grain_size px, grain_rough, sharp_radius, sharp_detail]
+    extra1: [f32; 4],
+    /// LR camera calibration: 3x3 matrix rows + [shadow_tint,0,0,0]
+    cal0: [f32; 4],
+    cal1: [f32; 4],
+    cal2: [f32; 4],
+    /// LR Texture (global): fine-scale midtone contrast, -1..1
+    tex0: [f32; 4],
+    /// LR Lens Blur bokeh: [highlight_boost, highlight_thresh, aspect, shape]
+    lb0: [f32; 4],
+    /// [spherical_aberration, 0, 0, 0]
+    lb1: [f32; 4],
+    /// LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
+    gb0: [f32; 4],
+    /// measured auto-CA radial scales: [k_r, k_b, 0, 0]
+    ca0: [f32; 4],
+    /// post-profile working-space exit matrix (ProPhoto->sRGB / identity)
+    pp0: [f32; 4],
+    pp1: [f32; 4],
+    pp2: [f32; 4],
+    /// LR bitmap-mask mattes (flag 1024): 3 vec4 per matte index j —
+    /// [w, h, wmbuf word offset, 0], u-row [ux, uy, uc, 0], v-row
+    /// [vx, vy, vc, 0] mapping post-crop nx,ny → bitmap u,v. w==0 = none.
+    wmeta: [[f32; 4]; 48],
+    /// LR PatchMatch remove spots: 3 vec4 per spot —
+    /// [dst_x0, dst_y0, pw, ph], [ell cx, cy, rx, ry], [pmbuf base, opacity, 0, 0].
+    pm: [[f32; 4]; 36],
 }
 
 const WGSL: &str = r#"
@@ -175,7 +217,14 @@ struct Uni {
     misc2: vec4<f32>,
     fx0: vec4<f32>,
     flare: vec4<f32>,
-    wins: array<vec4<f32>, 16>,
+    // defringe bands: amount, lo_deg, hi_deg, unused
+    defr_pu: vec4<f32>,
+    defr_gr: vec4<f32>,
+    wins: array<vec4<f32>, 96>,
+    refines: array<vec4<f32>, 32>,
+    // per-window local point colours: [n,0,0,0] then ≤2 swatches of
+    // [src3,var] [shift3,amt] [hr4] [sr4] [lr4]
+    lpcs: array<vec4<f32>, 176>,
     clones: array<vec4<f32>, 16>,
     qf2: vec4<f32>,
     ze0: vec4<f32>,
@@ -188,6 +237,8 @@ struct Uni {
     lens2: vec4<f32>,
     lens3: vec4<f32>,
     blayers: array<vec4<f32>, 4>,
+    // brush layer extras (contrast,clarity,dehaze,tint,hi,sh,wh,bl)
+    blayers2: array<vec4<f32>, 12>,
     bmisc: vec4<f32>,
     bstr: array<vec4<f32>, 192>,
     // stg0 = [n_stages,0,0,0]; sop0 = per-stage opacity; sinv0 = key invert
@@ -196,10 +247,37 @@ struct Uni {
     sop0: vec4<f32>,
     sinv0: vec4<f32>,
     misc3: vec4<f32>,
-    // ColorSlice wedges + ColorWarper points; csn = [n_warp, has_cs, 0, 0]
+    // ColorSlice wedges + ColorWarper points;
+    // csn = [n_warp, has_cs, sharp_mask, lens_blur]
     cs: array<vec4<f32>, 7>,
     warp: array<vec4<f32>, 16>,
     csn: vec4<f32>,
+    // post-crop vignette shape [mid, round, feather, 0]
+    extra0: vec4<f32>,
+    // [grain cell size, roughness, sharpen radius, sharpen detail]
+    extra1: vec4<f32>,
+    // LR camera calibration: 3x3 matrix rows + [shadow_tint,0,0,0]
+    cal0: vec4<f32>,
+    cal1: vec4<f32>,
+    cal2: vec4<f32>,
+    // LR Texture (global): fine-scale midtone contrast at tex0.x
+    tex0: vec4<f32>,
+    // LR Lens Blur bokeh: [highlight_boost, highlight_thresh, aspect, shape]
+    lb0: vec4<f32>,
+    // [spherical_aberration, 0, 0, 0]
+    lb1: vec4<f32>,
+    // LR grade balance/blend: [SplitToningBalance, ColorGradeBlending, 0, 0]
+    gb0: vec4<f32>,
+    // measured auto-CA radial scales [k_r, k_b]
+    ca0: vec4<f32>,
+    pp0: vec4<f32>,
+    pp1: vec4<f32>,
+    pp2: vec4<f32>,
+    // LR bitmap-mask mattes: per matte index [w,h,wmbuf off,0] + 2x3 affine
+    wmeta: array<vec4<f32>, 48>,
+    // LR PatchMatch remove spots: 3 vec4 per spot —
+    // [dst x0,y0, pw,ph] [ellipse cx,cy,rx,ry] [pmbuf base, opacity, 0,0]
+    pm: array<vec4<f32>, 36>,
 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var<storage, read> rawbuf: array<u32>;
@@ -215,10 +293,23 @@ struct Uni {
 // AI-denoised base cache: [0]=w, [1]=h, then 2 u32 per px (r|g<<16, b), sRGB16
 @group(0) @binding(11) var<storage, read> denbuf: array<u32>;
 @group(0) @binding(12) var<storage, read> subjbuf: array<u32>;
+@group(0) @binding(16) var<storage, read_write> skybuf: array<u32>;
+// profile look table (HsMap): [hd, sd, vd] then cells of
+// [hue_shift_deg, sat_scale, val_scale] in (h,s,v) order, val fastest
+@group(0) @binding(18) var<storage, read> lookbuf: array<f32>;
+// flat packed-u16 store for LR bitmap mask mattes (indexed via pg.wmeta)
+@group(0) @binding(19) var<storage, read> wmbuf: array<u32>;
+// LR PatchMatch source maps: src vec2 per patch px (indexed via pg.pm)
+@group(0) @binding(20) var<storage, read> pmbuf: array<vec2<f32>>;
+// lens blur: matte-res defocused copy of the linear image,
+// [0].xy = (mw,mh), data at [1..]
+@group(0) @binding(17) var<storage, read_write> lbl: array<vec4<f32>>;
 @group(0) @binding(13) var<storage, read> suni: array<Uni>;
 // edge-aware brush seeds: [r,g,b,tol] per stroke, 64 slots per param block
 // (base + one per serial stage), written by seed_main.
 @group(0) @binding(14) var<storage, read_write> seedsb: array<vec4<f32>>;
+// DNG embedded lens-correction ops (header 32 f32, then gainmap data)
+@group(0) @binding(15) var<storage, read> dngb: array<f32>;
 // working copy of the uniform: every kernel seeds it with `pg = u`, and the
 // stage loop in finish_main swaps in suni[i] so all param reads below are
 // shared between the base grade and serial correction stages.
@@ -490,12 +581,17 @@ fn demosaic(vx: u32, vy: u32) -> vec3<f32> {
 }
 
 fn wb_matrix(cam: vec3<f32>) -> vec3<f32> {
-    let cw = clamp(cam * pg.wb.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec3<f32>(
+    // wb.w = 1.0 -> exposure gain applied in camera space before the
+    // matrix+HSM (dng_render order; mirrors CPU expo_early)
+    let eg = select(1.0, pg.a1.x, pg.wb.w > 0.5);
+    let cw = clamp(cam * pg.wb.xyz * eg, vec3<f32>(0.0), vec3<f32>(1.0));
+    // HueSatMap applies in the profile working space (ProPhoto), AFTER the
+    // camera->working matrix — mirrors develop.rs / dng_render.cpp order.
+    return hsm_apply(vec3<f32>(
         dot(pg.m0.xyz, cw),
         dot(pg.m1.xyz, cw),
         dot(pg.m2.xyz, cw),
-    );
+    ));
 }
 
 // x-dispatch is capped at 65535 workgroups; gid.y carries the overflow rows.
@@ -560,8 +656,19 @@ fn lens_fp(model: u32, rd: f32) -> f32 {
     }
     return 1.0 + 3.0 * pg.lens0.y * rd * rd;
 }
-fn inv_dist(model: u32, ru: f32) -> f32 {
+fn inv_dist(model: u32, ru: f32, lens_s: f32) -> f32 {
     if (model == 0u || ru <= 0.0) { return ru; }
+    if (model == 3u) {
+        // Adobe ACM radial part: rd = ru·(1+k1 ru²+k2 ru⁴+k3 ru⁶) defined
+        // on FOCAL-UNIT radius r = dist_px/(foc·Dmax) — convert through
+        // s = halfd/(foc·Dmax). (tangential terms dropped in preview path)
+        let s = max(lens_s, 1e-3);
+        let ruf = ru * s;
+        let r2 = ruf * ruf;
+        let rdf = ruf * (1.0 + pg.lens0.y * r2 + pg.lens0.z * r2 * r2
+            + pg.lens0.w * r2 * r2 * r2);
+        return max(rdf / s, 0.0);
+    }
     var rd = ru;
     for (var k = 0u; k < 5u; k = k + 1u) {
         rd = rd - (lens_f(model, rd) - ru) / max(lens_fp(model, rd), 1e-4);
@@ -602,14 +709,34 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
     let rn = sqrt(dx * dx + dy * dy) / halfd;
     if (rn < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let ru = rn * pg.lens2.w;
-    let rd = inv_dist(u32(pg.lens0.x), ru);
+    let model = u32(pg.lens0.x);
+    // focal-unit conversion factor for Adobe models: halfd/(foc·Dmax)
+    let lens_s = halfd / (max(pg.lens3.z, 1e-3) * max(w, h));
+    let rd = inv_dist(model, ru, lens_s);
     let amt = pg.lens3.w;
-    let att = max(1.0 + pg.lens2.x * ru * ru + pg.lens2.y * ru * ru * ru * ru
-        + pg.lens2.z * ru * ru * ru * ru * ru * ru, 0.05);
+    // Adobe vignette poly is defined on the distorted radius in focal
+    // units: r = dist_px / (vig_foc·Dmax); lensfun PA uses ru directly
+    var rv = ru;
+    if (pg.lens3.x > 0.5) {
+        let dmax = max(w, h);
+        rv = rd * halfd / (max(pg.lens3.y, 1e-3) * dmax);
+    }
+    let r2 = rv * rv;
+    let att = max(1.0 + pg.lens2.x * r2 + pg.lens2.y * r2 * r2
+        + pg.lens2.z * r2 * r2 * r2, 0.05);
     let gain = 1.0 + (1.0 / att - 1.0) * amt;
-    let rr = inv_tca(pg.lens1.x, pg.lens1.y, rd) / pg.lens2.w;
+    // Adobe TCA is a forward warp on rd; lensfun TCA needs inversion
+    var rr = inv_tca(pg.lens1.x, pg.lens1.y, rd);
+    var rb = inv_tca(pg.lens1.z, pg.lens1.w, rd);
+    if (model == 3u) {
+        // fitted Adobe TCA warp is defined on focal units: b·r_f² = b·(s·rd)²
+        let s2 = lens_s * lens_s;
+        rr = rd * (pg.lens1.x + pg.lens1.y * rd * rd * s2);
+        rb = rd * (pg.lens1.z + pg.lens1.w * rd * rd * s2);
+    }
+    rr = rr / pg.lens2.w;
     let rg = rd / pg.lens2.w;
-    let rb = inv_tca(pg.lens1.z, pg.lens1.w, rd) / pg.lens2.w;
+    rb = rb / pg.lens2.w;
     // blend to identity by amount
     let f = 1.0 - amt;
     return vec4<f32>(
@@ -618,6 +745,48 @@ fn lens_geom(x: f32, y: f32, w: f32, h: f32) -> vec4<f32> {
         rb + (rn - rb) * f,
         gain,
     );
+}
+
+// DNG WarpRectilinear: per-channel radial factor f = k0 + k1r² + ... applied
+// on the corrected (display-side) normalized radius, blended by amount
+fn dng_warp(rn: f32, ch: u32, amt: f32) -> f32 {
+    if (pg.dh0.z < 0.5) { return 1.0; }
+    let b = 1u + ch * 6u;
+    let r2 = rn * rn;
+    let f = dngb[b] + r2 * (dngb[b + 1u] + r2 * (dngb[b + 2u] +
+        r2 * (dngb[b + 3u] + r2 * (dngb[b + 4u] + r2 * dngb[b + 5u]))));
+    return 1.0 + (f - 1.0) * amt;
+}
+
+// DNG GainMap: bilinear gain at an image-space source position.
+// Layout: dngb[22..32] = rows,cols,planes,plane0,nplanes,spV,spH,orgV,orgH,-
+fn dng_gain(x: f32, y: f32, ch: u32, w: f32, h: f32, amt: f32) -> f32 {
+    if (pg.dh0.w < 0.5) { return 1.0; }
+    let rows = u32(dngb[22]);
+    let cols = u32(dngb[23]);
+    if (rows < 2u || cols < 2u) { return 1.0; }
+    let plane0 = u32(dngb[25]);
+    let npl = u32(dngb[26]);
+    if (ch < plane0 || ch >= plane0 + npl) { return 1.0; }
+    let planes = u32(dngb[24]);
+    let pl = min(ch, max(planes, 1u) - 1u);
+    let v = (y + 0.5) / h;
+    let u = (x + 0.5) / w;
+    let gy = clamp((v - dngb[29]) / max(dngb[27], 1e-6), 0.0, f32(rows - 1u));
+    let gx = clamp((u - dngb[30]) / max(dngb[28], 1e-6), 0.0, f32(cols - 1u));
+    let y0 = u32(floor(gy));
+    let x0 = u32(floor(gx));
+    let y1 = min(y0 + 1u, rows - 1u);
+    let x1 = min(x0 + 1u, cols - 1u);
+    let ty = gy - f32(y0);
+    let tx = gx - f32(x0);
+    let base = 32u;
+    let g00 = dngb[base + (y0 * cols + x0) * planes + pl];
+    let g01 = dngb[base + (y0 * cols + x1) * planes + pl];
+    let g10 = dngb[base + (y1 * cols + x0) * planes + pl];
+    let g11 = dngb[base + (y1 * cols + x1) * planes + pl];
+    let g = mix(mix(g00, g01, tx), mix(g10, g11, tx), ty);
+    return 1.0 + (g - 1.0) * amt;
 }
 
 // stride-1 + lens: reconstruct cam grid into io_a
@@ -651,8 +820,13 @@ fn geom_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let dy = y - cy;
     let s = vec3<f32>(g.x, g.y, g.z) * halfd / sqrt(dx * dx + dy * dy);
     var out3: vec3<f32>;
+    let amt = pg.lens3.w;
+    let rn = sqrt(dx * dx + dy * dy) / halfd;
     for (var ch = 0u; ch < 3u; ch = ch + 1u) {
-        out3[ch] = lens_bilinear(cx + dx * s[ch], cy + dy * s[ch], ch);
+        let s_ch = s[ch] * dng_warp(rn, ch, amt);
+        let px = cx + dx * s_ch;
+        let py = cy + dy * s_ch;
+        out3[ch] = lens_bilinear(px, py, ch) * dng_gain(px, py, ch, w, h, amt);
     }
     io_b[i] = vec4<f32>(out3 * g.w, 1.0);
 }
@@ -685,10 +859,15 @@ fn demosaic_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
             let halfd = max(sqrt(cx * cx + cy * cy), 1.0);
             let dx = x - cx;
             let dy = y - cy;
-            let sc = g.y * halfd / sqrt(dx * dx + dy * dy);
+            let rn = sqrt(dx * dx + dy * dy) / halfd;
+            let sc = g.y * halfd * dng_warp(rn, 1u, pg.lens3.w)
+                / sqrt(dx * dx + dy * dy);
             let sx = min(u32(round(cx + dx * sc)), pg.g1.x - 1u);
             let sy = min(u32(round(cy + dy * sc)), pg.g1.y - 1u);
-            cam = demosaic(sx, sy) * g.w;
+            let st = f32(pg.g1.z);
+            cam = demosaic(sx, sy) * g.w
+                * dng_gain((cx + dx * sc) * st, (cy + dy * sc) * st, 1u,
+                    w * st, h * st, pg.lens3.w);
         }
     } else {
         cam = demosaic(i % pg.g1.x, i / pg.g1.x);
@@ -747,6 +926,56 @@ fn subj_at(ix: i32, iy: i32) -> f32 {
     return f32(v) / 65535.0;
 }
 
+// heuristic sky matte (LR sky AI masks) — same packed u16 layout as
+// subjbuf, written by skymat_main at frame resolution.
+fn sky_at(ix: i32, iy: i32) -> f32 {
+    let w = i32(skybuf[0]);
+    let h = i32(skybuf[1]);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = skybuf[2u + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn sky_bil(nx: f32, ny: f32) -> f32 {
+    let fx = nx * f32(skybuf[0]) - 0.5;
+    let fy = ny * f32(skybuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(sky_at(x0, y0), sky_at(x0 + 1, y0), tx);
+    let b = mix(sky_at(x0, y0 + 1), sky_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
+// vegetation matte: second packed region after the sky words in skybuf
+fn veg_at(ix: i32, iy: i32) -> f32 {
+    let w = i32(skybuf[0]);
+    let h = i32(skybuf[1]);
+    let npw = (u32(w) * u32(h) + 1u) / 2u;
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = skybuf[2u + npw + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn veg_bil(nx: f32, ny: f32) -> f32 {
+    let fx = nx * f32(skybuf[0]) - 0.5;
+    let fy = ny * f32(skybuf[1]) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(veg_at(x0, y0), veg_at(x0 + 1, y0), tx);
+    let b = mix(veg_at(x0, y0 + 1), veg_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
 // bilinear sample of the subject matte at a normalized position
 fn subj_bil(nx: f32, ny: f32) -> f32 {
     let fx = nx * f32(subjbuf[0]) - 0.5;
@@ -757,6 +986,39 @@ fn subj_bil(nx: f32, ny: f32) -> f32 {
     let ty = fy - f32(y0);
     let a = mix(subj_at(x0, y0), subj_at(x0 + 1, y0), tx);
     let b = mix(subj_at(x0, y0 + 1), subj_at(x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
+}
+
+// LR bitmap mask matte (extracted .lrcat-data blob): flat wmbuf, per-matte
+// [w,h,word_off,0] + 2x3 affine rows in pg.wmeta (mirrors WMatte in
+// develop.rs). u16 luma packed 2-per-u32.
+fn wmat_at(mt: vec4<f32>, ix: i32, iy: i32) -> f32 {
+    let w = i32(mt.x);
+    let h = i32(mt.y);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
+    let idx = u32(y * w + x);
+    let word = wmbuf[u32(mt.z) + idx / 2u];
+    let v = select(word >> 16u, word & 0xFFFFu, (idx & 1u) == 0u);
+    return f32(v) / 65535.0;
+}
+
+fn wmat_bil(mi: u32, nx: f32, ny: f32) -> f32 {
+    let mt = pg.wmeta[mi * 3u];
+    if (mt.x < 1.0) { return 0.0; }
+    let ru = pg.wmeta[mi * 3u + 1u];
+    let rv = pg.wmeta[mi * 3u + 2u];
+    let u = nx * ru.x + ny * ru.y + ru.z;
+    let v = nx * rv.x + ny * rv.y + rv.z;
+    if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) { return 0.0; }
+    let fx = u * mt.x - 0.5;
+    let fy = v * mt.y - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let a = mix(wmat_at(mt, x0, y0), wmat_at(mt, x0 + 1, y0), tx);
+    let b = mix(wmat_at(mt, x0, y0 + 1), wmat_at(mt, x0 + 1, y0 + 1), tx);
     return mix(a, b, ty);
 }
 
@@ -923,6 +1185,60 @@ fn heal_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
             c = mix(c, sv + acc, blend);
         }
     }
+    // LR PatchMatch remove spots: per-pixel source coords from pmbuf
+    // (mirrors pm_heal_lin in develop.rs — keep in sync)
+    for (var s = 0u; s < 12u; s = s + 1u) {
+        let pr = pg.pm[s * 3u];
+        if (pr.z <= 0.0) { continue; }
+        let pxf = vec2<f32>(f32(i % w), f32(i / w));
+        let sc = pg.pm[s * 3u + 2u].z;
+        let lx = i32(floor((pxf.x - pr.x) / sc));
+        let ly = i32(floor((pxf.y - pr.y) / sc));
+        if (lx < 0 || ly < 0 || lx >= i32(pr.z) || ly >= i32(pr.w)) { continue; }
+        let base = u32(pg.pm[s * 3u + 2u].x);
+        let own = pmbuf[base + u32(ly) * u32(pr.z) + u32(lx)];
+        let ep = pg.pm[s * 3u + 1u];
+        let dd = length(vec2<f32>(
+            (pxf.x - ep.x) / max(ep.z, 1.0),
+            (pxf.y - ep.y) / max(ep.w, 1.0),
+        ));
+        let blend = (1.0 - sstep(0.7, 1.0, dd)) * pg.pm[s * 3u + 2u].y;
+        if (blend <= 0.0) { continue; }
+        // per-px low-freq correction LP(t − sv): 4×4 tap grid spanning
+        // ±0.75·patch/4. Source fetch is a 13-tap box at ±2 px — LR applies
+        // PatchMatch maps in the gradient domain (Method="poisson"), so the
+        // source must not inject per-px outliers (mirrors pm_heal_lin).
+        let tap_r = max(max(pr.z, pr.w) * sc * 0.25, 1.0);
+        var acc = vec3<f32>(0.0);
+        for (var gy = 0u; gy < 4u; gy = gy + 1u) {
+            for (var gx = 0u; gx < 4u; gx = gx + 1u) {
+                let tp = pxf - vec2<f32>(tap_r) + vec2<f32>((f32(gx) + 0.5) * tap_r * 0.5, (f32(gy) + 0.5) * tap_r * 0.5);
+                var so = own;
+                let tx = i32(floor((tp.x - pr.x) / sc));
+                let ty = i32(floor((tp.y - pr.y) / sc));
+                if (tx >= 0 && ty >= 0 && tx < i32(pr.z) && ty < i32(pr.w)) {
+                    so = pmbuf[base + u32(ty) * u32(pr.z) + u32(tx)];
+                }
+                let t = px_at(i32(tp.x + 0.5), i32(tp.y + 0.5));
+                var svv = vec3<f32>(0.0);
+                for (var oy = -2i; oy <= 2i; oy = oy + 1i) {
+                    for (var ox = -2i; ox <= 2i; ox = ox + 1i) {
+                        if ((ox + oy) % 2 != 0i) { continue; }
+                        svv = svv + px_at(i32(so.x + 0.5) + ox, i32(so.y + 0.5) + oy) / 13.0;
+                    }
+                }
+                acc = acc + (t - svv) / 16.0;
+            }
+        }
+        var sv = vec3<f32>(0.0);
+        for (var oy = -2i; oy <= 2i; oy = oy + 1i) {
+            for (var ox = -2i; ox <= 2i; ox = ox + 1i) {
+                if ((ox + oy) % 2 != 0i) { continue; }
+                sv = sv + px_at(i32(own.x + 0.5) + ox, i32(own.y + 0.5) + oy) / 13.0;
+            }
+        }
+        c = mix(c, sv + acc, blend);
+    }
     // clone stamps: copy the source patch into the destination circle
     let nc = u32(pg.misc2.y);
     for (var s = 0u; s < nc; s = s + 1u) {
@@ -952,6 +1268,15 @@ fn hue_to_rgb(h: f32) -> vec3<f32> {
     let a = seg_a[i];
     let b = seg_a[(i + 1u) % 6u];
     return a + (b - a) * f;
+}
+
+// soft-edged membership in a circular hue band (degrees, 5 deg feather)
+fn hue_band(deg: f32, lo: f32, hi: f32) -> f32 {
+    let mid = (lo + hi) * 0.5;
+    var d = abs(deg - mid);
+    if (d > 180.0) { d = 360.0 - d; }
+    let half = max(abs(hi - lo) * 0.5, 0.5);
+    return 1.0 - sstep(half, half + 5.0, d);
 }
 
 fn rgb_to_hsv(x: vec3<f32>) -> vec3<f32> {
@@ -1058,12 +1383,30 @@ fn sharpen_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     let src = io_a[i].xyz;
     var out = src;
     if (pg.a3.x != 0.0) {
-        out = src + pg.a3.x * 0.8 * (src - box_at(i % w, i / w, 1));
+        // radius: interpolate between integer box radii; detail blends
+        // the coarse-band and fine 3x3 deltas.
+        let rf = clamp(pg.extra1.z, 1.0, 3.0);
+        let ra = i32(floor(rf));
+        let rb = min(ra + 1, 3);
+        let rt = rf - f32(ra);
+        let da = src - box_at(i % w, i / w, ra);
+        let db = src - box_at(i % w, i / w, rb);
+        var d = da + (db - da) * rt;
+        if (pg.extra1.w > 0.0) {
+            let dfine = src - box_at(i % w, i / w, 1);
+            d = d * (1.0 - pg.extra1.w) + dfine * pg.extra1.w;
+        }
+        // LR "Masking": suppress the unsharp delta on flat areas.
+        let edge = abs(dot(d, vec3<f32>(0.2126, 0.7152, 0.0722)));
+        let ms = 1.0 - pg.csn.z * (1.0 - sstep(0.006, 0.05, edge));
+        out = src + pg.a3.x * 0.8 * d * ms;
     }
-    if (pg.a3.z != 0.0) {
+    if (pg.a3.z != 0.0 || pg.tex0.x != 0.0) {
         let lum = clamp(luma(src), 0.0, 1.0);
         let mid = 4.0 * lum * (1.0 - lum);
         out = out + pg.a3.z * 0.6 * mid * (src - box_at(i % w, i / w, 2));
+        // LR Texture: finer (3x3) scale, lower gain — mirrors develop.rs
+        out = out + pg.tex0.x * 0.45 * mid * (src - box_at(i % w, i / w, 1));
     }
     io_b[i] = vec4<f32>(out, 0.0);
 }
@@ -1156,8 +1499,209 @@ fn qual_mask(c: vec3<f32>) -> f32 {
     return mask;
 }
 
+// DNG ProfileLookTable / ProfileHueSatMap: trilinear HSV shift map.
+// Mirrors HsMap::lookup + apply in dcp.rs. lookbuf layout:
+//   [0..4] look dims+enc flag, look cells, 256 tone-curve floats,
+//   [..+4] hsm dims+enc flag, hsm cells
+fn map_cell(base: u32, h: u32, s: u32, v: u32, c: u32) -> f32 {
+    let hd = u32(lookbuf[base]);
+    let sd = u32(lookbuf[base + 1u]);
+    // dng_hue_sat_map storage: value outer, hue middle, sat fastest
+    let i = base + 4u + ((v * hd + h) * sd + s) * 3u + c;
+    return lookbuf[i];
+}
+
+fn map_srgb_encode(x: f32) -> f32 {
+    let xc = clamp(x, 0.0, 1.0);
+    return select(1.055 * pow(xc, 1.0 / 2.4) - 0.055, 12.92 * xc, xc <= 0.0031308);
+}
+fn map_srgb_decode(x: f32) -> f32 {
+    let xc = clamp(x, 0.0, 1.0);
+    return select(pow((xc + 0.055) / 1.055, 2.4), xc / 12.92, xc <= 0.04045);
+}
+
+fn map_apply(base: u32, x: vec3<f32>) -> vec3<f32> {
+    let hd = u32(lookbuf[base]);
+    let sd = u32(lookbuf[base + 1u]);
+    let vd = u32(lookbuf[base + 2u]);
+    if (hd < 1u || sd < 1u || vd < 1u) { return x; }
+    let enc = lookbuf[base + 3u] > 0.5;
+    let hsv = rgb_to_hsv(x);
+    // no neutral early-out: the map's val scale applies to neutrals too
+    // (mirrors dcp.rs HsMap::apply — Adobe Standard lifts shadows ~1.2x)
+    let hf = fract(hsv.x) * f32(hd);
+    let h0 = min(u32(hf), hd - 1u);
+    let h1 = (h0 + 1u) % hd;
+    let ht = hf - f32(h0);
+    let sf = max(min(hsv.y * f32(sd - 1u), f32(sd - 1u) - 1e-6), 0.0);
+    let s0 = u32(sf);
+    let s1 = min(s0 + 1u, sd - 1u);
+    let st = sf - f32(s0);
+    // sRGB-encoded maps (ProfileLookTableEncoding=1): the V coordinate is
+    // encoded for the lookup and the scaled result decoded back — mirrors
+    // dng_reference.cpp RefBaselineHueSatMap / dcp.rs HsMap::apply
+    var v_enc = hsv.z;
+    if (enc && vd > 1u) { v_enc = map_srgb_encode(hsv.z); }
+    let vf = max(min(v_enc * f32(vd - 1u), f32(vd - 1u) - 1e-6), 0.0);
+    let v0 = u32(vf);
+    let v1 = min(v0 + 1u, vd - 1u);
+    let vt = vf - f32(v0);
+    var d = vec3<f32>();
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        let c00 = mix(
+            mix(map_cell(base, h0, s0, v0, c), map_cell(base, h0, s1, v0, c), st),
+            mix(map_cell(base, h0, s0, v1, c), map_cell(base, h0, s1, v1, c), st),
+            vt);
+        let c11 = mix(
+            mix(map_cell(base, h1, s0, v0, c), map_cell(base, h1, s1, v0, c), st),
+            mix(map_cell(base, h1, s0, v1, c), map_cell(base, h1, s1, v1, c), st),
+            vt);
+        if (c == 0u) {
+            // hue shift: interpolate on the circle
+            var dd = c11 - c00;
+            if (dd > 180.0) { dd = dd - 360.0; }
+            if (dd < -180.0) { dd = dd + 360.0; }
+            d.x = c00 + dd * ht;
+        } else {
+            let v2 = c00 + (c11 - c00) * ht;
+            if (c == 1u) { d.y = v2; } else { d.z = v2; }
+        }
+    }
+    var v2 = clamp(v_enc * d.z, 0.0, 1.0);
+    if (enc) { v2 = map_srgb_decode(v2); }
+    return hsv_to_rgb(hsv.x + d.x / 360.0, clamp(hsv.y * d.y, 0.0, 1.0), v2);
+}
+
+fn look_apply(x: vec3<f32>) -> vec3<f32> {
+    return map_apply(0u, x);
+}
+
+// DNG ProfileHueSatMap — trilinear map evaluated in the profile working
+// space (ProPhoto) after the camera->working matrix (mirrors colorize_plane).
+fn hsm_apply(x: vec3<f32>) -> vec3<f32> {
+    let base = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u + 256u;
+    return map_apply(base, x);
+}
+
+// ---- LR Point Color (crs:PointColors) — mirrors pc_apply in develop.rs ---
+fn trap01(x: f32, ln: f32, lf: f32, uf: f32, un: f32) -> f32 {
+    var up = 0.0;
+    if (lf > ln + 1e-6) { up = clamp((x - ln) / (lf - ln), 0.0, 1.0); }
+    else if (x >= lf) { up = 1.0; }
+    var dn = 0.0;
+    if (un > uf + 1e-6) { dn = clamp((un - x) / (un - uf), 0.0, 1.0); }
+    else if (x <= uf) { dn = 1.0; }
+    return min(up, dn);
+}
+
+fn pc_base() -> u32 {
+    let lk = u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]);
+    let hb = 4u + lk * 3u + 256u;
+    let hm = u32(lookbuf[hb]) * u32(lookbuf[hb + 1u]) * u32(lookbuf[hb + 2u]);
+    return hb + 4u + hm * 3u;
+}
+
+fn pc_apply(x: vec3<f32>) -> vec3<f32> {
+    let pb = pc_base();
+    let n = min(u32(lookbuf[pb]), 8u);
+    if (n == 0u) { return x; }
+    var out = x;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let b = pb + 1u + i * 20u;
+        let hsv = rgb_to_hsv(out);
+        let lum = hsv.z; // LR "lum" ≈ brightness (see pc_apply)
+        let k = max(lookbuf[b + 6u] * 2.0, 0.0);
+        // scale each trapezoid about its centre (RangeAmount semantics)
+        var hr = vec4<f32>(lookbuf[b + 7u], lookbuf[b + 8u], lookbuf[b + 9u], lookbuf[b + 10u]);
+        var sr = vec4<f32>(lookbuf[b + 11u], lookbuf[b + 12u], lookbuf[b + 13u], lookbuf[b + 14u]);
+        var lr = vec4<f32>(lookbuf[b + 15u], lookbuf[b + 16u], lookbuf[b + 17u], lookbuf[b + 18u]);
+        let hc = (hr.x + hr.w) * 0.5;
+        let sc = (sr.x + sr.w) * 0.5;
+        let lc = (lr.x + lr.w) * 0.5;
+        hr = clamp(hc + (hr - vec4<f32>(hc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        sr = clamp(sc + (sr - vec4<f32>(sc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        lr = clamp(lc + (lr - vec4<f32>(lc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+        let hpos = fract(hsv.x - lookbuf[b + 0u] + 0.5);
+        let wh = trap01(hpos, hr.x, hr.y, hr.z, hr.w);
+        let w = wh * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
+            * trap01(lum, lr.x, lr.y, lr.z, lr.w);
+        if (w > 1e-4) {
+            // full-strength shift, blended by the selection weight
+            let xs = hsv_to_rgb(
+                fract(hsv.x + lookbuf[b + 3u] * 0.5 + 1.0),
+                clamp(hsv.y * (1.0 + lookbuf[b + 4u]), 0.0, 1.0),
+                max(hsv.z * (1.0 + lookbuf[b + 5u]), 0.0));
+            let vrr = lookbuf[b + 19u];
+            var tgt = xs;
+            if (abs(vrr) > 1e-4) {
+                // push away from / pull toward the "after" swatch colour
+                let a = hsv_to_rgb(
+                    fract(lookbuf[b + 0u] + lookbuf[b + 3u] * 0.5 + 1.0),
+                    clamp(lookbuf[b + 1u] * (1.0 + lookbuf[b + 4u]), 0.0, 1.0),
+                    max(lookbuf[b + 2u] * (1.0 + lookbuf[b + 5u]), 0.0));
+                tgt = a + (xs - a) * (1.0 + vrr);
+            }
+            out = out + (tgt - out) * w;
+        }
+    }
+    return out;
+}
+
 fn adjust(px: vec3<f32>) -> vec3<f32> {
-    var x = px * pg.a1.x;
+    // camera calibration: primary hue/sat matrix + shadow green/magenta
+    var x = px;
+    if (abs(pg.cal0.x - 1.0) > 1e-5 || abs(pg.cal1.y - 1.0) > 1e-5
+        || abs(pg.cal2.z - 1.0) > 1e-5 || abs(pg.cal0.y) > 1e-5
+        || abs(pg.cal0.z) > 1e-5 || abs(pg.cal1.x) > 1e-5
+        || abs(pg.cal1.z) > 1e-5 || abs(pg.cal2.x) > 1e-5
+        || abs(pg.cal2.y) > 1e-5) {
+        x = vec3<f32>(
+            dot(pg.cal0.xyz, x),
+            dot(pg.cal1.xyz, x),
+            dot(pg.cal2.xyz, x));
+    }
+    if (pg.cal0.w != 0.0) {
+        let l = luma(x);
+        x = vec3<f32>(x.x, x.y - pg.cal0.w * (1.0 - sstep(0.0, 0.4, l)) * 0.05, x.z);
+    }
+    // exposure — scene-linear gain before the profile's nonlinear ops
+    // (ACR pushes hot data into the tone shoulder, mirrors develop.rs)
+    x = x * select(pg.a1.x, 1.0, pg.wb.w > 0.5);
+    // profile look table (DCP/XMP)
+    x = look_apply(x);
+    // DCP ProfileToneCurve — appended to lookbuf after the look cells;
+    // evaluated via DNG RefBaselineRGBTone (max, mid, min) sorted operator
+    // so mid-channel hue ratio (mid-min)/(max-min) stays invariant.
+    if (pg.bmisc.w > 0.5) {
+        let pto = 4u + u32(lookbuf[0]) * u32(lookbuf[1]) * u32(lookbuf[2]) * 3u;
+        let hi = max(x.x, max(x.y, x.z));
+        let lo = min(x.x, min(x.y, x.z));
+        let mid = x.x + x.y + x.z - hi - lo;
+        let span = hi - lo;
+        var w = 0.0;
+        if (span > 1e-6) { w = (mid - lo) / span; }
+        let hi_o = lookbuf[pto + u32(clamp(hi, 0.0, 1.0) * 255.0)];
+        let lo_o = lookbuf[pto + u32(clamp(lo, 0.0, 1.0) * 255.0)];
+        let mid_o = lo_o + w * (hi_o - lo_o);
+        var ox = vec3<f32>(mid_o);
+        if (x.x >= x.y && x.x >= x.z) {
+            ox.x = hi_o;
+            if (x.y >= x.z) { ox.z = lo_o; } else { ox.y = lo_o; }
+        } else if (x.y >= x.x && x.y >= x.z) {
+            ox.y = hi_o;
+            if (x.x >= x.z) { ox.z = lo_o; } else { ox.x = lo_o; }
+        } else {
+            ox.z = hi_o;
+            if (x.x >= x.y) { ox.y = lo_o; } else { ox.x = lo_o; }
+        }
+        x = ox;
+    }
+    // exit the profile working space (ProPhoto -> sRGB; identity when
+    // no profile resolved) — mirrors develop.rs post_profile
+    x = vec3<f32>(
+        dot(pg.pp0.xyz, x),
+        dot(pg.pp1.xyz, x),
+        dot(pg.pp2.xyz, x));
     // auto-contrast percentile remap
     if (pg.misc.y - pg.misc.x < 0.999 || pg.misc.x > 0.001) {
         x = (x - vec3<f32>(pg.misc.x)) / max(pg.misc.y - pg.misc.x, 0.02);
@@ -1189,9 +1733,23 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let tl = clamp(luma(x), 0.0, 1.6);
         // clamp evaluation luma to bound the y/l gain — mirrors develop.rs
         let le = max(tl, 0.04);
-        x = x * (tone_at(le / 1.6) / le);
+        var g = tone_at(le / 1.6) / le;
+        // mirrors develop.rs: >+1EV pushes evaluate the LUT in the
+        // sRGB-encoded (Melissa) domain — slider bands pivot on encoded luma
+        if (pg.qh.w > 1.0) {
+            let e = srgb_encode(min(le, 1.0));
+            g = srgb_decode(clamp(tone_at(e / 1.6), 0.0, 1.6)) / le;
+        }
+        x = x * min(g, 32.0);
     }
-    x = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
+    // contrast about pivot + soft-limit ~[0,1.35] — mirrors develop.rs
+    if (pg.a1.y != 0.0) {
+        let v = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
+        // eps tiny: softmin/softmax leaves ~eps/2 floor at black —
+        // mirrors develop.rs
+        let s = (v + sqrt(v * v + vec3<f32>(1e-7))) * 0.5;
+        x = vec3<f32>(1.35) - (vec3<f32>(1.35) - s + sqrt((vec3<f32>(1.35) - s) * (vec3<f32>(1.35) - s) + vec3<f32>(1e-7))) * 0.5;
+    }
     if (pg.a2.z != 0.0 || pg.a2.w != 0.0) {
         let luma2 = luma(x);
         let mx = max(x.x, max(x.y, x.z));
@@ -1201,15 +1759,50 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let s = max(1.0 + pg.a2.z + pg.a2.w * (1.0 - sat_now), 0.0);
         x = vec3<f32>(luma2) + (x - vec3<f32>(luma2)) * s;
     }
+    // defringe (LR): desaturate chromatic pixels inside the purple and
+    // green hue bands — mirrors develop.rs
+    if (pg.defr_pu.x > 0.0 || pg.defr_gr.x > 0.0) {
+        let hsv = rgb_to_hsv(x);
+        let deg = hsv.x * 360.0;
+        let kp = pg.defr_pu.x * hue_band(deg, pg.defr_pu.y, pg.defr_pu.z)
+            + pg.defr_gr.x * hue_band(deg, pg.defr_gr.y, pg.defr_gr.z);
+        let k = kp * sstep(0.05, 0.3, hsv.y);
+        if (k > 0.0) {
+            x = hsv_to_rgb(hsv.x, max(hsv.y * (1.0 - k), 0.0), hsv.z);
+        }
+    }
     // split toning (shadow / midtone / highlight)
     if (pg.st0.w > 0.0 || pg.st1.w > 0.0 || pg.mt0.w > 0.0) {
         let lum = luma(x);
-        let ws = (1.0 - sstep(0.0, 0.55, lum)) * pg.st0.w;
-        let wh = sstep(0.45, 1.0, lum) * pg.st1.w;
-        let wm = max(1.0 - abs(lum - 0.5) * 2.0, 0.0) * pg.mt0.w;
-        x = x + ws * (pg.st0.xyz - vec3<f32>(lum)) * 0.5
-            + wh * (pg.st1.xyz - vec3<f32>(lum)) * 0.5
-            + wm * (pg.mt0.xyz - vec3<f32>(lum)) * 0.5;
+        // LR SplitToningBalance shifts the crossover; ColorGradeBlending
+        // widens/narrows the overlap — mirrors develop.rs
+        let sp = 0.5 + pg.gb0.x * 0.2;
+        let bw = 0.7 + pg.gb0.y * 0.6;
+        // LR fSplitTone semantics: per-channel gain operator
+        // x' = g*x/(x*(g-1)+1) in sRGB-encoded domain, weighted by maps
+        // computed on encoded luma — mirrors develop.rs (gk = 0.2).
+        let le = srgb_encode(clamp(lum, 0.0, 1.0));
+        let ws = (1.0 - sstep(sp - 0.5 * bw, sp + 0.05 * bw, le)) * pg.st0.w;
+        let wh = sstep(sp - 0.05 * bw, sp + 0.5 * bw, le) * pg.st1.w;
+        let wm = max(1.0 - abs(le - sp) * 2.0 / bw, 0.0) * pg.mt0.w;
+        var xd = vec3<f32>(
+            srgb_encode(clamp(x.x, 0.0, 1.0)),
+            srgb_encode(clamp(x.y, 0.0, 1.0)),
+            srgb_encode(clamp(x.z, 0.0, 1.0)));
+        let wheels = array<vec4<f32>, 3>(pg.st0, pg.mt0, pg.st1);
+        let wts = array<f32, 3>(ws, wm, wh);
+        for (var wi = 0u; wi < 3u; wi = wi + 1u) {
+            let w = wts[wi];
+            if (w <= 0.0) { continue; }
+            let col = wheels[wi].xyz;
+            let cl = 0.2126 * col.x + 0.7152 * col.y + 0.0722 * col.z;
+            let g = max(exp(vec3<f32>(w * 0.2) * (col - vec3<f32>(cl))), vec3<f32>(0.05));
+            xd = g * xd / (xd * (g - vec3<f32>(1.0)) + vec3<f32>(1.0));
+        }
+        x = vec3<f32>(
+            srgb_decode(clamp(xd.x, 0.0, 1.0)),
+            srgb_decode(clamp(xd.y, 0.0, 1.0)),
+            srgb_decode(clamp(xd.z, 0.0, 1.0)));
     }
     // HDR zone wheels
     let zones = array<vec4<f32>, 4>(pg.z0, pg.z1, pg.z2, pg.z3);
@@ -1242,20 +1835,22 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let g = dot(pg.mono0.xyz, x);
         x = vec3<f32>(g);
     }
-    x = vec3<f32>(
-        lut[u32(pg.misc3.x) + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-        lut[u32(pg.misc3.x) + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-        lut[u32(pg.misc3.x) + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
-    );
-    // per-channel custom curves (lut offsets 256/512/768)
-    if (pg.fx0.w > 0.5) {
-        x = vec3<f32>(
-            lut[u32(pg.misc3.x) + 256u + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
-            lut[u32(pg.misc3.x) + 512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
-            lut[u32(pg.misc3.x) + 768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
-        );
+    // PV2012-style overrange: channels above white fold toward the luma
+    // on an exponential shoulder so hot colors converge to ~white
+    // instead of hard-clipping at the curve LUT (mirrors develop.rs)
+    let omax = max(x.x, max(x.y, x.z));
+    if (omax > 1.0) {
+        let ol = clamp(luma(x), 0.0, 1.0);
+        let oh = max(1.0 - ol, 0.02);
+        for (var c = 0; c < 3; c++) {
+            let oe = x[c] - ol;
+            if (oe > 0.0) {
+                x[c] = ol + oh * (1.0 - exp(-oe / oh));
+            }
+        }
     }
-    // hue-domain curves (lut offsets 1024 hh | 1280 hs | 1536 hl | 1792 ls | 2048 ss)
+    // hue-domain curves BEFORE the tone LUT — LR order (HSL tuner at cb0[7]
+    // precedes RGBTone2 at cb0[8]); mirrors develop.rs hsl_first.
     if (pg.misc2.z > 0.5) {
         let hsv = rgb_to_hsv(x);
         let lum = luma(x);
@@ -1268,6 +1863,39 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
         let l3 = luma(x2);
         if (l3 > 1e-5) { x2 = x2 * (l2 / l3); }
         x = x2;
+    }
+    {
+        let xc = max(x, vec3<f32>(0.0));
+        let hi = max(xc.x, max(xc.y, xc.z));
+        let lo = min(xc.x, min(xc.y, xc.z));
+        let mid = xc.x + xc.y + xc.z - hi - lo;
+        let span = hi - lo;
+        var w = 0.0;
+        if (span > 1e-6) { w = (mid - lo) / span; }
+        let lb = u32(pg.misc3.x);
+        let hi_o = lut[lb + u32(clamp(hi, 0.0, 1.0) * 255.0)];
+        let lo_o = lut[lb + u32(clamp(lo, 0.0, 1.0) * 255.0)];
+        let mid_o = lo_o + w * (hi_o - lo_o);
+        var ox = vec3<f32>(mid_o);
+        if (xc.x >= xc.y && xc.x >= xc.z) {
+            ox.x = hi_o;
+            if (xc.y >= xc.z) { ox.z = lo_o; } else { ox.y = lo_o; }
+        } else if (xc.y >= xc.x && xc.y >= xc.z) {
+            ox.y = hi_o;
+            if (xc.x >= xc.z) { ox.z = lo_o; } else { ox.x = lo_o; }
+        } else {
+            ox.z = hi_o;
+            if (xc.x >= xc.y) { ox.y = lo_o; } else { ox.x = lo_o; }
+        }
+        x = ox;
+    }
+    // per-channel custom curves (lut offsets 256/512/768)
+    if (pg.fx0.w > 0.5) {
+        x = vec3<f32>(
+            lut[u32(pg.misc3.x) + 256u + u32(clamp(x.x, 0.0, 1.0) * 255.0)],
+            lut[u32(pg.misc3.x) + 512u + u32(clamp(x.y, 0.0, 1.0) * 255.0)],
+            lut[u32(pg.misc3.x) + 768u + u32(clamp(x.z, 0.0, 1.0) * 255.0)],
+        );
     }
     // ColorSlice (7 hue wedges) + ColorWarper — mirrors develop.rs
     if (pg.csn.y > 0.5 || pg.csn.x > 0.5) {
@@ -1309,6 +1937,7 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
                 clamp(hsv.z * (1.0 + dl), 0.0, 8.0));
         }
     }
+    x = pc_apply(x);
     // HSL qualifier (also runs for highlight-only preview when pg.qf2.w is set)
     if (pg.qf.x > 0.5 || pg.qf2.w > 0.5) {
         let hsv = rgb_to_hsv(x);
@@ -1357,6 +1986,22 @@ fn bil_ch(sx: f32, sy: f32, ch: u32) -> f32 {
     let a = mix(io_a[i00][ch], io_a[i00 + 1u][ch], tx);
     let b = mix(io_a[i00 + sw][ch], io_a[i00 + sw + 1u][ch], tx);
     return mix(a, b, ty);
+}
+
+// bilinear cell noise for the grain low-frequency component; cell ids
+// feed the same integer hash so CPU/GPU grain fields match.
+fn cell_noise(p: vec2<f32>, cell: f32, seed: f32) -> f32 {
+    let fx = p.x / cell;
+    let fy = p.y / cell;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let n00 = hash(vec2<f32>(x0, y0), seed);
+    let n10 = hash(vec2<f32>(x0 + 1.0, y0), seed);
+    let n01 = hash(vec2<f32>(x0, y0 + 1.0), seed);
+    let n11 = hash(vec2<f32>(x0 + 1.0, y0 + 1.0), seed);
+    return mix(mix(n00, n10, tx), mix(n01, n11, tx), ty);
 }
 
 fn hash(p: vec2<f32>, seed: f32) -> f32 {
@@ -1425,14 +2070,234 @@ fn seed_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     seedsb[k * 64u + si] = vec4<f32>(c, e1.w);
 }
 
+// heuristic sky matte (LR sky AI masks): one thread writes one packed
+// u32 (two matte texels). The matte is capped at 384px and blurred —
+// two 3x3 box passes = one 5x5 triangular filter, evaluated directly
+// so CPU and GPU mattes match. Mirrors sky_matte() in develop.rs.
+@compute @workgroup_size(256)
+fn skymat_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
+    let i = flat_index(gid, num);
+    let w = pg.g2.x;
+    let h = pg.g2.y;
+    let mw = min(w, 384u);
+    let mh = min(h, 384u);
+    let np = mw * mh;
+    if (i * 2u >= np) { return; }
+    let npw = (np + 1u) / 2u;
+    if (i == 0u) { skybuf[0] = mw; skybuf[1] = mh; }
+    var packed = 0u;
+    var pveg = 0u;
+    for (var k = 0u; k < 2u; k = k + 1u) {
+        let px = i * 2u + k;
+        if (px < np) {
+            let mx = i32(px % mw);
+            let my = i32(px / mw);
+            var acc = 0.0;
+            var vacc = 0.0;
+            var wsum = 0.0;
+            for (var dy = -2; dy <= 2; dy = dy + 1) {
+                for (var dx = -2; dx <= 2; dx = dx + 1) {
+                    let nx2 = mx + dx;
+                    let ny2 = my + dy;
+                    if (nx2 < 0 || ny2 < 0 || nx2 >= i32(mw) || ny2 >= i32(mh)) {
+                        continue;
+                    }
+                    let sw = f32((3 - abs(dx)) * (3 - abs(dy)));
+                    let sx = min(u32((f32(nx2) + 0.5) / f32(mw) * f32(w)), w - 1u);
+                    let sy = min(u32((f32(ny2) + 0.5) / f32(mh) * f32(h)), h - 1u);
+                    let c = io_a[sy * w + sx].xyz;
+                    let hsv = rgb_to_hsv(c);
+                    var dh = abs(hsv.x * 360.0 - 217.5);
+                    if (dh > 180.0) { dh = 360.0 - dh; }
+                    let hg = 1.0 - sstep(37.5, 60.0, dh);
+                    let sg = max(sstep(0.08, 0.30, hsv.y),
+                                 sstep(0.55, 0.8, hsv.z) * (1.0 - sstep(0.06, 0.18, hsv.y)) * 0.6);
+                    let lg = sstep(0.12, 0.45, hsv.z);
+                    let vert = 0.35 + 0.65 * (1.0 - f32(ny2) / f32(mh));
+                    acc = acc + clamp(hg * sg * lg * vert, 0.0, 1.0) * sw;
+                    // vegetation: green hue band × saturation × brightness
+                    var vd = abs(hsv.x * 360.0 - 120.0);
+                    if (vd > 180.0) { vd = 360.0 - vd; }
+                    let vh = 1.0 - sstep(45.0, 75.0, vd);
+                    vacc = vacc + clamp(vh * sstep(0.15, 0.45, hsv.y)
+                        * sstep(0.05, 0.25, hsv.z), 0.0, 1.0) * sw;
+                    wsum = wsum + sw;
+                }
+            }
+            packed = packed | (u32(acc / wsum * 65535.0) << (16u * k));
+            pveg = pveg | (u32(vacc / wsum * 65535.0) << (16u * k));
+        }
+    }
+    skybuf[2u + i] = packed;
+    skybuf[2u + npw + i] = pveg;
+}
+
+// lens blur: disc-blurred matte-res copy of the linear image (io_a).
+// Radius scales with BlurAmount — LR blurs by depth; we blend by
+// (1 - subject matte) in finish instead, so this only defocuses.
+@compute @workgroup_size(256)
+fn lbl_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num: vec3<u32>) {
+    pg = u;
+    let i = flat_index(gid, num);
+    let w = pg.g2.x;
+    let h = pg.g2.y;
+    let mw = min(w, 192u);
+    let mh = min(h, 192u);
+    if (i >= mw * mh) { return; }
+    if (i == 0u) { lbl[0] = vec4<f32>(f32(mw), f32(mh), 0.0, 0.0); }
+    let mx = i % mw;
+    let my = i / mw;
+    let r = max(2.0, pg.csn.w * 10.0);
+    let r2 = r * r;
+    // lb0 = [highlight_boost, highlight_thresh, aspect, shape];
+    // lb1 = [sa, cat_eye, cat_scale, rotation]; tex0.y = shape_detail
+    let boost = pg.lb0.x;
+    let thr = pg.lb0.y;
+    let aspect = clamp(pg.lb0.z, -0.8, 0.8);
+    let shape = pg.lb0.w;
+    let sa = pg.lb1.x;
+    let cat = pg.lb1.y;
+    let cat_scale = pg.lb1.z;
+    let rot = pg.lb1.w;
+    let ring_w = 0.15 / (1.0 + pg.tex0.y * 2.0);
+    let rc = cos(rot * 3.14159);
+    let rs = sin(rot * 3.14159);
+    // cat-eye: radial squash toward frame edges
+    let cx = (f32(mx) + 0.5) / f32(mw) - 0.5;
+    let cy = (f32(my) + 0.5) / f32(mh) - 0.5;
+    let rd = sqrt(cx * cx + cy * cy) * 1.4142;
+    let edge = sstep(max(0.05, 1.0 - cat_scale * 0.9), 1.0, rd);
+    let q = max(0.15, 1.0 - cat * edge * 0.85);
+    var dir_c = 1.0;
+    var dir_s = 0.0;
+    if (rd > 1e-4) {
+        dir_c = cx / (rd / 1.4142);
+        dir_s = cy / (rd / 1.4142);
+    }
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    let ri = i32(ceil(r));
+    for (var dy = -ri; dy <= ri; dy = dy + 1) {
+        for (var dx = -ri; dx <= ri; dx = dx + 1) {
+            let rx = f32(dx) * rc - f32(dy) * rs;
+            let ry0 = f32(dx) * rs + f32(dy) * rc;
+            let ry = ry0 * (1.0 + aspect);
+            let d_rad = rx * dir_c + ry * dir_s;
+            let d_tan = -rx * dir_s + ry * dir_c;
+            let d2 = d_rad * d_rad / (q * q) + d_tan * d_tan;
+            if (d2 > r2) { continue; }
+            let nx2 = i32(mx) + dx;
+            let ny2 = i32(my) + dy;
+            if (nx2 < 0 || ny2 < 0 || nx2 >= i32(mw) || ny2 >= i32(mh)) {
+                continue;
+            }
+            var wg = exp(-d2 / (0.45 * r2));
+            if (shape > 0.5) {
+                let dr = sqrt(d2);
+                let dd = (dr - 0.72 * r) / (ring_w * r);
+                wg = exp(-dd * dd);
+            } else if (sa > 0.0) {
+                wg = wg * (1.0 + sa * 1.5 * sstep(0.55, 0.95, d2 / r2));
+            } else {
+                wg = wg * (1.0 + sa * 0.4);
+            }
+            let sx = min(u32((f32(nx2) + 0.5) / f32(mw) * f32(w)), w - 1u);
+            let sy = min(u32((f32(ny2) + 0.5) / f32(mh) * f32(h)), h - 1u);
+            var c = io_a[sy * w + sx].xyz;
+            if (boost > 0.001) {
+                let l = clamp(luma(c), 0.0, 1.0);
+                c = c * (1.0 + boost * 2.0 * sstep(thr, 1.0, l));
+            }
+            acc = acc + c * wg;
+            wsum = wsum + wg;
+        }
+    }
+    lbl[1u + i] = vec4<f32>(acc / max(wsum, 1e-6), 1.0);
+}
+
+fn lbl_at(x: i32, y: i32) -> vec3<f32> {
+    let w = i32(lbl[0].x);
+    let h = i32(lbl[0].y);
+    let cx = clamp(x, 0, w - 1);
+    let cy = clamp(y, 0, h - 1);
+    return lbl[1u + u32(cy * w + cx)].xyz;
+}
+
+fn lbl_bil(nx: f32, ny: f32) -> vec3<f32> {
+    let fx = nx * lbl[0].x - 0.5;
+    let fy = ny * lbl[0].y - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    return mix(mix(lbl_at(x0, y0), lbl_at(x0 + 1, y0), tx),
+               mix(lbl_at(x0, y0 + 1), lbl_at(x0 + 1, y0 + 1), tx), ty);
+}
+
 // finish: fit-resize + straighten + flip undo + adjust + grain + vignette + gamma
+// soft-ellipse eval shared by the AI-gated kinds (part/veg/nsky):
+// [cx,cy,rx,ry,rot,soft] with the 50% radius at w2.w when set.
+fn ellm(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32) -> f32 {
+    let rot = w1.x * 0.0174533;
+    let dd = vec2<f32>(nx, ny) - w0.xy;
+    let rr = max(w0.zw, vec2<f32>(0.005));
+    let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
+    let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
+    let d = length(vec2<f32>(ux, uy));
+    let soft = clamp(w1.y, 0.0, 0.95);
+    let rmid = select(1.0 - soft * 0.5, clamp(w2.w, 0.01, 0.99), w2.w > 0.001);
+    let r0 = max(rmid - soft * 0.5, 0.0);
+    let r1 = min(rmid + soft * 0.5, 1.0);
+    return 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
+}
+
 // shared power-window mask eval (used by local_ops and the stage key).
-fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
+// LR color-range matte (mirrors develop.rs color_matte)
+fn color_matte(col: vec3<f32>, h: f32, s: f32, tol: f32) -> f32 {
+    let hsv = rgb_to_hsv(col);
+    let dh = hue_dist(hsv.x, h);
+    let d = sqrt(dh * dh + (hsv.y - s) * (hsv.y - s));
+    let t = 0.04 + clamp(tol, 0.0, 1.0) * 0.26;
+    return 1.0 - sstep(t, t + 0.08, d);
+}
+
+fn win_mask(wi: u32, w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: vec3<f32>) -> f32 {
+    let mid_in = w2.w;
     let kb = u32(w2.y);
     let kind = kb & 1u;
     var mask = 0.0;
-    if ((kb & 16u) != 0u) {
+    if ((kb & 1024u) != 0u) {
+        // real LR AI-mask bitmap — supersedes every heuristic kind matte.
+        // wins[wi*6+5].y carries this window's matte index.
+        mask = wmat_bil(u32(pg.wins[wi * 6u + 5u].y), nx, ny);
+    } else if ((kb & 16u) != 0u) {
         mask = select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 64u) != 0u) {
+        // LR person-part mask (MaskSubType=3): subject matte gated by a
+        // soft ellipse prior positioned at the named body region.
+        mask = ellm(w0, w1, w2, nx, ny) * select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u);
+    } else if ((kb & 128u) != 0u) {
+        // LR landscape "Vegetation": heuristic veg matte × region prior
+        mask = ellm(w0, w1, w2, nx, ny) * select(0.0, veg_bil(nx, ny), skybuf[0] > 0u);
+    } else if ((kb & 256u) != 0u) {
+        // LR landscape semantic class (MaskSubType=0, non-sky):
+        // (1 - sky matte) gated by a region prior for the named class.
+        // Semantic classes are disjoint in LR — normalize by the sum of
+        // all nsky region priors so overlapping priors share weight.
+        var cover = 0.0;
+        for (var wi = 0u; wi < u32(pg.misc2.x); wi = wi + 1u) {
+            let ok = u32(pg.wins[wi * 6u + 2u].y);
+            if ((ok & 256u) != 0u && pg.wins[wi * 6u + 2u].z > 0.0) {
+                cover = cover + ellm(pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny);
+            }
+        }
+        mask = ellm(w0, w1, w2, nx, ny) / max(cover, 1.0)
+            * (1.0 - select(0.0, sky_bil(nx, ny), skybuf[0] > 0u));
+    } else if ((kb & 32u) != 0u) {
+        mask = select(0.0, sky_bil(nx, ny), skybuf[0] > 0u);
+    } else if ((kb & 512u) != 0u) {
+        mask = color_matte(col, w0.x, w0.y, w0.z);
     } else if ((kb & 4u) != 0u) {
         let l = luma(col);
         let lf = max(w0.z, 0.005);
@@ -1443,7 +2308,8 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         let len2 = max(dot(dvec, dvec), 1e-6);
         let t = dot(vec2<f32>(nx, ny) - w0.xy, dvec) / len2;
         let soft = max(w1.y, 0.02);
-        mask = 1.0 - sstep(0.5 - soft * 0.5, 0.5 + soft * 0.5, t);
+        let mid = select(0.5, mid_in, mid_in > 0.001);
+        mask = 1.0 - sstep(mid - soft * 0.5, mid + soft * 0.5, t);
     } else {
         let rot = w1.x * 0.0174533;
         let dd = vec2<f32>(nx, ny) - w0.xy;
@@ -1451,7 +2317,26 @@ fn win_mask(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, nx: f32, ny: f32, col: 
         let ux = (dd.x * cos(rot) + dd.y * sin(rot)) / rr.x;
         let uy = (-dd.x * sin(rot) + dd.y * cos(rot)) / rr.y;
         let d = length(vec2<f32>(ux, uy));
-        mask = 1.0 - sstep(1.0 - clamp(w1.y, 0.0, 0.95), 1.0, d);
+        let soft = clamp(w1.y, 0.0, 0.95);
+        let rmid = select(1.0 - soft * 0.5, clamp(mid_in, 0.01, 0.99), mid_in > 0.001);
+        let r0 = max(rmid - soft * 0.5, 0.0);
+        let r1 = min(rmid + soft * 0.5, 1.0);
+        mask = 1.0 - sstep(r0, max(r1, r0 + 0.01), d);
+    }
+    // LR range-mask refinement: mode 1 = subtract, 2 = intersect
+    let rf0 = pg.refines[wi * 2u];
+    let rf1 = pg.refines[wi * 2u + 1u];
+    if (rf0.x > 0.5 && mask > 0.0) {
+        var rm = 0.0;
+        if (u32(rf0.y) == 2u) {
+            let l = luma(col);
+            let f = max(rf1.x, 0.005);
+            rm = sstep(rf0.z - f, rf0.z + f, l) * (1.0 - sstep(rf0.w - f, rf0.w + f, l));
+        } else {
+            rm = color_matte(col, rf0.z, rf0.w, rf1.x);
+        }
+        if (rf1.y > 0.5) { rm = 1.0 - rm; }
+        if (rf0.x > 1.5) { mask = mask * rm; } else { mask = mask * (1.0 - rm); }
     }
     if ((kb & 2u) != 0u) { mask = 1.0 - mask; }
     if ((kb & 8u) != 0u) { mask = mask * qual_mask(col); }
@@ -1482,15 +2367,57 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
     }
     let nw = u32(pg.misc2.x);
     for (var wi = 0u; wi < nw; wi = wi + 1u) {
-        let w1 = pg.wins[wi * 4u + 1u];
-        let w2 = pg.wins[wi * 4u + 2u];
-        let mask = win_mask(pg.wins[wi * 4u], w1, w2, nx, ny, col);
+        let w1 = pg.wins[wi * 6u + 1u];
+        let w2 = pg.wins[wi * 6u + 2u];
+        let mask = win_mask(wi, pg.wins[wi * 6u], w1, w2, nx, ny, col);
         if (mask > 0.001) {
             let evg = pow(2.0, w1.z * mask);
             let l = luma(adj);
             adj = adj * evg;
             adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + w1.w * mask);
             adj = adj + vec3<f32>(w2.x * mask * 0.08, 0.0, -w2.x * mask * 0.08);
+            let ex = pg.wins[wi * 6u + 3u];
+            let ex2 = pg.wins[wi * 6u + 4u];
+            let ex3 = pg.wins[wi * 6u + 5u];
+            adj = local_extra(adj, mask, ex, ex2, ex3.x);
+            // masked point colours (LR LocalPointColors) — mirrors the
+            // lpcs block in develop.rs local_ops
+            let nlp = u32(pg.lpcs[wi * 11u].x);
+            for (var s = 0u; s < nlp; s = s + 1u) {
+                let d = wi * 11u + 1u + s * 5u;
+                let v0 = pg.lpcs[d];
+                let v1 = pg.lpcs[d + 1u];
+                var hr = pg.lpcs[d + 2u];
+                var sr = pg.lpcs[d + 3u];
+                var lr = pg.lpcs[d + 4u];
+                let hsv = rgb_to_hsv(adj);
+                let k = max(v1.w * 2.0, 0.0);
+                let hc = (hr.x + hr.w) * 0.5;
+                let sc = (sr.x + sr.w) * 0.5;
+                let lc = (lr.x + lr.w) * 0.5;
+                hr = clamp(hc + (hr - vec4<f32>(hc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                sr = clamp(sc + (sr - vec4<f32>(sc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                lr = clamp(lc + (lr - vec4<f32>(lc)) * k, vec4<f32>(0.0), vec4<f32>(1.0));
+                let hpos = fract(hsv.x - v0.x + 0.5);
+                let w = trap01(hpos, hr.x, hr.y, hr.z, hr.w)
+                    * trap01(hsv.y, sr.x, sr.y, sr.z, sr.w)
+                    * trap01(hsv.z, lr.x, lr.y, lr.z, lr.w);
+                if (w > 1e-4) {
+                    let xs = hsv_to_rgb(
+                        fract(hsv.x + v1.x * 0.5 + 1.0),
+                        clamp(hsv.y * (1.0 + v1.y), 0.0, 1.0),
+                        max(hsv.z * (1.0 + v1.z), 0.0));
+                    var tgt = xs;
+                    if (abs(v0.w) > 1e-4) {
+                        let a = hsv_to_rgb(
+                            fract(v0.x + v1.x * 0.5 + 1.0),
+                            clamp(v0.y * (1.0 + v1.y), 0.0, 1.0),
+                            max(v0.z * (1.0 + v1.z), 0.0));
+                        tgt = a + (xs - a) * (1.0 + v0.w);
+                    }
+                    adj = adj + (tgt - adj) * (w * mask);
+                }
+            }
         }
     }
     let n_str = u32(pg.bmisc.x);
@@ -1550,6 +2477,48 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             adj = adj * evg;
             adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + lp.y * bmask);
             adj = adj + vec3<f32>(lp.z * bmask * 0.08, 0.0, -lp.z * bmask * 0.08);
+            let ex = pg.blayers2[li * 3u];
+            let ex2 = pg.blayers2[li * 3u + 1u];
+            let ex3 = pg.blayers2[li * 3u + 2u];
+            adj = local_extra(adj, bmask, ex, ex2, ex3.x);
+        }
+    }
+    return adj;
+}
+
+// extended LR local adjustments inside a window/brush mask —
+// mirrors local_extra() in develop.rs. ex = contrast/clarity/dehaze/
+// tint, ex2 = highlights/shadows/whites/blacks tone-band offsets.
+fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex: f32) -> vec3<f32> {
+    var adj = adj_in;
+    if (ex.w != 0.0) {
+        adj = adj + vec3<f32>(0.0, -ex.w * mask * 0.06, 0.0);
+    }
+    if (ex.x != 0.0 || ex.y != 0.0 || ex.z != 0.0 || ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0 || tex != 0.0) {
+        let l = clamp(luma(adj), 0.0, 1.0);
+        let mid = 4.0 * l * (1.0 - l);
+        let k = (ex.x + ex.y * mid * 0.8 + tex * mid * 0.6 + ex.z * 0.2) * mask * 0.9;
+        adj = vec3<f32>(l) + (adj - vec3<f32>(l)) * (1.0 + k);
+        if (ex.z != 0.0) {
+            let f = ex.z * mask;
+            adj = adj * (1.0 + 0.08 * f) - vec3<f32>(0.015 * f * (1.0 - l));
+        }
+        if (ex2.y != 0.0) {
+            adj = adj + vec3<f32>(ex2.y * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * max(1.0 - l / 1.6, 0.0));
+        }
+        if (ex2.x != 0.0) {
+            adj = adj / max(1.0 - ex2.x * mask * 2.19 * sstep(0.60, 1.49, l), 0.15);
+        }
+        if (ex2.z != 0.0) {
+            adj = adj * (1.0 + ex2.z * mask * 0.35 * sstep(0.5, 1.0, l));
+        }
+        if (ex2.w != 0.0) {
+            let lw = 1.0 - sstep(0.0, 0.4, l);
+            if (ex2.w > 0.0) {
+                adj = adj + vec3<f32>(ex2.w * mask * 0.06 * lw);
+            } else {
+                adj = adj * (1.0 + ex2.w * mask * 0.25 * lw);
+            }
         }
     }
     return adj;
@@ -1606,9 +2575,15 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     if (pg.fx0.x != 0.0) {
         let wcx = f32(sw) * 0.5;
         let wcy = f32(sh) * 0.5;
-        let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
-        let fr = 1.0 - pg.fx0.x * 0.05 * rn;
-        let fb = 1.0 + pg.fx0.x * 0.05 * rn;
+        var fr = 1.0; var fb = 1.0;
+        if (pg.fx0.x > 0.0) {
+            fr = 1.0 - pg.ca0.x;
+            fb = 1.0 - pg.ca0.y;
+        } else {
+            let rn = distance(vec2<f32>(sx, sy), vec2<f32>(wcx, wcy)) / f32(max(sw, sh)) * 2.0;
+            fr = 1.0 - pg.fx0.x * 0.05 * rn;
+            fb = 1.0 + pg.fx0.x * 0.05 * rn;
+        }
         col = vec3<f32>(
             bil_ch(wcx + (sx - wcx) * fr, wcy + (sy - wcy) * fr, 0u),
             bil_ch(sx, sy, 1u),
@@ -1630,6 +2605,13 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
             col = io_a[u32(y0) * sw + u32(x0)].xyz;
         }
     }
+    // lens blur: defocus blend by (1 - subject matte) — subject matte is
+    // the focus proxy (LR uses a depth map; this approximates "keep the
+    // subject sharp, blur the rest")
+    if (pg.csn.w > 0.001 && lbl[0].x > 0.5) {
+        let bm = (1.0 - select(0.0, subj_bil(nx, ny), subjbuf[0] > 0u)) * pg.csn.w;
+        col = mix(col, lbl_bil(sx / f32(sw), sy / f32(sh)), bm);
+    }
     var adj = adjust(col);
     let aspect = f32(dw) / f32(dh);
     adj = local_ops(adj, col, nx, ny, aspect);
@@ -1646,7 +2628,7 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         if (snw > 0u) {
             var wu = 0.0;
             for (var wi = 0u; wi < snw; wi = wi + 1u) {
-                wu = max(wu, win_mask(pg.wins[wi * 4u], pg.wins[wi * 4u + 1u], pg.wins[wi * 4u + 2u], nx, ny, col));
+                wu = max(wu, win_mask(wi, pg.wins[wi * 6u], pg.wins[wi * 6u + 1u], pg.wins[wi * 6u + 2u], nx, ny, col));
             }
             key = key * wu;
         }
@@ -1668,21 +2650,35 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let ghost = exp(-gd * gd / 0.0008);
         adj = adj + hue_to_rgb(pg.flare.w) * (pg.flare.z * (0.5 * core + 0.7 * streak + 0.35 * ghost));
     }
-    // film grain (pre-gamma, linear domain)
+    // film grain (pre-gamma, linear domain) — cell size + low-freq
+    // roughness mix matching the CPU finish pass.
     if (pg.a4.x > 0.0) {
         let p = vec2<f32>(f32(dx), f32(dy));
+        let cell = max(pg.extra1.x, 1.0);
+        let rough = pg.extra1.y * 0.6;
+        let has_lf = cell > 1.5;
         adj = adj + vec3<f32>(
-            hash(p, 0.0) - 0.5,
-            hash(p, 17.0) - 0.5,
-            hash(p, 43.0) - 0.5,
+            mix(hash(p, 0.0), select(hash(p, 0.0), cell_noise(p, cell, 0.0), has_lf), rough) - 0.5,
+            mix(hash(p, 17.0), select(hash(p, 17.0), cell_noise(p, cell, 17.0), has_lf), rough) - 0.5,
+            mix(hash(p, 43.0), select(hash(p, 43.0), cell_noise(p, cell, 43.0), has_lf), rough) - 0.5,
         ) * pg.a4.x * 0.12;
     }
     // vignette (post-adjust, pre-gamma; positive darkens corners)
     if (pg.a3.w != 0.0) {
         let vx = nx * 2.0 - 1.0;
         let vy = ny * 2.0 - 1.0;
-        let d = length(vec2<f32>(vx, vy)) * 0.7071;
-        adj = adj * (1.0 - pg.a3.w * sstep(0.35, 1.05, d) * 0.9);
+        var d = length(vec2<f32>(vx, vy)) * 0.7071;
+        var r0 = 0.35;
+        var r1 = 1.05;
+        if (pg.extra0.x >= 0.0) {
+            let dr = max(abs(vx), abs(vy));
+            let w = (pg.extra0.y + 1.0) * 0.5;
+            let wid = max(pg.extra0.z, 0.02);
+            d = dr + (d - dr) * w;
+            r0 = pg.extra0.x - wid * 0.5;
+            r1 = pg.extra0.x + wid * 0.5;
+        }
+        adj = adj * (1.0 - pg.a3.w * sstep(r0, r1, d) * 0.9);
     }
     let enc = srgb_encode(clamp(adj.x, 0.0, 1.0)) * 255.0 + 0.5;
     let enc2 = srgb_encode(clamp(adj.y, 0.0, 1.0)) * 255.0 + 0.5;
@@ -1714,16 +2710,14 @@ pub struct Gpu {
     soft: Pipe,
     glow: Pipe,
     sharpen: Pipe,
+    skymat: Pipe,
+    lbl: Pipe,
     finish: Pipe,
     seed: Pipe,
 }
 
 fn norm_factors(m: &Mosaic) -> [f32; 4] {
-    let mut n = [0.0f32; 4];
-    for c in 0..4 {
-        n[c] = 1.0 / (m.maximum as f32 - m.black[c]).max(1.0);
-    }
-    n
+    crate::develop::norm_factors(m)
 }
 
 impl Gpu {
@@ -1773,14 +2767,14 @@ impl Gpu {
         let mk = |entry: &str| -> Pipe {
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(entry),
-                entries: &(0..15)
+                entries: &(0..21)
                     .map(|i| wgpu::BindGroupLayoutEntry {
                         binding: i,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: match i {
                                 0 => wgpu::BufferBindingType::Uniform,
-                                3 | 4 | 5 | 7 | 14 => {
+                                3 | 4 | 5 | 7 | 14 | 16 | 17 => {
                                     wgpu::BufferBindingType::Storage { read_only: false }
                                 }
                                 _ => wgpu::BufferBindingType::Storage { read_only: true },
@@ -1820,6 +2814,8 @@ impl Gpu {
             soft: mk("soft_main"),
             glow: mk("glow_main"),
             sharpen: mk("sharpen_main"),
+            skymat: mk("skymat_main"),
+            lbl: mk("lbl_main"),
             finish: mk("finish_main"),
             seed: mk("seed_main"),
             device,
@@ -1909,12 +2905,15 @@ impl Gpu {
         });
         // master 256 + per-channel 768 + hue-curves 1280 + tone 512
         const LUT_N: u64 = 2816;
-        // .cube 3D LUT (loaded once for sizing; build_params hits the cache)
-        let lut3d = if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
-            crate::lut::load(&r.lut_file)
-        } else {
-            None
-        };
+        // .cube 3D LUT (loaded once for sizing; build_params hits the
+        // cache); embedded Adobe profile LUT takes precedence
+        let lut3d = r.rgb_lut.clone().or_else(|| {
+            if !r.lut_file.is_empty() && r.lut_amount > 0.0 {
+                crate::lut::load(&r.lut_file)
+            } else {
+                None
+            }
+        });
         // header after the curve region: [size, amt, dmin*3, dscale*3] then data
         let n_stg = r.stages.iter().filter(|s| s.enabled).take(4).count() as u64;
         // per-stage curve/tone regions follow the base 3D LUT data; each stage's
@@ -1936,7 +2935,9 @@ impl Gpu {
             })
             .map(|dl| 8 + dl)
             .collect();
-        let lut_len = LUT_N + 8 + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
+        let lut_len = LUT_N
+            + 8
+            + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
             + n_stg * LUT_N
             + stg_l3.iter().sum::<u64>();
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -1979,36 +2980,58 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        // lens profile correction: same lookup as the CPU path
-        let corr = if r.lens_corr > 0.001 {
-            crate::lensdb::db().and_then(|d| {
-                let c = d.correction(
-                    &m.info.lens,
-                    &m.info.make,
-                    &m.info.model,
-                    m.info.focal,
-                    m.info.aperture,
-                );
-                if c.is_empty() {
-                    None
-                } else {
-                    Some(c)
-                }
-            })
-        } else {
-            None
-        };
+        // lens profile correction: same lookup as the CPU path (preset
+        // crs:LensProfileName first, then EXIF), plus any DNG-embedded
+        // opcode corrections merged underneath
+        let corr = crate::develop::lens_stage(m, r);
         let lens_amt = r.lens_corr.min(1.0);
+        let dng = corr.as_ref().and_then(|c| c.dng.as_ref());
+        let dng_warp_en = dng.and_then(|d| d.warp.as_ref()).is_some();
+        let dng_gain_en = dng.and_then(|d| d.gain.as_ref()).is_some();
+        // packed DNG payload: [warp_en, kr[18], center2, pad, gain hdr, map]
+        let mut dng32: Vec<f32> = vec![0.0; 32];
+        if let Some(d) = dng {
+            if let Some(wr) = &d.warp {
+                dng32[0] = 1.0;
+                for ch in 0..3 {
+                    for i in 0..6 {
+                        dng32[1 + ch * 6 + i] = wr.kr[ch][i];
+                    }
+                }
+                dng32[19] = wr.center[0];
+                dng32[20] = wr.center[1];
+            }
+            if let Some(g) = &d.gain {
+                dng32[21] = 1.0;
+                dng32[22] = g.rows as f32;
+                dng32[23] = g.cols as f32;
+                dng32[24] = g.planes as f32;
+                dng32[25] = g.plane0 as f32;
+                dng32[26] = g.nplanes as f32;
+                dng32[27] = g.spacing[0] as f32;
+                dng32[28] = g.spacing[1] as f32;
+                dng32[29] = g.origin[0] as f32;
+                dng32[30] = g.origin[1] as f32;
+                dng32.extend_from_slice(&g.map);
+            }
+        }
 
         let mk_uni = |p: &Params, samp_step: u32| Uni {
             black: m.black,
             norm: norm_factors(m),
-            wb: [p.wb[0], p.wb[1], p.wb[2], 0.0],
+            wb: [
+                p.wb[0],
+                p.wb[1],
+                p.wb[2],
+                if p.expo_early { 1.0 } else { 0.0 },
+            ],
             m0: [p.m[0][0], p.m[0][1], p.m[0][2], 0.0],
             m1: [p.m[1][0], p.m[1][1], p.m[1][2], 0.0],
             m2: [p.m[2][0], p.m[2][1], p.m[2][2], 0.0],
             a1: [p.exposure_mul, p.contrast, p.highlights, p.shadows],
             a2: [p.whites, p.blacks, p.saturation, p.vibrance],
+            defr_pu: [p.defringe[0], p.defringe[1], p.defringe[2], 0.0],
+            defr_gr: [p.defringe[4], p.defringe[5], p.defringe[6], 0.0],
             a3: [p.sharpen, p.noise_luma, p.clarity, p.vignette],
             a4: [
                 p.grain,
@@ -2060,7 +3083,7 @@ impl Gpu {
                 p.sh_roll,
                 if p.chan_luts.is_empty() { 0.0 } else { 1.0 },
             ],
-            qh: [p.qh[0], p.qh[1], p.qh[2], 0.0],
+            qh: [p.qh[0], p.qh[1], p.qh[2], p.exposure_ev],
             qs: [p.qs[0], p.qs[1], p.qs[2], 0.0],
             ql: [p.ql[0], p.ql[1], p.ql[2], 0.0],
             qadj: p.qadj,
@@ -2093,11 +3116,39 @@ impl Gpu {
             ],
             flare: p.flare,
             wins: {
-                let mut a = [[0.0f32; 4]; 16];
-                for (i, w) in p.wins.iter().take(4).enumerate() {
-                    a[i * 4] = [w[1], w[2], w[3], w[4]];
-                    a[i * 4 + 1] = [w[5], w[6], w[7], w[8]];
-                    a[i * 4 + 2] = [w[9], w[0], w[10], 0.0];
+                let mut a = [[0.0f32; 4]; 96];
+                for (i, w) in p.wins.iter().take(16).enumerate() {
+                    a[i * 6] = [w[1], w[2], w[3], w[4]];
+                    a[i * 6 + 1] = [w[5], w[6], w[7], w[8]];
+                    a[i * 6 + 2] = [w[9], w[0], w[10], w[11]];
+                    a[i * 6 + 3] = [w[12], w[13], w[14], w[15]];
+                    a[i * 6 + 4] = [w[16], w[17], w[18], w[19]];
+                    // .y = bitmap-mask matte index (flag 1024)
+                    a[i * 6 + 5] = [w[20], w[21], 0.0, 0.0];
+                }
+                a
+            },
+            refines: {
+                let mut a = [[0.0f32; 4]; 32];
+                for (i, rf) in p.refines.iter().take(16).enumerate() {
+                    a[i * 2] = [rf[0], rf[1], rf[2], rf[3]];
+                    a[i * 2 + 1] = [rf[4], rf[5], 0.0, 0.0];
+                }
+                a
+            },
+            lpcs: {
+                let mut a = [[0.0f32; 4]; 176];
+                for (i, lp) in p.lpcs.iter().take(16).enumerate() {
+                    a[i * 11] = [lp[0], 0.0, 0.0, 0.0];
+                    for s in 0..2usize {
+                        let o = 1 + s * 20;
+                        let d = i * 11 + 1 + s * 5;
+                        a[d] = [lp[o], lp[o + 1], lp[o + 2], lp[o + 19]];
+                        a[d + 1] = [lp[o + 3], lp[o + 4], lp[o + 5], lp[o + 6]];
+                        a[d + 2] = [lp[o + 7], lp[o + 8], lp[o + 9], lp[o + 10]];
+                        a[d + 3] = [lp[o + 11], lp[o + 12], lp[o + 13], lp[o + 14]];
+                        a[d + 4] = [lp[o + 15], lp[o + 16], lp[o + 17], lp[o + 18]];
+                    }
                 }
                 a
             },
@@ -2134,7 +3185,12 @@ impl Gpu {
                 p.key_v,
                 p.key_h,
             ],
-            dh0: [p.dehaze, p.dehaze_a, 0.0, 0.0],
+            dh0: [
+                p.dehaze,
+                p.dehaze_a,
+                if dng_warp_en { 1.0 } else { 0.0 },
+                if dng_gain_en { 1.0 } else { 0.0 },
+            ],
             lens0: corr
                 .as_ref()
                 .map(|c| [c.model as f32, c.abc[0], c.abc[1], c.abc[2]])
@@ -2144,9 +3200,36 @@ impl Gpu {
                 .as_ref()
                 .map(|c| [c.vig[0], c.vig[1], c.vig[2], c.scale])
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
-            lens3: [0.0, 0.0, 0.0, if corr.is_some() { lens_amt } else { 0.0 }],
+            lens3: [
+                corr.as_ref()
+                    .map(|c| c.vig_adobe as i32 as f32)
+                    .unwrap_or(0.0),
+                corr.as_ref().map(|c| c.vig_foc).unwrap_or(0.0),
+                corr.as_ref()
+                    .and_then(|c| c.adobe.as_ref().map(|a| a.foc[0]))
+                    .unwrap_or(0.0),
+                if corr.is_some() { lens_amt } else { 0.0 },
+            ],
             blayers: p.brush_layers,
-            bmisc: [p.brush_misc[0], p.brush_misc[1], r.ai_denoise.min(1.0), 0.0],
+            blayers2: {
+                let mut a = [[0.0f32; 4]; 12];
+                for (i, e) in p.brush_layers2.iter().take(4).enumerate() {
+                    a[i * 3] = [e[0], e[1], e[2], e[3]];
+                    a[i * 3 + 1] = [e[4], e[5], e[6], e[7]];
+                    a[i * 3 + 2] = [e[8], 0.0, 0.0, 0.0];
+                }
+                a
+            },
+            bmisc: [
+                p.brush_misc[0],
+                p.brush_misc[1],
+                r.ai_denoise.min(1.0),
+                if p.profile_tone_lut.is_empty() {
+                    0.0
+                } else {
+                    1.0
+                },
+            ],
             bstr: {
                 let mut a = [[0.0f32; 4]; 192];
                 for (i, s) in p.brush_strokes.iter().take(192).enumerate() {
@@ -2170,15 +3253,108 @@ impl Gpu {
             csn: [
                 p.warper.len().min(8) as f32,
                 if p.has_cs { 1.0 } else { 0.0 },
-                0.0,
+                p.sharp_mask,
+                p.lens_blur,
+            ],
+            extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
+            extra1: [p.grain_size, p.grain_rough, p.sharp_radius, p.sharp_detail],
+            cal0: [p.calib[0], p.calib[1], p.calib[2], p.calib[9]],
+            cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
+            cal2: [p.calib[6], p.calib[7], p.calib[8], 0.0],
+            tex0: [p.texture, p.lens_blur_opts2[3], 0.0, 0.0],
+            lb0: [
+                p.lens_blur_opts[0],
+                p.lens_blur_opts[1],
+                p.lens_blur_opts[2],
+                p.lens_blur_opts[3],
+            ],
+            lb1: [
+                p.lens_blur_opts[4],
+                p.lens_blur_opts2[0],
+                p.lens_blur_opts2[1],
+                p.lens_blur_opts2[2],
+            ],
+            gb0: [p.grade_balance, p.grade_blend, 0.0, 0.0],
+            ca0: [p.ca_r, p.ca_b, 0.0, 0.0],
+            pp0: [
+                p.post_profile[0][0],
+                p.post_profile[0][1],
+                p.post_profile[0][2],
                 0.0,
             ],
+            pp1: [
+                p.post_profile[1][0],
+                p.post_profile[1][1],
+                p.post_profile[1][2],
+                0.0,
+            ],
+            pp2: [
+                p.post_profile[2][0],
+                p.post_profile[2][1],
+                p.post_profile[2][2],
+                0.0,
+            ],
+            wmeta: [[0.0; 4]; 48],
+            pm: [[0.0; 4]; 36],
         };
 
         // adjustment-brush segment upload. Brush packing ignores `stats`, so
         // a stats-free params build produces identical segments to the main
         // pass's params below.
         let p0 = build_params(m, r, None);
+        // LR bitmap-mask mattes (flag 1024): one flat packed-u16 store for
+        // the base params + every stage; each Uni's wmeta records [w,h,off]
+        // + the post-crop→bitmap affine per matte index.
+        let mut wmbuf32: Vec<u32> = vec![0];
+        let pack_wmats = |wmats: &[crate::develop::WMatte], buf: &mut Vec<u32>| -> [[f32; 4]; 48] {
+            let mut a = [[0.0f32; 4]; 48];
+            for (j, t) in wmats.iter().take(16).enumerate() {
+                let off = buf.len();
+                for px in t.m.data.chunks(2) {
+                    buf.push(px[0] as u32 | ((px.get(1).copied().unwrap_or(0) as u32) << 16));
+                }
+                a[j * 3] = [t.m.w as f32, t.m.h as f32, off as f32, 0.0];
+                a[j * 3 + 1] = [t.ux, t.uy, t.uc, 0.0];
+                a[j * 3 + 2] = [t.vx, t.vy, t.vc, 0.0];
+            }
+            a
+        };
+        let wm_main = pack_wmats(&p0.wmats, &mut wmbuf32);
+        // LR PatchMatch remove spots: one flat vec2 store of per-patch-px
+        // source coords; each Uni's pm record indexes it via pm[3i+2].x.
+        // pm coords are sensor px — scale into the virtual frame (g2 = vw).
+        let pm_sc = if p0.pm_frame[0] > 0.0 {
+            vw as f32 / p0.pm_frame[0]
+        } else {
+            1.0
+        };
+        let mut pmv: Vec<[f32; 2]> = vec![[0.0, 0.0]];
+        let pm_main = {
+            let mut a = [[0.0f32; 4]; 36];
+            for (i, m) in p0.pms.iter().take(12).enumerate() {
+                let base = pmv.len();
+                pmv.extend(
+                    m.src
+                        .iter()
+                        .take(m.pw * m.ph)
+                        .map(|s| [s[0] * pm_sc, s[1] * pm_sc]),
+                );
+                a[i * 3] = [m.dst[0] * pm_sc, m.dst[1] * pm_sc, m.pw as f32, m.ph as f32];
+                a[i * 3 + 1] = [
+                    m.ell[0] * pm_sc,
+                    m.ell[1] * pm_sc,
+                    m.ell[2] * pm_sc,
+                    m.ell[3] * pm_sc,
+                ];
+                a[i * 3 + 2] = [base as f32, m.opacity, pm_sc, 0.0];
+            }
+            a
+        };
+        let wm_stages: Vec<[[f32; 4]; 48]> = p0
+            .stages
+            .iter()
+            .map(|(sp, _, _)| pack_wmats(&sp.wmats, &mut wmbuf32))
+            .collect();
         let mut segs32: Vec<f32> = p0.brush_segs.iter().flatten().copied().collect();
         // per-stage segments appended; each stage Uni records its vec4 base
         let mut stg_seg_base: Vec<f32> = Vec::new();
@@ -2225,32 +3401,99 @@ impl Gpu {
             _ => vec![0u32, 0u32],
         };
         let subj_b = mk_buf("subjbuf", bytemuck::cast_slice(&subj32), storage_in);
+        // heuristic sky matte buffer ([mw,mh] header + packed u16 pairs);
+        // header stays [0,0] unless skymat_main fills it.
+        let sky_b = mk_buf(
+            "skybuf",
+            // two packed mattes: sky at [2..2+npw], veg at [2+npw..]
+            &vec![0u8; (2 + (384 * 384 + 1) / 2 * 2) * 4],
+            storage_in,
+        );
+        let dng_b = mk_buf("dngbuf", bytemuck::cast_slice(&dng32), storage_in);
+        let wm_b = mk_buf("wmbuf", bytemuck::cast_slice(&wmbuf32), storage_in);
+        let pm_b = mk_buf("pmbuf", bytemuck::cast_slice(&pmv), storage_in);
+        // lens blur: matte-res defocused copy (header vec4 + 192² pixels)
+        let lbl_b = mk_buf("lblbuf", &vec![0u8; (1 + 192 * 192) * 16], storage_in);
+        // HSV shift maps + profile tone: [look dims+cells][256 tone][hsm
+        // dims+cells]. Tone guarded by bmisc.w; maps self-guard via dims==0.
+        let push_map = |v: &mut Vec<f32>, m: &Option<crate::dcp::HsMap>| match m {
+            Some(m) if !m.data.is_empty() => {
+                v.extend([
+                    m.dims[0] as f32,
+                    m.dims[1] as f32,
+                    m.dims[2] as f32,
+                    if m.srgb_encoded { 1.0 } else { 0.0 },
+                ]);
+                for cell in &m.data {
+                    v.extend_from_slice(cell);
+                }
+            }
+            _ => v.extend([0.0; 4]),
+        };
+        let look32: Vec<f32> = {
+            let mut v = Vec::new();
+            push_map(&mut v, &p0.profile_look);
+            if p0.profile_tone_lut.is_empty() {
+                v.extend([0.0; 256]);
+            } else {
+                v.extend_from_slice(&p0.profile_tone_lut);
+            }
+            push_map(&mut v, &p0.profile_hsm);
+            // LR Point Color swatches, normalized on CPU so the shader sees a
+            // fixed layout: [src_h01,s,l][dh,ds,dl][amt][hr4][sr4][lr4][var]
+            // = 20 (var = per-swatch ColorVariance, index-aligned)
+            let mut n_pc = 0usize;
+            let mut tail = Vec::new();
+            for (i, raw) in p0.point_colors.iter().enumerate() {
+                if let Some(sw) = crate::develop::pc_normalize(raw) {
+                    tail.extend(sw.src);
+                    tail.extend(sw.shift);
+                    tail.push(sw.amt);
+                    tail.extend(sw.hr);
+                    tail.extend(sw.sr);
+                    tail.extend(sw.lr);
+                    tail.push(p0.point_color_vars.get(i).copied().unwrap_or(0.0));
+                    n_pc += 1;
+                }
+            }
+            v.push(n_pc as f32);
+            v.extend(tail);
+            v
+        };
+        let look_b = mk_buf("lookbuf", bytemuck::cast_slice(&look32), storage_in);
 
         let bind = |pipe: &Pipe| {
-            let entries: Vec<wgpu::BindGroupEntry> =
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-                .iter()
-                .map(|&i| wgpu::BindGroupEntry {
-                    binding: i,
-                    resource: match i {
-                        0 => uni_b.as_entire_binding(),
-                        1 => raw_b.as_entire_binding(),
-                        2 => cfa_b.as_entire_binding(),
-                        3 => io_a.as_entire_binding(),
-                        4 => io_b.as_entire_binding(),
-                        5 => out_b.as_entire_binding(),
-                        6 => lut_b.as_entire_binding(),
-                        7 => stats_b.as_entire_binding(),
-                        8 => idx_b.as_entire_binding(),
-                        9 => tap_b.as_entire_binding(),
-                        10 => brush_b.as_entire_binding(),
-                        11 => den_b.as_entire_binding(),
-                        12 => subj_b.as_entire_binding(),
-                        13 => suni_b.as_entire_binding(),
-                        _ => seeds_b.as_entire_binding(),
-                    },
-                })
-                .collect();
+            let entries: Vec<wgpu::BindGroupEntry> = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            ]
+            .iter()
+            .map(|&i| wgpu::BindGroupEntry {
+                binding: i,
+                resource: match i {
+                    0 => uni_b.as_entire_binding(),
+                    1 => raw_b.as_entire_binding(),
+                    2 => cfa_b.as_entire_binding(),
+                    3 => io_a.as_entire_binding(),
+                    4 => io_b.as_entire_binding(),
+                    5 => out_b.as_entire_binding(),
+                    6 => lut_b.as_entire_binding(),
+                    7 => stats_b.as_entire_binding(),
+                    8 => idx_b.as_entire_binding(),
+                    9 => tap_b.as_entire_binding(),
+                    10 => brush_b.as_entire_binding(),
+                    11 => den_b.as_entire_binding(),
+                    12 => subj_b.as_entire_binding(),
+                    13 => suni_b.as_entire_binding(),
+                    14 => seeds_b.as_entire_binding(),
+                    15 => dng_b.as_entire_binding(),
+                    16 => sky_b.as_entire_binding(),
+                    17 => lbl_b.as_entire_binding(),
+                    19 => wm_b.as_entire_binding(),
+                    20 => pm_b.as_entire_binding(),
+                    _ => look_b.as_entire_binding(),
+                },
+            })
+            .collect();
             dev.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipe.layout,
@@ -2321,7 +3564,14 @@ impl Gpu {
             None
         };
 
-        let p = build_params(m, r, stats.as_ref());
+        let mut p = build_params(m, r, stats.as_ref());
+        // auto lateral CA: measure on a cheap CPU demosaic of the mosaic
+        if p.ca_fix > 0.0 {
+            let s = (p.ca_fix / 0.3).clamp(0.0, 1.0);
+            let (kr, kb) = crate::develop::estimate_ca_mosaic(m);
+            p.ca_r = kr * s;
+            p.ca_b = kb * s;
+        }
         // packed lut buffer: master | chan r,g,b | hue hh,hs,hl,ls,ss
         let mut lut_buf = vec![0.0f32; LUT_N as usize];
         lut_buf[..256].copy_from_slice(&p.lut);
@@ -2390,6 +3640,8 @@ impl Gpu {
         self.queue
             .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         let mut u_main = mk_uni(&p, 0);
+        u_main.wmeta = wm_main;
+        u_main.pm = pm_main;
         u_main.stg0 = [p.stages.len() as f32, 0.0, 0.0, 0.0];
         for (i, (_, sop, sinv)) in p.stages.iter().enumerate() {
             u_main.sop0[i] = *sop;
@@ -2416,6 +3668,7 @@ impl Gpu {
                 .enumerate()
                 .map(|(i, (sp, _, _))| {
                     let mut uu = mk_uni(sp, 0);
+                    uu.wmeta = wm_stages.get(i).copied().unwrap_or([[0.0; 4]; 48]);
                     uu.misc3 = [
                         slut0 as f32 + i as f32 * LUT_N as f32,
                         1.0,
@@ -2458,7 +3711,7 @@ impl Gpu {
         }
         run(&mut enc, &self.demosaic, n_px);
         // Each spatial stage reads io_a and writes io_b; copy back between stages.
-        if p.n_spots > 0 || p.n_clones > 0 {
+        if p.n_spots > 0 || p.n_clones > 0 || !p.pms.is_empty() {
             run(&mut enc, &self.heal, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
@@ -2478,9 +3731,32 @@ impl Gpu {
             run(&mut enc, &self.glow, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
         }
-        if p.sharpen > 0.0 || p.clarity != 0.0 {
+        if p.sharpen > 0.0 || p.clarity != 0.0 || p.texture != 0.0 {
             run(&mut enc, &self.sharpen, n_px);
             enc.copy_buffer_to_buffer(&io_b, 0, &io_a, 0, n_px * 16);
+        }
+        // heuristic sky/veg mattes for LR AI-mask windows
+        let needs_sky = p
+            .wins
+            .iter()
+            .take(p.n_wins as usize)
+            .any(|w| (w[0] as i32) & (32 | 128 | 256) != 0)
+            || p.stages.iter().any(|(sp, _, _)| {
+                sp.wins
+                    .iter()
+                    .take(sp.n_wins as usize)
+                    .any(|w| (w[0] as i32) & (32 | 128 | 256) != 0)
+            });
+        if needs_sky {
+            let mw = vw.min(384);
+            let mh = vh.min(384);
+            run(&mut enc, &self.skymat, ((mw * mh + 1) / 2) as u64);
+        }
+        // lens blur: defocused matte-res copy of the linear image
+        if p.lens_blur > 0.001 {
+            let mw = vw.min(192);
+            let mh = vh.min(192);
+            run(&mut enc, &self.lbl, (mw * mh) as u64);
         }
         // edge-aware brush seeds: sample the finished linear image at each
         // flagged stroke's first dab before the per-pixel finish pass

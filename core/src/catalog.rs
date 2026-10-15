@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::decode;
-use crate::recipe::{
-    read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Sidecar,
-};
+use crate::recipe::{read_sidecar_path_for_v, sidecar_path_for, sidecar_path_for_v, Sidecar};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetEntry {
@@ -767,7 +765,13 @@ mod tests {
     use std::io::Write;
 
     fn tmpdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("sl_cat_{}", std::process::id()));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "sl_cat_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

@@ -33,6 +33,8 @@ pub struct SlRawInfo {
     pub aperture: f32,
     pub focal: f32,
     pub timestamp: c_long,
+    pub baseline_exposure: f32,
+    pub linear_max: [c_uint; 4],
 }
 
 pub enum SlRaw {}

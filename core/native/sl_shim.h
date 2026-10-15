@@ -37,6 +37,8 @@ typedef struct SlRawInfo {
   float aperture;
   float focal;
   long timestamp;
+  float baseline_exposure;   /* libraw's per-camera scene-referred gain (EV) */
+  unsigned int linear_max[4];/* per-channel real saturation level (0 = n/a) */
 } SlRawInfo;
 
 SlRaw* sl_raw_open(const char* path, SlRawInfo* info);

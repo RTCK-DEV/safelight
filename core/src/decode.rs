@@ -13,9 +13,7 @@ pub const RAW_EXTS: &[&str] = &[
 ];
 // .insp = Insta360 still: a plain JPEG holding both lenses in one 2:1
 // frame — readable as a normal raster for browsing/equirect export.
-pub const RASTER_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "tif", "tiff", "webp", "insp",
-];
+pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp", "insp"];
 
 pub fn is_raw(path: &Path) -> bool {
     path.extension()
@@ -73,6 +71,10 @@ pub struct Mosaic {
     pub h: usize,
     pub black: [f32; 4],
     pub maximum: u32,
+    /// libraw's per-camera scene-referred gain in EV (0 when unspecified)
+    pub baseline_exposure: f32,
+    /// per-channel real saturation point when libraw knows it (0 = n/a)
+    pub linear_max: [u32; 4],
     /// as-shot white balance multipliers (R G1 B G2)
     pub cam_mul: [f32; 4],
     /// XYZ->camera matrix (dcraw cam_xyz semantics), 4x3
@@ -83,6 +85,12 @@ pub struct Mosaic {
     pub pre_mul: [f32; 4],
     pub cfa: CfaPattern,
     pub info: CameraInfo,
+    /// DNG embedded lens-correction opcodes (GainMap / WarpRectilinear)
+    pub dng_ops: Option<crate::dngops::DngOps>,
+    /// LR "Denoise"/"SuperRes" DNGs embed a demosaiced camera-space RGB
+    /// image (LinearRaw IFD, JPEG XL tiles) — when present this is what
+    /// Lightroom renders, superseding the CFA mosaic.
+    pub linear: Option<crate::dngops::LinearRaw>,
 }
 
 #[derive(Debug)]
@@ -171,6 +179,18 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         // fall through: let libraw report whatever it can.
     }
     let (h, mut info) = open_raw(path)?;
+    if std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+        eprintln!(
+            "[decode] cfa_kind={} cfa={}x{} {}x{} make={} model={}",
+            info.cfa_kind,
+            info.cfa_w,
+            info.cfa_h,
+            info.raw_width,
+            info.raw_height,
+            ffi::cstr_field(&info.make),
+            ffi::cstr_field(&info.model)
+        );
+    }
     if info.cfa_kind == 0 {
         // not a mosaic raw (linear dng / rgb) - use libraw's own pipeline,
         // falling back to system codecs / embedded preview on failure
@@ -194,7 +214,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         // before the OS codec and the embedded preview.
         if std::env::var_os("SAFELIGHT_NO_HE").is_none() {
             if let Ok((bayer, bw, bh)) = crate::nef_he::decode_nef_he(path) {
-                return mosaic_decoded(&info, bayer, bw, bh);
+                return mosaic_decoded(&info, bayer, bw, bh, crate::dngops::parse(path));
             }
         }
         // other sensor compression libraw can't decode: try macOS ImageIO
@@ -217,12 +237,21 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         bail!("sl_raw_cfa failed ({rc})");
     }
     let data = unsafe { Vec::from_raw_parts(out, count as usize, count as usize) };
-    mosaic_decoded(
+    let mut dec = mosaic_decoded(
         &info,
         data,
         info.raw_width as usize,
         info.raw_height as usize,
-    )
+        crate::dngops::parse(path),
+    )?;
+    if let Decoded::Mosaic(m) = &mut dec {
+        m.linear = crate::dngops::linear_raw(path);
+        if m.linear.is_some() && std::env::var_os("SAFELIGHT_VERBOSE").is_some() {
+            let l = m.linear.as_ref().unwrap();
+            eprintln!("[dng] LinearRaw {}x{} planes={}", l.w, l.h, l.planes.len());
+        }
+    }
+    Ok(dec)
 }
 
 /// Shared Mosaic construction for CFA decodes (libraw unpack or our own
@@ -233,6 +262,7 @@ fn mosaic_decoded(
     data: Vec<u16>,
     raw_w: usize,
     raw_h: usize,
+    dng_ops: Option<crate::dngops::DngOps>,
 ) -> Result<Decoded> {
     let (w, hgt) = if info.width > 0 && info.height > 0 {
         (info.width as usize, info.height as usize)
@@ -269,12 +299,20 @@ fn mosaic_decoded(
         h: hgt,
         black,
         maximum: info.maximum.max(1),
+        baseline_exposure: if info.baseline_exposure < -100.0 {
+            0.0
+        } else {
+            info.baseline_exposure
+        },
+        linear_max: info.linear_max,
         cam_mul: info.cam_mul,
         cam_xyz: info.cam_xyz,
         rgb_cam: info.rgb_cam,
         pre_mul: info.pre_mul,
         cfa,
         info: info_of(info),
+        dng_ops,
+        linear: None,
     }))
 }
 
@@ -349,7 +387,11 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
     path.hash(&mut hasher);
     meta.len().hash(&mut hasher);
     meta.modified()
-        .map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())
+        .map(|m| {
+            m.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        })
         .unwrap_or(0)
         .hash(&mut hasher);
     let dir = std::env::temp_dir().join("safelight-gpr");
@@ -369,6 +411,12 @@ fn gpr_to_dng(path: &Path) -> Result<std::path::PathBuf> {
 
 /// Full-res decode via macOS ImageIO system RAW codecs (real debayer for
 /// formats libraw can't unpack, e.g. Nikon HE/HE*). Returns rgba16 sRGB.
+#[cfg(not(target_os = "macos"))]
+fn imgio_decode(_path: &Path, _info: &ffi::SlRawInfo) -> Result<Decoded> {
+    bail!("imgio decode unavailable off macOS")
+}
+
+#[cfg(target_os = "macos")]
 fn imgio_decode(path: &Path, info: &ffi::SlRawInfo) -> Result<Decoded> {
     let c = CString::new(path.to_string_lossy().as_bytes())?;
     let mut out: *mut u16 = std::ptr::null_mut();
@@ -535,8 +583,8 @@ fn decode_raster(path: &Path) -> Result<Decoded> {
     // sniff content, not extension: .insp stills are dual-lens JPEGs and
     // image::open's format guess rejects unknown extensions outright
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let img = image::load_from_memory(&bytes)
-        .with_context(|| format!("decode {}", path.display()))?;
+    let img =
+        image::load_from_memory(&bytes).with_context(|| format!("decode {}", path.display()))?;
     // keep 16-bit sources at full depth (to_rgba16 expands 8-bit inputs
     // identically to the old (v<<8)|v path)
     let rgba16 = img.to_rgba16();
@@ -635,6 +683,201 @@ pub fn embedded_thumb(path: &Path) -> Result<Option<Thumb>> {
         rgba,
         flip: info.flip,
     }))
+}
+
+#[cfg(test)]
+mod rawstats {
+    use super::*;
+    #[test]
+    fn parse_dcp() {
+        let p = Path::new(
+            r"C:\Program Files\Adobe\Adobe Lightroom Classic\Resources\CameraProfiles\Adobe Standard\Sony ILCE-7RM3 Adobe Standard.dcp",
+        );
+        // diagnostic: needs a local Lightroom install; skip elsewhere
+        let Ok(d) = std::fs::read(p) else { return };
+        let prof = crate::dcp::DcpProfile::parse(&d).unwrap();
+        eprintln!(
+            "name={:?} hsm1={} hsm2={} tone={}pts look={} fwd={:?}",
+            prof.name,
+            prof.hsm1.is_some(),
+            prof.hsm2.is_some(),
+            prof.tone_curve.len(),
+            prof.look_table.is_some(),
+            (
+                prof.forward_matrix1.is_some(),
+                prof.forward_matrix2.is_some()
+            )
+        );
+        if let Some(h) = &prof.hsm1 {
+            let vm: f32 = h.data.iter().map(|c| c[2]).sum::<f32>() / h.data.len() as f32;
+            eprintln!("hsm dims={:?} vscale_mean={vm:.3}", h.dims);
+        }
+    }
+    #[test]
+    #[ignore = "slow diagnostic: decodes an 86MB raw several times"]
+    fn print_sony() {
+        let p = Path::new(r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW");
+        // diagnostic: needs the local RAW collection; skip elsewhere
+        if !p.exists() {
+            return;
+        }
+        match decode(p) {
+            Ok(Decoded::Mosaic(m)) => {
+                eprintln!(
+                    "black={:?} max={} cam_mul={:?} pre_mul={:?} baseline_ev={} linear_max={:?}",
+                    m.black, m.maximum, m.cam_mul, m.pre_mul, m.baseline_exposure, m.linear_max
+                );
+                // raw DN histogram on the CFA plane (sample every 4th px)
+                let mut h = [0u64; 16];
+                let mut at_black = 0u64;
+                let mut n = 0u64;
+                let max = m.maximum.max(1) as f32;
+                for i in (0..m.data.len()).step_by(4) {
+                    let v = m.data[i] as f32 / max;
+                    h[(v * 15.999) as usize] += 1;
+                    if m.data[i] as f32 <= m.black[0].max(m.black[1]).max(m.black[2]) {
+                        at_black += 1;
+                    }
+                    n += 1;
+                }
+                eprintln!("hist/16 {:?}", h);
+                eprintln!("at_or_below_black {:.3}", at_black as f32 / n as f32);
+                // scene-linear stats after black subtraction, per CFA channel
+                let blk = m.black[0];
+                let mut sums = [0f64; 4];
+                let mut cnt = [0u64; 4];
+                // step 1: every CFA cell must be hit (a 2-step keeps parity)
+                for y in 0..m.raw_h.min(4000) {
+                    for x in 0..m.raw_w.min(4000) {
+                        let ch = m.cfa.color_at(x % m.cfa.w, y % m.cfa.h) as usize;
+                        let v = (m.data[y * m.raw_w + x] as f32 - blk).max(0.0) / (max - blk);
+                        sums[ch] += v as f64;
+                        cnt[ch] += 1;
+                    }
+                }
+                eprintln!(
+                    "cfa={:?}x{:?} cnt={:?} linear/ch R={:.5} G={:.5} B={:.5} G2={:.5}",
+                    m.cfa.w,
+                    m.cfa.cells,
+                    cnt,
+                    sums[0] / cnt[0].max(1) as f64,
+                    sums[1] / cnt[1].max(1) as f64,
+                    sums[2] / cnt[2].max(1) as f64,
+                    sums[3] / cnt[3].max(1) as f64
+                );
+                // masked-margin pixels = the true optical black level
+                eprintln!(
+                    "raw {}x{} margins l={} t={}",
+                    m.raw_w, m.raw_h, m.left, m.top
+                );
+                for band in [
+                    (0usize, m.raw_h, 0usize, m.left.min(64)),
+                    (0usize, m.top.min(64), 0usize, m.raw_w),
+                ] {
+                    let (y0, y1, x0, x1) = band;
+                    let mut v = Vec::new();
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            v.push(m.data[y * m.raw_w + x]);
+                        }
+                    }
+                    if !v.is_empty() {
+                        v.sort_unstable();
+                        eprintln!(
+                            "  band {:?}: n={} p10={} p50={} p90={}",
+                            band,
+                            v.len(),
+                            v[v.len() / 10],
+                            v[v.len() / 2],
+                            v[v.len() * 9 / 10]
+                        );
+                    }
+                }
+                // stage isolation: mean of the post-colorize linear buffer
+                // (WB + profile matrix, pre-adjust) vs the display output
+                {
+                    let r = crate::recipe::Recipe::default();
+                    let dd = Decoded::Mosaic(m);
+                    match crate::develop::lin_base(&dd, &r) {
+                        Ok((lin, _w, _h)) => {
+                            let (mut s, mut n) = (0.0f64, 0u64);
+                            for px in lin.iter().step_by(97) {
+                                s += (px[0] + px[1] + px[2]) as f64;
+                                n += 1;
+                            }
+                            eprintln!("lin_base mean {:.5}", s / n.max(1) as f64 / 3.0);
+                        }
+                        Err(e) => eprintln!("lin_base: {e}"),
+                    }
+                }
+                // try lower black levels: if the true black is below 512,
+                // subtracting 512 crushes real shadow signal
+                for blk in [512.0f32, 384.0, 256.0, 128.0, 0.0] {
+                    let mut m2 = match decode(p) {
+                        Ok(Decoded::Mosaic(mm)) => mm,
+                        _ => continue,
+                    };
+                    m2.black = [blk; 4];
+                    let mut r = crate::recipe::Recipe::default();
+                    r.profile = "Adobe Color".to_string();
+                    r.curve = vec![[0.0, 0.0], [1.0, 1.0]];
+                    let img = crate::develop::develop_cpu(&Decoded::Mosaic(m2), &r, 1024);
+                    let buf = &img.data;
+                    let (mut n0, mut sum) = (0u64, 0u64);
+                    for px in buf.chunks(4) {
+                        if px[0].max(px[1]).max(px[2]) == 0 {
+                            n0 += 1;
+                        }
+                        sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
+                    }
+                    let np = (buf.len() / 4) as u64;
+                    eprintln!(
+                        "black={blk}: zero={:.3} mean={:.3}",
+                        n0 as f32 / np as f32,
+                        sum as f32 / (np as f32 * 3.0) / 255.0
+                    );
+                }
+            }
+            _ => eprintln!("not mosaic"),
+        }
+    }
+
+    /// Scene-linear percentiles of the demosaiced G channel, for
+    /// correlating fitted exposure-ramp params with raw stats.
+    /// `SAFELIGHT_DIAG_FILE` picks the raw file.
+    #[test]
+    #[ignore = "diagnostic: decodes a local raw file"]
+    fn raw_stats() {
+        let path = std::env::var("SAFELIGHT_DIAG_FILE")
+            .unwrap_or_else(|_| r"G:\カメラ\RAW_alpha7R3\2023\0419\DSC00151.ARW".into());
+        let p = Path::new(&path);
+        if !p.exists() {
+            return;
+        }
+        let m = match decode(p) {
+            Ok(Decoded::Mosaic(m)) => m,
+            _ => return,
+        };
+        let blk = m.black[0].max(m.black[1]).max(m.black[2]);
+        let white = m
+            .linear_max
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(m.maximum)
+            .max(blk as u32) as f32;
+        // sample the green channel (dominant luma proxy) every 8th px
+        let mut v = Vec::with_capacity(1 << 18);
+        for i in (0..m.data.len()).step_by(8) {
+            v.push((m.data[i] as f32 - blk).max(0.0) / (white - blk));
+        }
+        v.sort_unstable_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
+        eprintln!(
+            "raw_stats {}: p001={:.5} p01={:.5} p05={:.5} p25={:.5} p50={:.5} p75={:.5} p95={:.5} p99={:.5} p999={:.5} max={:.5}",
+            path, q(0.001), q(0.01), q(0.05), q(0.25), q(0.5), q(0.75), q(0.95), q(0.99), q(0.999), v[v.len()-1]
+        );
+    }
 }
 
 #[cfg(test)]

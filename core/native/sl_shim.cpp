@@ -2,6 +2,11 @@
 
 #include <libraw/libraw.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#include <windows.h>
+#endif
+
 #include <cstdlib>
 #include <cstring>
 
@@ -14,7 +19,19 @@ extern "C" {
 SlRaw* sl_raw_open(const char* path, SlRawInfo* info) {
   if (!path || !info) return nullptr;
   LibRaw* r = new LibRaw();
-  if (r->open_file(path) != LIBRAW_SUCCESS) {
+  int rc;
+#ifdef _WIN32
+  /* paths arrive UTF-8; open via the wchar_t overload */
+  {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    wchar_t* wpath = (wchar_t*)alloca(n * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, n);
+    rc = r->open_file(wpath);
+  }
+#else
+  rc = r->open_file(path);
+#endif
+  if (rc != LIBRAW_SUCCESS) {
     delete r;
     return nullptr;
   }
@@ -73,6 +90,8 @@ SlRaw* sl_raw_open(const char* path, SlRawInfo* info) {
   info->aperture = id.other.aperture;
   info->focal = id.other.focal_len;
   info->timestamp = (long)id.other.timestamp;
+  info->baseline_exposure = id.color.dng_levels.baseline_exposure;
+  for (int i = 0; i < 4; i++) info->linear_max[i] = id.color.linear_max[i];
 
   return new SlRaw{r};
 }
@@ -92,6 +111,8 @@ void sl_raw_refresh_info(SlRaw* r, SlRawInfo* info) {
     info->pre_mul[i] = id.color.pre_mul[i];
   }
   memcpy(info->rgb_cam, id.color.rgb_cam, sizeof(info->rgb_cam));
+  info->baseline_exposure = id.color.dng_levels.baseline_exposure;
+  for (int i = 0; i < 4; i++) info->linear_max[i] = id.color.linear_max[i];
 }
 
 int sl_raw_cfa(SlRaw* r, unsigned short** out, int* count) {

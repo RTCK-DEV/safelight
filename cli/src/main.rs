@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use safelight_core::{Engine, Recipe};
@@ -13,6 +13,7 @@ fn main() -> Result<()> {
   safelight-cli thumb <raw> <out.png> [max_px]
   safelight-cli reference <raw> <out.png>
   safelight-cli scan <folder>
+  safelight-cli lrcat <catalog.lrcat> [--apply]
   safelight-cli meta <file>
   safelight-cli auto <file>
   safelight-cli rate <file> <0-5>"
@@ -26,15 +27,25 @@ fn main() -> Result<()> {
             let path = Path::new(&args[2]);
             let out = args.get(3).map(String::as_str).unwrap_or("out.png");
             // a recipe path argument must read + parse — silent fallback would
-            // render with the wrong settings and look like success
+            // render with the wrong settings and look like success.
+            // .xmp files are parsed as Lightroom develop presets (crs:*).
             let recipe = match args.get(4) {
                 Some(p) => {
                     let s =
                         std::fs::read_to_string(p).with_context(|| format!("read recipe {p}"))?;
-                    Recipe::from_json(&s)
-                        .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
+                    if p.ends_with(".xmp") {
+                        safelight_core::xmp::crs_to_recipe(&s)
+                    } else {
+                        Recipe::from_json(&s)
+                            .ok_or_else(|| anyhow::anyhow!("invalid recipe JSON in {p}"))?
+                    }
                 }
-                None => Recipe::default(),
+                // no recipe arg: adopt any saved sidecar (.safelight.json,
+                // Lightroom .xmp, or embedded XMP in the file itself)
+                None => eng
+                    .read_sidecar(path)
+                    .map(|sc| sc.recipe)
+                    .unwrap_or_default(),
             };
             let max_px: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
             let t = std::time::Instant::now();
@@ -87,8 +98,101 @@ fn main() -> Result<()> {
                 args[4..].iter().map(std::path::PathBuf::from).collect();
             let t = std::time::Instant::now();
             let img = eng.merge(&paths, mode)?;
-            eprintln!("merge {mode} {}x{} in {:?}", img.width, img.height, t.elapsed());
-            image::save_buffer(out, &img.data, img.width, img.height, image::ColorType::Rgba8)?;
+            eprintln!(
+                "merge {mode} {}x{} in {:?}",
+                img.width,
+                img.height,
+                t.elapsed()
+            );
+            image::save_buffer(
+                out,
+                &img.data,
+                img.width,
+                img.height,
+                image::ColorType::Rgba8,
+            )?;
+        }
+        // import a Lightroom Classic catalog: Lua develop settings → crs
+        // recipes, plus rating/flag/label, written as .safelight.json
+        // sidecars next to each image that exists on disk.
+        "lrcat" => {
+            let apply = args.iter().any(|a| a == "--apply");
+            let limit: Option<usize> = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--limit="))
+                .and_then(|v| v.parse().ok());
+            let grep = args.iter().find_map(|a| a.strip_prefix("--grep="));
+            // catalog stores the volume it was created on; remap when files
+            // moved (e.g. --root=D:/カメラ/RAW/=G:/カメラ/RAW_alpha7R3/2023/)
+            let remap: Vec<(&str, &str)> = args
+                .iter()
+                .filter_map(|a| a.strip_prefix("--root="))
+                .filter_map(|s| s.split_once('='))
+                .collect();
+            let cat_path = Path::new(&args[2]);
+            let mut list = safelight_core::lrcat::entries(cat_path)?;
+            for e in &mut list {
+                for (from, to) in &remap {
+                    let p = e.path.to_string_lossy().replace('\\', "/");
+                    if let Some(rest) = p.strip_prefix(from) {
+                        e.path = PathBuf::from(format!("{to}{rest}"));
+                    }
+                }
+            }
+            if let Some(g) = grep {
+                list.retain(|e| e.path.to_string_lossy().contains(g));
+            }
+            if let Some(n) = limit {
+                list.truncate(n);
+            }
+            // LR's computed AI-mask bitmaps live in <catalog>.lrcat-data/*.blob
+            // keyed by MaskDigest — index once, extract per image on apply.
+            let blobs = if apply {
+                safelight_core::lrcat::blob_index(cat_path)
+            } else {
+                Default::default()
+            };
+            let mut n_disk = 0usize;
+            let mut n_edits = 0usize;
+            let mut n_write = 0usize;
+            let mut n_masks = 0usize;
+            for e in &mut list {
+                if !e.path.exists() {
+                    continue;
+                }
+                n_disk += 1;
+                let importable = e.has_edits
+                    || e.sidecar.rating != 0
+                    || e.sidecar.flag != 0
+                    || !e.sidecar.label.is_empty()
+                    || !e.sidecar.keywords.is_empty();
+                if !importable {
+                    continue;
+                }
+                n_edits += 1;
+                if apply {
+                    n_masks += safelight_core::lrcat::apply_blob_masks(
+                        &blobs,
+                        &mut e.sidecar.recipe,
+                        &e.path,
+                    );
+                    let sp = safelight_core::recipe::sidecar_path_for(&e.path);
+                    std::fs::write(&sp, serde_json::to_string_pretty(&e.sidecar)?)
+                        .with_context(|| format!("write {}", sp.display()))?;
+                    n_write += 1;
+                }
+            }
+            println!(
+                "{} catalog images, {} on disk, {} with edits — {}",
+                list.len(),
+                n_disk,
+                n_edits,
+                if apply {
+                    format!("{n_write} sidecars written, {n_masks} mask bitmaps extracted")
+                } else {
+                    "dry run — pass --apply".into()
+                }
+            );
         }
         "meta" => {
             let v = eng.metadata(Path::new(&args[2]))?;
