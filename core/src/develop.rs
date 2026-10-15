@@ -1756,7 +1756,10 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
 fn tone_fit_consts() -> [f32; 11] {
     static C: std::sync::OnceLock<[f32; 11]> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
-        let mut c = [0.0488f32, 0.9349, 3.0063, 0.6151, 1.6655, 1.5514, 0.3064, 0.0463, 0.04, 32.0, 1.5];
+        // refit post black-floor fix (Powell on real renders, 12 tone-diverse
+        // images): wider shadows band, stronger highlight recovery, higher
+        // white-point floor
+        let mut c = [0.1125f32, 0.8799, 3.2614, 0.6079, 1.6648, 1.2809, 0.8626, 0.0416, 0.04, 32.0, 1.5];
         if let Ok(v) = std::env::var("SL_TONE_LUT") {
             let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             if p.len() >= 8 {
