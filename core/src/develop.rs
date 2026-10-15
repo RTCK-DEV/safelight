@@ -4073,11 +4073,16 @@ pub fn colorize_plane(
                     None => demosaic_pixel(m, vx, vy, stride, norm),
                 },
             };
-            // WB in camera space, clip at sensor white -> neutral highlights
+            // WB in camera space. LR/ACR keeps overrange (>1) data through
+            // the profile matrix + HueSatMap (fSeqPinSrcOverrange) — only
+            // truly clipped sensor channels need the 1.0 clip. SL_OVR=0
+            // restores the legacy hard clip.
+            let ovr = matches!(std::env::var("SL_OVR").as_deref(), Ok("1"));
+            let lim = if ovr { f32::INFINITY } else { 1.0 };
             let cw = [
-                (cam[0] * p.wb[0]).clamp(0.0, 1.0),
-                (cam[1] * p.wb[1]).clamp(0.0, 1.0),
-                (cam[2] * p.wb[2]).clamp(0.0, 1.0),
+                (cam[0] * p.wb[0]).clamp(0.0, lim),
+                (cam[1] * p.wb[1]).clamp(0.0, lim),
+                (cam[2] * p.wb[2]).clamp(0.0, lim),
             ];
             let mut out = [0.0f32; 3];
             for c in 0..3 {
