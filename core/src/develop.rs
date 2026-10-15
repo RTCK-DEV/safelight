@@ -6573,6 +6573,7 @@ fn sharpen_clarity(
         s / n as f32
     };
     let mut out = vec![[0.0f32; 3]; lin.len()];
+    let lrclar = std::env::var("SL_LRCLAR").map_or(false, |s| s == "1");
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -6625,13 +6626,43 @@ fn sharpen_clarity(
                 } else {
                     lin[i][c]
                 };
-                if clarity != 0.0 {
-                    v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));
-                }
-                // LR Texture: same midtone-weighted local contrast as clarity
-                // but at a finer (3x3) scale and lower gain
-                if texture != 0.0 {
-                    v += texture * 0.45 * mid * (lin[i][c] - boxn(&chans[c], x, y, 1));
+                // LR LocalContrast (Sequence2 shader): unsharp on luma in the
+                // soft-sqrt domain, applied back as a multiplicative RGB gain.
+                // sv(x) = 1.064451*(sqrt(x+1/256) - 1/16); inverse below.
+                // W suppresses the effect where the blurred luma is dark.
+                if (clarity != 0.0 || texture != 0.0) && lrclar {
+                    let l = 0.25 * lin[i][0] + 0.5 * lin[i][1] + 0.25 * lin[i][2];
+                    let mut so = 1.064451 * ((l.max(0.0) + 0.003906).sqrt() - 0.0625);
+                    if clarity != 0.0 {
+                        let b = 0.25 * boxn(&chans[0], x, y, 2)
+                            + 0.5 * boxn(&chans[1], x, y, 2)
+                            + 0.25 * boxn(&chans[2], x, y, 2);
+                        let sb = 1.064451 * ((b.max(0.0) + 0.003906).sqrt() - 0.0625);
+                        let n = (2.0 * sb - 1.0).min(0.0);
+                        let wn = (1.0 - n.powi(4)).powi(4).clamp(0.0, 1.0);
+                        so += clarity * wn * (so - sb);
+                    }
+                    if texture != 0.0 {
+                        let b = 0.25 * boxn(&chans[0], x, y, 1)
+                            + 0.5 * boxn(&chans[1], x, y, 1)
+                            + 0.25 * boxn(&chans[2], x, y, 1);
+                        let sb = 1.064451 * ((b.max(0.0) + 0.003906).sqrt() - 0.0625);
+                        let n = (2.0 * sb - 1.0).min(0.0);
+                        let wn = (1.0 - n.powi(4)).powi(4).clamp(0.0, 1.0);
+                        so += texture * 0.75 * wn * (so - sb);
+                    }
+                    let base = 0.939451 * so.max(0.0) + 0.0625;
+                    let lout = (base * base - 0.003906).max(0.0);
+                    v *= (lout / l.max(1e-5)).clamp(0.5, 2.0);
+                } else {
+                    if clarity != 0.0 {
+                        v += clarity * 0.6 * mid * (lin[i][c] - boxn(&chans[c], x, y, 2));
+                    }
+                    // LR Texture: same midtone-weighted local contrast as clarity
+                    // but at a finer (3x3) scale and lower gain
+                    if texture != 0.0 {
+                        v += texture * 0.45 * mid * (lin[i][c] - boxn(&chans[c], x, y, 1));
+                    }
                 }
                 out[i][c] = v;
             }

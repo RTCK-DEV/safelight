@@ -101,3 +101,26 @@ fDeltaScale(220), エッジマスクバッファ(t0, step 224/228)。
 - HSL/LuminanceチューナーはRGBTone2カーブの前 (CPU+GPU両方修正済み)
 - 30枚シャープン有効コーパスで luma方式 vs RGB方式: 完全一致(<1e-4) —
   実画像のUSMデルタはほぼ無彩色のため。残差はシャープン由来ではない
+
+## LocalClarity / LocalContrast (Sequence2, sh_059349e0)
+
+LRのclarity/textureは softsqrt輝度域のアンシャープマスク:
+  sv(x)  = 1.064451*(sqrt(x + 1/256) - 1/16)   (0→0, 1→1 正規化)
+  svinv(y) = (0.939451*y + 0.0625)^2 - 1/256
+  L = 0.25R + 0.5G + 0.25B (clarity専用重み)
+  B = ブラー済み輝度 (t5バッファ, 別パスで事前生成)
+  W = (1 - min(2*sv(B)-1, 0)^4)^4  — 暗部窓 (sv(B)<0.5 で効果抑制)
+  sv_out = svL + strength * W * (svL - svB)
+  gain = clamp(svinv(sv_out)/L, .., 2.0); rgb *= gain
+  clarity mask (t6) は exp2(mask*0.585938) で強度変調
+→ SL_LRCLAR=1 でソフトsqrt域版を実装。clarity非ゼロ3画像で中立
+  (コーパスのclarity量が小さいため)。env-gatedで保持。
+
+## 残差の最終分解 (確定)
+
+- blur6後もMAEの72-90%が残存 → 残差は低周波
+- 自由3x3アフィン行列フィットでも 0.151→0.114 / 0.198→0.197 しか改善しない
+  → 残差は大域的な色変換では説明不能 = **空間可変なトーン/色処理**
+- 仮説: グローバルなShadows/Highlightsすらt11-14経由で空間適応的に
+  適用される (uGlobalAmt* × コンテンツ由来マスク)。コーパス残差の
+  本体はこの空間適応トーンマップの差と推定
