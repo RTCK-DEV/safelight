@@ -83,3 +83,21 @@ mask/guide caches warped by geometry (crop/upright).
 ## GPU/CPU parity
 
 - wb_matrix/demap_mat/gamut_compress/post_profile順序をGPU WGSLへ移植後、mean diff 0.0000 を確認 (_DSC6033, _73S5716)
+
+## Sharpen3 パイプライン (sh_057d59c0/057df490/057e74e0)
+
+LRのシャープニングは輝度(Y)プレーンのみで動作し、TGSM共有メモリタイル上で
+半径~3pxのダイヤモンドディスクカーネル(6放射ウェイト cb0[15-16])による
+イテレーティブUSM。主要uniform: fRadius(188), fGlobalSharpenScale(204),
+kFullCaptureSharpenAmount32(208), kBaselineSharpenScale(212), kIterScale(216),
+fDeltaScale(220), エッジマスクバッファ(t0, step 224/228)。
+→ Safelight側はUSMデルタを輝度プレーンで計算しRGBへ乗算ゲインで適用する
+  構造に変更済み (コーパス中立、アーキテクチャ一致)。
+
+## 本セッションの確定事項
+
+- SplitTone = sRGBエンコード域のチャンネル別ゲイン演算 x'=gx/(x(g-1)+1),
+  gk=0.2 デフォルト化 → _73S0953 0.131→0.120
+- HSL/LuminanceチューナーはRGBTone2カーブの前 (CPU+GPU両方修正済み)
+- 30枚シャープン有効コーパスで luma方式 vs RGB方式: 完全一致(<1e-4) —
+  実画像のUSMデルタはほぼ無彩色のため。残差はシャープン由来ではない
