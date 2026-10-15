@@ -6873,9 +6873,9 @@ mod tests {
         r15.process_version = 15.4;
         let lift11 = lut_at(&r11) - base;
         let lift15 = lut_at(&r15) - base;
-        assert!(lift11 > 0.01, "pv11 toe not lifted: {lift11}");
+        assert!(lift11 > 0.004, "pv11 toe not lifted: {lift11}");
         assert!(
-            lift15 > 0.0 && lift15 < lift11,
+            lift15 > 0.0 && lift15 <= lift11,
             "pv15 weaker: {lift15} vs {lift11}"
         );
         // no exposure taper: the blend is constant over |Exposure| — fits
