@@ -1745,8 +1745,10 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     // contrast about pivot + soft-limit ~[0,1.35] — mirrors develop.rs
     if (pg.a1.y != 0.0) {
         let v = (x - vec3<f32>(pg.pv.x)) * (1.0 + pg.a1.y * 0.9) + vec3<f32>(pg.pv.x);
-        let s = (v + sqrt(v * v + vec3<f32>(0.0016))) * 0.5;
-        x = vec3<f32>(1.35) - (vec3<f32>(1.35) - s + sqrt((vec3<f32>(1.35) - s) * (vec3<f32>(1.35) - s) + vec3<f32>(0.0016))) * 0.5;
+        // eps tiny: softmin/softmax leaves ~eps/2 floor at black —
+        // mirrors develop.rs
+        let s = (v + sqrt(v * v + vec3<f32>(1e-7))) * 0.5;
+        x = vec3<f32>(1.35) - (vec3<f32>(1.35) - s + sqrt((vec3<f32>(1.35) - s) * (vec3<f32>(1.35) - s) + vec3<f32>(1e-7))) * 0.5;
     }
     if (pg.a2.z != 0.0 || pg.a2.w != 0.0) {
         let luma2 = luma(x);

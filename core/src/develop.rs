@@ -1797,7 +1797,15 @@ fn build_tone_lut(r: &Recipe) -> [f32; 512] {
             let mut y = y0;
             // shadows lift (low band gain, linear domain)
             if sh != 0.0 {
-                y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0);
+                // LR applies the shadows amount in log2 space (multiplicative
+                // on linear luma) — a flat additive lift would leave a ~0.15
+                // sRGB floor at true black. sstep(0,0.02) sends the lift to 0
+                // at black while keeping the measured band shape above it.
+                // SL_SHTOE=<edge> sets the toe width (0 => legacy flat lift).
+                let toe_edge: f32 = std::env::var("SL_SHTOE")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
+                let toe = if toe_edge <= 0.0 { 1.0 } else { sstep(0.0, toe_edge, y0) };
+                y += sh * sh_mul * (1.0 - sstep(0.0, sh_band, y0)) * (1.0 - y0 / 1.6).max(0.0) * toe;
             }
             // shadow rolloff shaping
             if shr != 1.0 {
@@ -2618,7 +2626,9 @@ fn adjust_g(
     if p.contrast != 0.0 {
         for c in &mut x {
             let v = (*c - p.pivot) * cm + p.pivot;
-            let s = |u: f32| (u + (u * u + 0.0016).sqrt()) * 0.5;
+            // eps must stay tiny: the softmin/softmax pair leaves a floor of
+            // ~eps/2 at black (0.0016 => 0.02 lin = 0.15 sRGB floor).
+            let s = |u: f32| (u + (u * u + 1e-7).sqrt()) * 0.5;
             *c = 1.35 - s(1.35 - s(v));
         }
     }
