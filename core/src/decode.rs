@@ -192,6 +192,41 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         );
     }
     if info.cfa_kind == 0 {
+        // LinearDNG (LR "Denoise"/"Super Resolution"): the LinearRaw IFD
+        // holds demosaiced scene-linear RGB — the same data Lightroom
+        // renders. Route it through the mosaic/linear pipeline instead of
+        // libraw's display-sRGB process (which double-gammas the data).
+        if let Some(lr) = crate::dngops::linear_raw(path) {
+            return Ok(Decoded::Mosaic(Mosaic {
+                data: Vec::new(),
+                raw_w: 0,
+                raw_h: 0,
+                left: 0,
+                top: 0,
+                w: lr.w,
+                h: lr.h,
+                black: [0.0; 4],
+                maximum: lr.white.max(1.0) as u32,
+                baseline_exposure: if info.baseline_exposure < -100.0 {
+                    0.0
+                } else {
+                    info.baseline_exposure
+                },
+                linear_max: info.linear_max,
+                cam_mul: info.cam_mul,
+                cam_xyz: info.cam_xyz,
+                rgb_cam: info.rgb_cam,
+                pre_mul: info.pre_mul,
+                cfa: CfaPattern {
+                    w: 2,
+                    h: 2,
+                    cells: vec![0, 1, 1, 2],
+                },
+                info: info_of(&info),
+                dng_ops: crate::dngops::parse(path),
+                linear: Some(lr),
+            }));
+        }
         // not a mosaic raw (linear dng / rgb) - use libraw's own pipeline,
         // falling back to system codecs / embedded preview on failure
         match process8(&h) {

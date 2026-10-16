@@ -991,7 +991,15 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     // BaselineExposure folds in here — from the .dcp (profile's expected
     // gain) and from the file itself (DNG 0xC62A — e.g. DJI writes +1.8
     // because its raws are intentionally exposed dark).
-    let dng_baseline_ev = m.dng_ops.as_ref().map(|o| o.baseline_ev).unwrap_or(0.0);
+    // BaselineExposure is ignored on LinearRaw planes (Adobe's own denoise/
+    // merged DNGs): their data is already rendered at capture brightness, and
+    // LR's preview brightness matches slider exposure alone — applying the
+    // tag double-exposes (~2x too bright on -NR.dng files).
+    let dng_baseline_ev = if m.linear.is_some() {
+        0.0
+    } else {
+        m.dng_ops.as_ref().map(|o| o.baseline_ev).unwrap_or(0.0)
+    };
     // Sony expanded-LOW ISO (50/64/80 on bodies whose native base is 100):
     // the sensor records at native ISO and the file is tagged down, so ACR
     // compensates with a -log2(100/iso) EV baseline pull — verified against

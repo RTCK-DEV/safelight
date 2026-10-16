@@ -265,3 +265,24 @@ LR хранит превью **в ориентации сенсора** — ка
 Реальное состояние пайплайна: median ~0.09-0.097 на широком корпусе —
 тон-ядро близко, хвост = контент-адаптивные фильтры LR и немаскированные
 фичи (как и диагностировано ранее).
+
+## LinearRaw DNG: BaselineExposure を適用しない（確定修正）
+
+Adobe Denoise/強化-NR の LinearDNG では LinearRaw プレーンが既に
+キャプチャ輝度でレンダー済み。LR のプレビュー輝度はスライダー露出
+だけの結果と一致し、BaselineExposure を加算すると ~2x 明るくなる
+(4659: MAE 0.444 → 0.414/輝度 0.80→0.69、ev0比較で検証)。
+
+- `develop.rs`: `m.linear.is_some()` のとき `dng_baseline_ev = 0`
+- `decode.rs`: cfa_kind==0 でも `linear_raw()` を試行 — LR Denoise DNG が
+  libraw process8 (display-sRGB) に落ちるのを防ぎ、scene-linear 経路へ
+
+### 評価上の注意: stale preview
+
+MAE >0.3 の「最悪」NRファイル群 (8235/9588/8115/9403/4659) は
+**DNG内蔵XMPが Exposure2012=0** を示す — LRプレビューは埋め込み設定
+(=全スライダー0) で生成され、カタログの新しい編集(+1.6〜+2.6EV)は
+プレビュー未反映。ゼロ設定で再レンダーすると MAE 0.07-0.13 に正常化。
+内蔵XMPとカタログ設定が一致するファイル (0993/4001) は最初から一致。
+→ 今後のコーパス評価では LinearDNG は内蔵XMP側を正とみなすか、
+recipeなしレンダー(read_sidecar→embedded XMP)で比較すべき。
