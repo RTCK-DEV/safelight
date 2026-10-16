@@ -4186,11 +4186,36 @@ pub fn colorize_plane(
             let ovr = matches!(std::env::var("SL_OVR").as_deref(), Ok("1"));
             let lim = if ovr { f32::INFINITY } else { 1.0 };
             let eg = if p.expo_early { p.exposure_mul } else { 1.0 };
-            let cw = [
-                (cam[0] * p.wb[0] * eg).clamp(0.0, lim),
-                (cam[1] * p.wb[1] * eg).clamp(0.0, lim),
-                (cam[2] * p.wb[2] * eg).clamp(0.0, lim),
+            let raw = [
+                (cam[0] * p.wb[0] * eg).max(0.0),
+                (cam[1] * p.wb[1] * eg).max(0.0),
+                (cam[2] * p.wb[2] * eg).max(0.0),
             ];
+            // SL_HLREC=k: LR's ABCtoRGB highlight recovery — a channel past
+            // the clip point is pulled toward the max UNclipped channel by
+            // t^2*(max-v)+v, so blown channels converge to the surviving
+            // hue instead of hard-clipping (decoded from shader case 1).
+            let mut cw = raw;
+            if let Ok(k) = std::env::var("SL_HLREC") {
+                if let Ok(k) = k.parse::<f32>() {
+                    if k > 0.0 {
+                        let mx = raw
+                            .iter()
+                            .copied()
+                            .filter(|&v| v <= 1.0)
+                            .fold(0.0f32, f32::max);
+                        for v in &mut cw {
+                            if *v > 1.0 {
+                                let t = (*v - 1.0) * k;
+                                *v = t * t * (mx - *v) + *v;
+                            }
+                        }
+                    }
+                }
+            }
+            for v in &mut cw {
+                *v = v.clamp(0.0, lim);
+            }
             let mut out = [0.0f32; 3];
             for c in 0..3 {
                 out[c] = p.m[c][0] * cw[0] + p.m[c][1] * cw[1] + p.m[c][2] * cw[2];
