@@ -59,6 +59,12 @@ pub struct Recipe {
     pub noise_luma: f32,
     /// straighten angle in degrees, -10..10
     pub rotation_deg: f32,
+    /// LR catalog orientation as a dcraw flip code (0 none, 3=180, 5=90ccw,
+    /// 6=90cw). -1 = not set — fall back to the file's EXIF orientation.
+    /// Lightroom stores the user's Rotate Left/Right choice in the catalog;
+    /// exports bake it, previews keep source orientation.
+    #[serde(default = "neg_one_i")]
+    pub orientation: i32,
     /// mid-tone local contrast -1..1
     pub clarity: f32,
     /// corner darkening -1..1 (positive darkens)
@@ -592,6 +598,9 @@ fn default_true() -> bool {
 fn default_one() -> f32 {
     1.0
 }
+fn neg_one_i() -> i32 {
+    -1
+}
 fn neg_one() -> f32 {
     -1.0
 }
@@ -657,6 +666,7 @@ impl Default for Recipe {
             sharp_detail: 0.25,
             noise_luma: 0.0,
             rotation_deg: 0.0,
+            orientation: -1,
             clarity: 0.0,
             vignette: 0.0,
             vig_mid: -1.0,

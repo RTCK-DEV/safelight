@@ -2887,7 +2887,7 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let (fw, fh, cl, ct, ew, eh, dw, dh) =
-            frame_geometry(vw as usize, vh as usize, m.info.flip, r.crop, max_px);
+            frame_geometry(vw as usize, vh as usize, crate::develop::eff_flip(if r.orientation >= 0 { r.orientation } else { m.info.flip }), r.crop, max_px);
         let (fw, fh) = (fw as u32, fh as u32);
         let (dw, dh) = (dw as u32, dh as u32);
         let out_b = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -2954,7 +2954,7 @@ impl Gpu {
                 r.wb_pick,
                 vw as usize,
                 vh as usize,
-                m.info.flip,
+                crate::develop::eff_flip(if r.orientation >= 0 { r.orientation } else { m.info.flip }),
                 r.wb_pick_size,
             )
         } else {
@@ -3042,7 +3042,7 @@ impl Gpu {
                 0.0,
             ],
             g0: [m.raw_w as u32, m.raw_h as u32, m.left as u32, m.top as u32],
-            g1: [vw, vh, stride, m.info.flip as u32],
+            g1: [vw, vh, stride, crate::develop::eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }) as u32],
             g2: [vw, vh, dw, dh],
             g3: [m.cfa.w as u32, m.cfa.h as u32, samp_step, fw],
             g4: [
@@ -3067,7 +3067,7 @@ impl Gpu {
             heal: {
                 let mut a = [[0.0f32; 4]; 8];
                 for (i, s) in p.spots.iter().enumerate() {
-                    let (sx, sy, rad) = spot_to_src(*s, vw as usize, vh as usize, m.info.flip);
+                    let (sx, sy, rad) = spot_to_src(*s, vw as usize, vh as usize, crate::develop::eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }));
                     a[i] = [sx, sy, rad, 0.0];
                 }
                 a
@@ -3157,9 +3157,9 @@ impl Gpu {
             clones: {
                 let mut a = [[0.0f32; 4]; 16];
                 for (i, c) in p.clones.iter().take(8).enumerate() {
-                    let (sx, sy) = frame_to_src(c[0], c[1], vw as usize, vh as usize, m.info.flip);
-                    let (dx, dy) = frame_to_src(c[2], c[3], vw as usize, vh as usize, m.info.flip);
-                    let (fw2, fh2) = match m.info.flip {
+                    let (sx, sy) = frame_to_src(c[0], c[1], vw as usize, vh as usize, crate::develop::eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }));
+                    let (dx, dy) = frame_to_src(c[2], c[3], vw as usize, vh as usize, crate::develop::eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }));
+                    let (fw2, fh2) = match crate::develop::eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }) {
                         5 | 6 => (vh, vw),
                         _ => (vw, vh),
                     };

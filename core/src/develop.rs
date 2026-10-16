@@ -182,6 +182,8 @@ pub struct Params {
     /// adaptive EV trim: predicted per-image exposure compensation gain
     /// (linear multiplier on the pretone buffer, 1.0 = off)
     pub adev_gain: f32,
+    /// LR catalog orientation as dcraw flip code, -1 = use EXIF flip
+    pub orientation: i32,
     pub has_tone: bool,
     /// serial correction stages (DaVinci serial nodes): (params, opacity,
     /// invert_key) per enabled stage, max 4. Each stage re-runs adjust() +
@@ -1238,7 +1240,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
                 let (cl, ct) = (r.crop[0], r.crop[1]);
                 // display-normalized → mask-normalized per flip code,
                 // composed with the crop map into u = ux*nx+uy*ny+uc.
-                let (ux, uy, uc, vx, vy, vc) = match m.info.flip {
+                let (ux, uy, uc, vx, vy, vc) = match eff_flip(if r.orientation >= 0 { r.orientation } else { m.info.flip }) {
                     3 => (
                         // display = 180° rot: mx_n = 1-dx, my_n = 1-dy
                         -sw * aw / bw,
@@ -1674,6 +1676,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             ..r.clone()
         }),
         adev_gain: 1.0,
+        orientation: r.orientation,
         has_tone: r.shadows != 0.0
             || r.highlights != 0.0
             || r.whites != 0.0
@@ -4024,7 +4027,7 @@ pub fn develop_cpu_ctx(
         Decoded::Mosaic(m) => develop_mosaic(m, r, max_px, den, subj),
         Decoded::Raster {
             rgba, w, h, flip, ..
-        } => develop_raster(rgba, *w, *h, *flip, r, max_px, den, subj),
+        } => develop_raster(rgba, *w, *h, eff_flip(*flip), r, max_px, den, subj),
     }
 }
 
@@ -4060,7 +4063,7 @@ fn develop_mosaic(
         let step = 4usize; // sparse sample
                            // WB pick rectangle (virtual src px); empty when not picking
         let pr = if r.wb_mode == WbMode::Pick {
-            pick_rect(r.wb_pick, vw, vh, m.info.flip, r.wb_pick_size)
+            pick_rect(r.wb_pick, vw, vh, eff_flip(if r.orientation >= 0 { r.orientation } else { m.info.flip }), r.wb_pick_size)
         } else {
             [-1.0; 4]
         };
@@ -4150,7 +4153,18 @@ fn develop_mosaic(
     );
     blend_denoise(&mut lin, vw, vh, r.ai_denoise, den);
 
-    finish_linear(lin, vw, vh, &p, m.info.flip, max_px, subj)
+    finish_linear(lin, vw, vh, &p, eff_flip(if p.orientation >= 0 { p.orientation } else { m.info.flip }), max_px, subj)
+}
+
+/// LR previews are stored in the source's native orientation (catalog
+/// orientation is display-side), so preview-matching renders need the raw
+/// frame unrotated. SL_NOFLIP=1 forces flip=0.
+pub(crate) fn eff_flip(flip: i32) -> i32 {
+    if std::env::var_os("SL_NOFLIP").is_some() {
+        0
+    } else {
+        flip
+    }
 }
 
 /// camera-plane -> WB -> camera->sRGB matrix. Shared by the render path and

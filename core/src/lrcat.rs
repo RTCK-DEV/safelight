@@ -30,6 +30,7 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
         "SELECT rf.absolutePath, fo.pathFromRoot, \
                 COALESCE(f.idx_filename, f.baseName || '.' || f.extension), \
                 i.rating, i.pick, COALESCE(i.colorLabels,''), COALESCE(ds.text,''), \
+                COALESCE(i.orientation,'') \
                 COALESCE(kw.kws,'') \
          FROM Adobe_images i \
          JOIN AgLibraryFile f ON i.rootFile = f.id_local \
@@ -59,6 +60,15 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
+        // LR catalog orientation (AB/BC/CD/DA = 0/90/180/270 CW) — the user's
+        // explicit rotation overrides the file's EXIF orientation
+        let orientation = match r.get::<_, String>(8).unwrap_or_default().as_str() {
+            "AB" => 0,
+            "BC" => 6,
+            "CD" => 3,
+            "DA" => 5,
+            _ => -1,
+        };
         // a blob that parses to the same recipe as an empty blob means the
         // image was imported but never edited — still carries rating etc.
         let mut has_edits = false;
@@ -68,6 +78,7 @@ pub fn entries(cat: &Path) -> rusqlite::Result<Vec<LrAsset>> {
             sc.extras = crate::xmp::extras_from_xmp(&xmp);
             has_edits = sc.recipe.to_json() != crs_to_recipe("s = {}").to_json();
         }
+        sc.recipe.orientation = orientation;
         out.push(LrAsset {
             path: Path::new(&root).join(&sub).join(&name),
             sidecar: sc,
