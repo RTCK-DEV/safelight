@@ -6553,6 +6553,9 @@ pub(crate) fn adev_gain_mosaic(m: &Mosaic, p: &Params) -> f32 {
     for i in 0..13 {
         ev += W[i] * (f[i] - MU[i]) / SD[i];
     }
+    if std::env::var_os("SL_ADEV_DBG").is_some() {
+        eprintln!("[adev] feats={:?}", f);
+    }
     2f32.powf(ev.clamp(-0.5, 0.5))
 }
 
