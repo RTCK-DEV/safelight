@@ -179,6 +179,9 @@ pub struct Params {
     /// slider-free LUT (base curve + exposure/pv blend only) — reference for
     /// the spatially-varying slider delta in mode 9
     pub tone_neu: [f32; 512],
+    /// adaptive EV trim: predicted per-image exposure compensation gain
+    /// (linear multiplier on the pretone buffer, 1.0 = off)
+    pub adev_gain: f32,
     pub has_tone: bool,
     /// serial correction stages (DaVinci serial nodes): (params, opacity,
     /// invert_key) per enabled stage, max 4. Each stage re-runs adjust() +
@@ -1670,6 +1673,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             shadow_rolloff: 1.0,
             ..r.clone()
         }),
+        adev_gain: 1.0,
         has_tone: r.shadows != 0.0
             || r.highlights != 0.0
             || r.whites != 0.0
@@ -2170,7 +2174,7 @@ pub fn pc_apply(x: [f32; 3], sw: &PcSwatch, var: f32) -> [f32; 3] {
 /// Everything in adjust() that precedes the tone-map stage — factored out
 /// for diagnostics (SL_DUMP_PRETONE writes this stage's rgb per pixel).
 /// Returns rgb right before the tone LUT.
-fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
+pub(crate) fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
     let mut x = rgb;
     // camera calibration: primary hue/sat matrix + shadow green/magenta
     let ident = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -2282,6 +2286,11 @@ fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3] {
     // global offset wheel
     for c in 0..3 {
         x[c] += p.offset[c];
+    }
+    if p.adev_gain != 1.0 {
+        for c in &mut x {
+            *c *= p.adev_gain;
+        }
     }
     x
 }
@@ -4781,6 +4790,70 @@ fn finish_linear(
     // stroke's first dab (dst-normalized → src-px via the same map the
     // pixel loop uses). Stages share the base mapping (crop unified).
     fill_brush_seeds(&mut pc, &lin, w, h, flip, cl, ct, ew, eh, cx, cy, sin, cos);
+    // adaptive EV trim (SL_ADEV=0 disables): LR's tone response includes a
+    // hidden per-image exposure compensation. Ridge model over pretone-luma
+    // percentiles + sliders, fitted on the 31-image preview corpus
+    // (LOO-validated: mean MAE 0.0520 -> 0.0490, no held-out regression).
+    if std::env::var("SL_ADEV").map(|v| v != "0").unwrap_or(true) {
+        const MU: [f32; 13] = [
+            0.0188905506, 0.0508270606, 0.1155104535, 0.2605165693, 0.5146629220,
+            0.1727350434, -5.3565107584, 2.9223710077, 0.5032258065, -0.27,
+            0.2338709677, 0.0567741935, -0.0964516129,
+        ];
+        const SD: [f32; 13] = [
+            0.0374063586, 0.0741968545, 0.1206984249, 0.2084193963, 0.3291961487,
+            0.1185694883, 3.2815921252, 1.4948554620, 0.8023931427, 0.3333408601,
+            0.3004263360, 0.2264222019, 0.1436741023,
+        ];
+        const W: [f32; 14] = [
+            0.0077669445, 0.0015830116, 0.0223803489, 0.0356507764, -0.0436344887,
+            0.0071526028, 0.0044687681, -0.0374106132, 0.0072814357, 0.0374345731,
+            -0.0500853850, 0.1077811415, 0.0698842051, 0.0158536585,
+        ];
+        let sw = 64usize;
+        let mut hist = [0u32; 256];
+        let (mut n, mut ssum, mut lsum, mut lsq) = (0u32, 0.0f64, 0.0f64, 0.0f64);
+        for gy in 0..sw {
+            for gx in 0..sw {
+                let nx = (gx as f32 + 0.5) / sw as f32;
+                let ny = (gy as f32 + 0.5) / sw as f32;
+                let (sx, sy) = dst_to_src(
+                    nx, ny, cl, ct, ew, eh, cx, cy, sin, cos, pc.key_v, pc.key_h, flip, w, h,
+                );
+                let pt = pre_tone_rgb(bilinear(&lin, w, h, sx, sy), &pc, f32::NAN);
+                let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
+                hist[(l * 160.0).min(255.0) as usize] += 1;
+                n += 1;
+                ssum += l as f64;
+                let ll = (l.max(1e-5)).log2() as f64;
+                lsum += ll;
+                lsq += ll * ll;
+            }
+        }
+        let pct = |q: f32| -> f32 {
+            let t = (q * n as f32) as u32;
+            let mut c = 0u32;
+            for (i, &b) in hist.iter().enumerate() {
+                c += b;
+                if c > t {
+                    return i as f32 / 160.0;
+                }
+            }
+            1.6
+        };
+        let lmu = lsum / n as f64;
+        let f = [
+            pct(0.05), pct(0.25), pct(0.50), pct(0.75), pct(0.95),
+            (ssum / n as f64) as f32, lmu as f32,
+            ((lsq / n as f64 - lmu * lmu).max(0.0)).sqrt() as f32,
+            pc.exposure_ev, pc.highlights, pc.shadows, pc.whites, pc.blacks,
+        ];
+        let mut ev = W[13];
+        for i in 0..13 {
+            ev += W[i] * (f[i] - MU[i]) / SD[i];
+        }
+        pc.adev_gain = 2f32.powf(ev.clamp(-0.5, 0.5));
+    }
     let p = &pc;
     // heuristic sky matte for LR "sky" AI masks (MaskSubType=2):
     // computed once on the filtered linear image.
@@ -6405,6 +6478,84 @@ fn estimate_ca_px(lin: &[[f32; 3]], w: usize, h: usize) -> (f32, f32) {
 
 /// CA estimate for the mosaic path (GPU): cheap sparse demosaic via
 /// `demosaic_pixel`, then the shared edge estimator.
+/// Adaptive EV trim from a coarse CPU demosaic — shared by the GPU path
+/// (which never builds a CPU `lin` buffer). Ridge model over pretone-luma
+/// percentiles + recipe sliders, fitted on the 31-image preview corpus.
+/// SL_ADEV=0 disables. Returns a linear gain (1.0 = no trim).
+pub(crate) fn adev_gain_mosaic(m: &Mosaic, p: &Params) -> f32 {
+    if std::env::var("SL_ADEV").map(|v| v == "0").unwrap_or(false) {
+        return 1.0;
+    }
+    const MU: [f32; 13] = [
+        0.0188905506, 0.0508270606, 0.1155104535, 0.2605165693, 0.5146629220, 0.1727350434,
+        -5.3565107584, 2.9223710077, 0.5032258065, -0.27, 0.2338709677, 0.0567741935,
+        -0.0964516129,
+    ];
+    const SD: [f32; 13] = [
+        0.0374063586, 0.0741968545, 0.1206984249, 0.2084193963, 0.3291961487, 0.1185694883,
+        3.2815921252, 1.4948554620, 0.8023931427, 0.3333408601, 0.3004263360, 0.2264222019,
+        0.1436741023,
+    ];
+    const W: [f32; 14] = [
+        0.0077669445, 0.0015830116, 0.0223803489, 0.0356507764, -0.0436344887, 0.0071526028,
+        0.0044687681, -0.0374106132, 0.0072814357, 0.0374345731, -0.0500853850, 0.1077811415,
+        0.0698842051, 0.0158536585,
+    ];
+    let norm = norm_factors(m);
+    let stride = ((m.w.max(m.h) as f32 / 96.0).ceil() as usize).max(1) * m.cfa.h.max(1);
+    let vw = m.w / stride;
+    let vh = m.h / stride;
+    if vw < 8 || vh < 8 {
+        return 1.0;
+    }
+    let mut hist = [0u32; 256];
+    let (mut n, mut ssum, mut lsum, mut lsq) = (0u32, 0.0f64, 0.0f64, 0.0f64);
+    for vy in 0..vh {
+        for vx in 0..vw {
+            let pt = pre_tone_rgb(demosaic_pixel(m, vx, vy, stride, &norm), p, f32::NAN);
+            let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
+            hist[(l * 160.0).min(255.0) as usize] += 1;
+            n += 1;
+            ssum += l as f64;
+            let ll = (l.max(1e-5)).log2() as f64;
+            lsum += ll;
+            lsq += ll * ll;
+        }
+    }
+    let pct = |q: f32| -> f32 {
+        let t = (q * n as f32) as u32;
+        let mut c = 0u32;
+        for (i, &b) in hist.iter().enumerate() {
+            c += b;
+            if c > t {
+                return i as f32 / 160.0;
+            }
+        }
+        1.6
+    };
+    let lmu = lsum / n as f64;
+    let f = [
+        pct(0.05),
+        pct(0.25),
+        pct(0.50),
+        pct(0.75),
+        pct(0.95),
+        (ssum / n as f64) as f32,
+        lmu as f32,
+        ((lsq / n as f64 - lmu * lmu).max(0.0)).sqrt() as f32,
+        p.exposure_ev,
+        p.highlights,
+        p.shadows,
+        p.whites,
+        p.blacks,
+    ];
+    let mut ev = W[13];
+    for i in 0..13 {
+        ev += W[i] * (f[i] - MU[i]) / SD[i];
+    }
+    2f32.powf(ev.clamp(-0.5, 0.5))
+}
+
 pub fn estimate_ca_mosaic(m: &Mosaic) -> (f32, f32) {
     let norm = norm_factors(m);
     // ~1MP measurement grid, keeping CFA phase alignment

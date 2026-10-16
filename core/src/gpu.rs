@@ -1727,6 +1727,8 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     x = pg.lgg2.xyz * pow(max(x + pg.lgg0.xyz, vec3<f32>(0.0)), 1.0 / pg.lgg1.xyz);
     // offset wheel
     x = x + pg.off0.xyz;
+    // adaptive EV trim — mirrors develop.rs p.adev_gain
+    x = x * pg.lgg2.w;
     // EV-domain tone map (luminance-preserving): shadows/highlights/whites/
     // blacks + rolloff folded into one curve — mirrors develop.rs build_tone_lut
     if (pg.qf.w > 0.5) {
@@ -3052,7 +3054,7 @@ impl Gpu {
             ],
             lgg0: [p.lift[0], p.lift[1], p.lift[2], 0.0],
             lgg1: [p.gamma[0], p.gamma[1], p.gamma[2], 0.0],
-            lgg2: [p.gain[0], p.gain[1], p.gain[2], 0.0],
+            lgg2: [p.gain[0], p.gain[1], p.gain[2], p.adev_gain],
             st0: [
                 p.shadow_col[0],
                 p.shadow_col[1],
@@ -3565,6 +3567,9 @@ impl Gpu {
         };
 
         let mut p = build_params(m, r, stats.as_ref());
+        // adaptive EV trim: pretone stats on a cheap CPU demosaic —
+        // mirrors develop.rs's ADEV block (GPU has no CPU lin buffer)
+        p.adev_gain = crate::develop::adev_gain_mosaic(m, &p);
         // auto lateral CA: measure on a cheap CPU demosaic of the mosaic
         if p.ca_fix > 0.0 {
             let s = (p.ca_fix / 0.3).clamp(0.0, 1.0);
