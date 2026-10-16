@@ -2696,6 +2696,7 @@ struct Pipe {
 }
 
 pub struct Gpu {
+    device_adapter_name: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     demosaic: Pipe,
@@ -2727,7 +2728,10 @@ impl Gpu {
             return None;
         }
         match Self::init() {
-            Ok(g) => Some(g),
+            Ok(g) => {
+                log::info!("GPU pipeline active: {}", g.device_adapter_name);
+                Some(g)
+            }
             Err(e) => {
                 log::warn!("GPU init failed, falling back to CPU: {e:#}");
                 None
@@ -2802,6 +2806,7 @@ impl Gpu {
             Pipe { pipeline, layout }
         };
         Ok(Gpu {
+            device_adapter_name: adapter.get_info().name,
             demosaic: mk("demosaic_main"),
             green: mk("green_main"),
             diff: mk("diff_main"),

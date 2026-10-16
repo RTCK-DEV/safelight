@@ -1970,6 +1970,10 @@ mod tests {
         let f = std::env::var("HE_FILE")
             .unwrap_or_else(|_| "/Users/devin/real-raws/net/nikon_z9_he_star.nef".into());
         let p = Path::new(&f);
+        if !p.exists() {
+            eprintln!("skip: {f} not present (set HE_FILE to a Z9 HE* .nef)");
+            return;
+        }
         assert!(is_nef_he(p), "probe failed");
         let (b, w, h) = decode_nef_he(p).unwrap();
         eprintln!("decoded {w}x{h}");
@@ -2032,9 +2036,14 @@ mod dump {
     use super::*;
 
     #[test]
+    #[ignore = "debug dump: writes /tmp/he_mosaic.pgm; run with --ignored"]
     fn dump_mosaic() {
         let f = std::env::var("HE_FILE")
             .unwrap_or_else(|_| "/Users/devin/real-raws/net/nikon_z9_he_star.nef".into());
+        if !Path::new(&f).exists() {
+            eprintln!("skip: {f} not present (set HE_FILE to a Z9 HE* .nef)");
+            return;
+        }
         let (b, w, h) = decode_nef_he(Path::new(&f)).unwrap();
         let mut out = String::new();
         out.push_str(&format!("P5\n{w} {h}\n65535\n"));

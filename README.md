@@ -33,6 +33,24 @@ mac/build.sh                   # -> mac/build/Safelight.app
 ```
 
 `LIBRAW_PREFIX` overrides the lib search path (default `/opt/homebrew`).
+`mac/build.sh` picks the Xcode toolchain automatically when xcode-select still
+points at the Command Line Tools (CLT swiftc lacks the SwiftUI macro plugins).
+
+Pass a folder path to open it straight into the library — handy for scripts
+and screenshot-driven verification:
+
+```sh
+open mac/build/Safelight.app --args /path/to/raws
+```
+
+A headless smoke test exercises the app's own engine calls (scan, thumbnail,
+render+scopes, sidecar round-trip, export JPEG with ICC) and writes
+`selftest.json` + `export.jpg` — useful on machines without accessibility
+access for UI automation:
+
+```sh
+SAFELIGHT_SELFTEST=/tmp/st mac/build/Safelight.app/Contents/MacOS/safelight /path/to/raws
+```
 
 ## CLI quickstart
 
