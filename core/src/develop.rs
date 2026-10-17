@@ -274,7 +274,7 @@ impl Stats {
             || r.wb_mode == WbMode::Pick
             || r.auto_exposure
             || r.auto_contrast
-            || r.dehaze > 0.0
+            || r.dehaze != 0.0
     }
     fn luma_percentile(&self, p: f32) -> f32 {
         let target = (self.count as f64 * p as f64) as u64;
@@ -1618,7 +1618,11 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         n_clones: r.clones.len().min(8) as u32,
         beauty: r.beauty.clamp(0.0, 1.0),
         noise_chroma: r.noise_chroma.clamp(0.0, 1.0),
-        dehaze: r.dehaze.clamp(0.0, 1.0) * 0.85,
+        dehaze: r.dehaze.clamp(-1.0, 1.0)
+            * std::env::var("SL_DHSCALE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.85f32),
         dehaze_a: stats
             .map(|s| s.dark_percentile(0.995))
             .unwrap_or(1.0)
@@ -2269,7 +2273,7 @@ pub(crate) fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3]
     }
     // dehaze (dark-channel prior): veil = dehaze * min(r,g,b); transmission
     // t = 1 - veil/A floored at 0.35; x' = (x - veil)/t — mirrors gpu.rs
-    if p.dehaze > 0.0 {
+    if p.dehaze != 0.0 {
         // dark-channel prior: the veil is a SPATIALLY SMOOTHED min-channel
         // (patchwise min, blurred) — a per-pixel min underestimates haze on
         // bright/chromatic surfaces, which is where LR's Dehaze bites.
@@ -2278,10 +2282,24 @@ pub(crate) fn pre_tone_rgb(rgb: [f32; 3], p: &Params, veil_min: f32) -> [f32; 3]
         } else {
             x[0].min(x[1]).min(x[2])
         };
-        let t = (1.0 - p.dehaze * mn / p.dehaze_a).max(0.35);
-        let v = p.dehaze * mn;
-        for c in &mut x {
-            *c = ((*c - v) / t).max(0.0);
+        if p.dehaze > 0.0 {
+            let tfloor = std::env::var("SL_DHFLOOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.35f32);
+            let t = (1.0 - p.dehaze * mn / p.dehaze_a).max(tfloor);
+            let v = p.dehaze * mn;
+            for c in &mut x {
+                *c = ((*c - v) / t).max(0.0);
+            }
+        } else {
+            // negative dehaze adds haze: forward airlight model
+            // x' = x*(1-u) + A*u, u = |d|*mn/A (mirrors the inverse used
+            // for positive dehaze)
+            let u = (p.dehaze.abs() * mn / p.dehaze_a).min(0.65);
+            for c in &mut x {
+                *c = *c * (1.0 - u) + p.dehaze_a * u;
+            }
         }
     }
     // tone equalizer: per-zone exposure on the post-exposure luma
@@ -4133,7 +4151,11 @@ fn develop_mosaic(
     } else {
         None
     };
-    let p = build_params(m, r, stats.as_ref());
+    let mut p = build_params(m, r, stats.as_ref());
+    // adaptive EV trim: compute the SAME coarse-mosaic estimate the GPU
+    // path uses (adev_gain_mosaic) so CPU and GPU renders stay identical;
+    // finish_linear only re-estimates when a non-mosaic path left it unset.
+    p.adev_gain = adev_gain_mosaic(m, &p);
 
     // full-res (stride 1) gets the color-difference demosaic — the real
     // per-pixel interpolation; stride>1 previews keep the block mean,
@@ -4767,7 +4789,7 @@ fn finish_linear(
     // dehaze's atmosphere scalar is image-dependent: derive it on the actual
     // linear buffer so mosaic and raster paths share the estimate.
     let mut pc = p.clone();
-    if pc.dehaze > 0.0 {
+    if pc.dehaze != 0.0 {
         pc.dehaze_a = atmosphere(&lin, w, h);
     }
     // LR "auto" lateral CA: measure it instead of applying a fixed shift —
@@ -4820,7 +4842,9 @@ fn finish_linear(
     // hidden per-image exposure compensation. Ridge model over pretone-luma
     // percentiles + sliders, fitted on the 31-image preview corpus
     // (LOO-validated: mean MAE 0.0520 -> 0.0490, no held-out regression).
-    if std::env::var("SL_ADEV").map(|v| v != "0").unwrap_or(true) {
+    // skipped when the mosaic path already set adev_gain via
+    // adev_gain_mosaic (CPU/GPU parity); raster inputs keep this estimate.
+    if pc.adev_gain == 1.0 && std::env::var("SL_ADEV").map(|v| v != "0").unwrap_or(true) {
         const MU: [f32; 13] = [
             0.0188905506, 0.0508270606, 0.1155104535, 0.2605165693, 0.5146629220,
             0.1727350434, -5.3565107584, 2.9223710077, 0.5032258065, -0.27,
@@ -5227,7 +5251,7 @@ fn finish_linear(
     // dehaze dark-channel prior: coarse grid of pretone min(r,g,b), then
     // patchwise MIN (≈3% of frame) + blur — the veil varies smoothly and is
     // driven by the darkest channel of the local surround, not the pixel.
-    let veil = if p.dehaze > 0.0 {
+    let veil = if p.dehaze != 0.0 {
         let vw = (dw / 8).clamp(16, 512);
         let vh = (dh / 8).clamp(16, 512);
         let mut vg = vec![0.0f32; vw * vh];

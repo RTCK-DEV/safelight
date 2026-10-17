@@ -1708,10 +1708,16 @@ fn adjust(px: vec3<f32>) -> vec3<f32> {
     }
     // dehaze (dark-channel prior): veil = w * min(r,g,b); t floored at
     // 0.35; x' = (x - veil)/t — mirrors develop.rs
-    if (pg.dh0.x > 0.0) {
+    if (pg.dh0.x != 0.0) {
         let mn = min(x.x, min(x.y, x.z));
-        let t = max(1.0 - pg.dh0.x * mn / pg.dh0.y, 0.35);
-        x = max((x - vec3<f32>(pg.dh0.x * mn)) / t, vec3<f32>(0.0));
+        if (pg.dh0.x > 0.0) {
+            let t = max(1.0 - pg.dh0.x * mn / pg.dh0.y, 0.35);
+            x = max((x - vec3<f32>(pg.dh0.x * mn)) / t, vec3<f32>(0.0));
+        } else {
+            // negative dehaze: forward airlight model (mirrors develop.rs)
+            let u = min(abs(pg.dh0.x) * mn / pg.dh0.y, 0.65);
+            x = x * (1.0 - u) + vec3<f32>(pg.dh0.y * u);
+        }
     }
     // tone equalizer: per-zone EV (9 log2-luma zones, centers -4..+4)
     if (pg.ze2.y > 0.5) {

@@ -1970,6 +1970,10 @@ mod tests {
         let f = std::env::var("HE_FILE")
             .unwrap_or_else(|_| "/Users/devin/real-raws/net/nikon_z9_he_star.nef".into());
         let p = Path::new(&f);
+        if !p.exists() {
+            eprintln!("HE fixture {f} not present — skipping (set HE_FILE)");
+            return;
+        }
         assert!(is_nef_he(p), "probe failed");
         let (b, w, h) = decode_nef_he(p).unwrap();
         eprintln!("decoded {w}x{h}");
@@ -2035,6 +2039,10 @@ mod dump {
     fn dump_mosaic() {
         let f = std::env::var("HE_FILE")
             .unwrap_or_else(|_| "/Users/devin/real-raws/net/nikon_z9_he_star.nef".into());
+        if !Path::new(&f).exists() {
+            eprintln!("HE fixture {f} not present — skipping (set HE_FILE)");
+            return;
+        }
         let (b, w, h) = decode_nef_he(Path::new(&f)).unwrap();
         let mut out = String::new();
         out.push_str(&format!("P5\n{w} {h}\n65535\n"));
