@@ -2387,7 +2387,7 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             let ex = pg.wins[wi * 6u + 3u];
             let ex2 = pg.wins[wi * 6u + 4u];
             let ex3 = pg.wins[wi * 6u + 5u];
-            adj = local_extra(adj, mask, ex, ex2, ex3.x, select(0u, u32(pg.a4.w) + wi * 512u, pg.a4.w > 0.5));
+            adj = local_extra(adj, mask, ex, ex2, ex3.x, u32(pg.a4.w) + wi * 512u);
             // masked point colours (LR LocalPointColors) — mirrors the
             // lpcs block in develop.rs local_ops
             let nlp = u32(pg.lpcs[wi * 11u].x);
@@ -2488,7 +2488,7 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             let ex = pg.blayers2[li * 3u];
             let ex2 = pg.blayers2[li * 3u + 1u];
             let ex3 = pg.blayers2[li * 3u + 2u];
-            adj = local_extra(adj, bmask, ex, ex2, ex3.x, select(0u, u32(pg.a4.w) + 16u * 512u + li * 512u, pg.a4.w > 0.5));
+            adj = local_extra(adj, bmask, ex, ex2, ex3.x, u32(pg.a4.w) + 16u * 512u + li * 512u);
         }
     }
     return adj;
@@ -2518,11 +2518,11 @@ fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex:
             let f = ex.z * mask;
             adj = adj * (1.0 + 0.08 * f) - vec3<f32>(0.015 * f * (1.0 - l));
         }
-        if (wl > 0u) {
-            if (ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0) {
-                let g = max(wlut_at(wl, l / 1.6), 1e-4) / max(wlut_at(u32(pg.a4.w) + 20u * 512u, l / 1.6), 1e-4);
-                adj = adj * pow(g, mask);
-            }
+        if (wl > 0u && pg.a4.w > 0.5 && (ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0)) {
+            let nb = u32(pg.a4.w) + 20u * 512u;
+            let gv = wlut_at(wl, l / 1.6);
+            let nv = wlut_at(nb, l / 1.6);
+            adj = adj * pow(max(gv, 1e-4) / max(nv, 1e-4), mask);
         } else {
             if (ex2.y != 0.0) {
                 adj = adj + vec3<f32>(ex2.y * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * max(1.0 - l / 1.6, 0.0));
