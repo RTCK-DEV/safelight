@@ -337,3 +337,32 @@ SL_WBG スイープで wb[1]≈+3〜5% の緑不足を確認。tint_abs高では
 実測: tint_lo群 g-res −0.037→−0.026, mae 0.1194→0.1185。
 原因推定: LR の AsShot WB はカメラ記録 tint バイアス込みだが
 libraw cam_mul は中立 — 本質は BaselineTint 相当の補正。
+
+## 埋め込みプレビューの分離（評価法の重要な修正）
+
+Previews.lrdata の約36%は **LRレンダーではなくカメラ埋め込みJPEG**
+だった（2203件評価時点で emb 807件 / icc 1410件）:
+
+- 判別: icc_profile / xmp メタなし + APP14 'adobe'のみ → 埋め込み
+- _DSC2019 実証: lrdataプレビュー ↔ ARW内蔵1616×1080 JPEG で MAE 0.017
+- 埋め込み群 median 0.107 vs LR-render群 **median 0.0837** —
+  混合統計は過大評価になっていた。bigfull.py は結果行に
+  `"pv":"icc"|"emb"` を付記して分離集計する
+- 埋め込み群は「カメラJPEGルック」への別ベンチとしては使えるが
+  LR同等性の評価からは除外すべき
+
+## ローカル補正トーンバンドLUT化（win_luts/brush_luts）
+
+local_extra の hi/sh/wh/bl をアドホック帯域式から、グローバルと同じ
+build_tone_lut 機構（中立カーブ比のゲイン）に置換 — LRがマスク内でも
+同一のパラメトリックバンドモデルを評価する構造に合わせた。
+
+- CPU: Params.win_luts[16], brush_luts[4]
+- GPU: lutバッファ末尾に 21×512 (16 win + 4 brush + neutral) 追加、
+  未使用スロット a4.w でベース渡し。ステージuniは a4.w=0 → 従来式
+- 検証: parity(CPU/GPU) mae 4.5e-4。マスク19件中トーンバンド非ゼロは
+  1件のみで効果は実質未検証 — 構造的忠実度向上として採用
+- SL_ADEV_TAG: 特徴ダンプにソースパスを付記（条件付きスタイル学習用）
+
+### 評価実績の修正値（埋め込み分離後）
+- LR-render群のみ: median **0.0837** (混合0.0898から真の値へ)
