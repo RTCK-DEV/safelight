@@ -104,6 +104,10 @@ pub struct Params {
     pub has_qual: bool,
     /// power windows: packed [kind(+2=invert), p0,p1,p2,p3, p4(rot), p5(soft), ev, sat, temp, strength]
     pub wins: [[f32; 24]; 16],
+    /// per-window tone-band LUT (local hi/sh/wh/bl run through the same
+    /// shaping as the global sliders — replaces local_extra's ad-hoc bands)
+    pub win_luts: [[f32; 512]; 16],
+    pub brush_luts: [[f32; 512]; 4],
     /// per-window LR range refinement: [mode, kind, p0..p3]; mode 0=none,
     /// 1=subtract, 2=intersect; kind 1=color(h,s,tol,inv), 2=lum(lo,hi,f,inv)
     pub refines: [[f32; 6]; 16],
@@ -1325,6 +1329,20 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         }
     }
 
+    // per-window tone-band LUTs: run each window's local hi/sh/wh/bl through
+    // the same band-shaping as the global sliders (LR evaluates the same
+    // curve machinery inside the mask, not ad-hoc per-band formulas).
+    let mut win_luts = [[0.0f32; 512]; 16];
+    for (i, w) in r.windows.iter().take(16).enumerate() {
+        win_luts[i] = build_tone_lut(&Recipe {
+            highlights: w.hi.clamp(-1.0, 1.0),
+            shadows: w.sh.clamp(-1.0, 1.0),
+            whites: w.wh.clamp(-1.0, 1.0),
+            blacks: w.bl.clamp(-1.0, 1.0),
+            ..Default::default()
+        });
+    }
+
     // LR PatchMatch remove spots: decode the extracted 16-bit RGB patchmap
     // into absolute source px (ch0,ch1 normalize into the search rect; ch2
     // is refinement data we don't need). pm coords live in LR's frame
@@ -1370,8 +1388,16 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
     let mut brush_seeds: Vec<[f32; 4]> = Vec::new();
     let mut brush_layers = [[0.0f32; 4]; 4];
     let mut brush_layers2 = [[0.0f32; 12]; 4];
+    let mut brush_luts = [[0.0f32; 512]; 4];
     let mut link_bits = 0.0f32;
     for (li, b) in r.brushes.iter().take(4).enumerate() {
+        brush_luts[li] = build_tone_lut(&Recipe {
+            highlights: b.hi.clamp(-1.0, 1.0),
+            shadows: b.sh.clamp(-1.0, 1.0),
+            whites: b.wh.clamp(-1.0, 1.0),
+            blacks: b.bl.clamp(-1.0, 1.0),
+            ..Default::default()
+        });
         brush_layers[li] = [
             b.ev.clamp(-4.0, 4.0),
             b.sat.clamp(-1.0, 1.0),
@@ -1618,6 +1644,8 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         // show-key mode works even with no adjustment applied
         has_qual: r.qh[1] > 0.0,
         wins,
+        win_luts,
+        brush_luts,
         refines,
         wmats,
         pms,
@@ -4921,11 +4949,13 @@ fn finish_linear(
             ev += W[i] * (f[i] - MU[i]) / SD[i];
         }
         // SL_ADEV_DUMP=<file>: append the 13 raw features as a JSON line for
-        // offline refitting against the expanded corpus.
+        // offline refitting against the expanded corpus. SL_ADEV_TAG adds a
+        // caller-supplied id (the collector passes the raw path).
         if let Ok(fp) = std::env::var("SL_ADEV_DUMP") {
             use std::io::Write;
             if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(fp) {
-                let _ = writeln!(fh, "{}", serde_json::json!({"f": f}));
+                let tag = std::env::var("SL_ADEV_TAG").unwrap_or_default();
+                let _ = writeln!(fh, "{}", serde_json::json!({"t": tag, "f": f}));
             }
         }
         pc.adev_gain = 2f32.powf(ev.clamp(-0.5, 0.5));
@@ -5721,7 +5751,7 @@ fn local_ops(
         }
         adj[0] += win[9] * mask * 0.08;
         adj[2] -= win[9] * mask * 0.08;
-        local_extra(adj, mask, &win[12..21]);
+        local_extra(adj, mask, &win[12..21], Some((&p.win_luts[wi], &p.tone_neu)));
         // masked point colours (LR LocalPointColors): transform the pixel
         // colour inside the mask, folded into the local gain
         let lp = &p.lpcs[wi];
@@ -5810,7 +5840,7 @@ fn local_ops(
         adj[0] += lp[2] * mask * 0.08;
         adj[2] -= lp[2] * mask * 0.08;
         let ex = p.brush_layers2[li];
-        local_extra(adj, mask, &ex);
+        local_extra(adj, mask, &ex, Some((&p.brush_luts[li], &p.tone_neu)));
     }
 }
 
@@ -5819,7 +5849,12 @@ fn local_ops(
 /// blacks] — luma-pivot contrast, midtone-weighted clarity, dehaze
 /// density, green/magenta tint axis and tone-band offsets mirroring
 /// the global tone stage's shaping weights.
-fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
+fn local_extra(
+    adj: &mut [f32; 3],
+    mask: f32,
+    ex: &[f32],
+    tone: Option<(&[f32; 512], &[f32; 512])>,
+) {
     let (con, cla, deh, tin) = (ex[0], ex[1], ex[2], ex[3]);
     let (hi, sh, wh, bl) = (ex[4], ex[5], ex[6], ex[7]);
     let tex = ex.get(8).copied().unwrap_or(0.0);
@@ -5848,34 +5883,49 @@ fn local_extra(adj: &mut [f32; 3], mask: f32, ex: &[f32]) {
                 *c -= 0.015 * f * (1.0 - l);
             }
         }
-        // tone-band offsets: same band weights as build_tone_lut
-        if sh != 0.0 {
-            let s = sh * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * (1.0 - l / 1.6).max(0.0);
-            for c in adj.iter_mut() {
-                *c += s;
-            }
-        }
-        if hi != 0.0 {
-            let d = (1.0 - hi * mask * 2.19 * sstep(0.60, 1.49, l)).max(0.15);
-            for c in adj.iter_mut() {
-                *c /= d;
-            }
-        }
-        if wh != 0.0 {
-            let g = 1.0 + wh * mask * 0.35 * sstep(0.5, 1.0, l);
-            for c in adj.iter_mut() {
-                *c *= g;
-            }
-        }
-        if bl != 0.0 {
-            let lw = 1.0 - sstep(0.0, 0.4, l);
-            if bl > 0.0 {
+        // tone-band offsets: evaluate the local hi/sh/wh/bl through the
+        // same LUT machinery as the global sliders (ratio to the neutral
+        // curve, faded by the mask) when a window LUT is available;
+        // ad-hoc bands are the fallback.
+        if let Some((wlut, neu)) = tone {
+            if hi != 0.0 || sh != 0.0 || wh != 0.0 || bl != 0.0 {
+                let g = tone_lut_at(wlut, l / 1.6).max(1e-4)
+                    / tone_lut_at(neu, l / 1.6).max(1e-4);
+                let gg = g.powf(mask);
                 for c in adj.iter_mut() {
-                    *c += bl * mask * 0.06 * lw;
+                    *c *= gg;
                 }
-            } else {
+            }
+        } else {
+            if sh != 0.0 {
+                let s =
+                    sh * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * (1.0 - l / 1.6).max(0.0);
                 for c in adj.iter_mut() {
-                    *c *= 1.0 + bl * mask * 0.25 * lw;
+                    *c += s;
+                }
+            }
+            if hi != 0.0 {
+                let d = (1.0 - hi * mask * 2.19 * sstep(0.60, 1.49, l)).max(0.15);
+                for c in adj.iter_mut() {
+                    *c /= d;
+                }
+            }
+            if wh != 0.0 {
+                let g = 1.0 + wh * mask * 0.35 * sstep(0.5, 1.0, l);
+                for c in adj.iter_mut() {
+                    *c *= g;
+                }
+            }
+            if bl != 0.0 {
+                let lw = 1.0 - sstep(0.0, 0.4, l);
+                if bl > 0.0 {
+                    for c in adj.iter_mut() {
+                        *c += bl * mask * 0.06 * lw;
+                    }
+                } else {
+                    for c in adj.iter_mut() {
+                        *c *= 1.0 + bl * mask * 0.25 * lw;
+                    }
                 }
             }
         }
@@ -6640,7 +6690,8 @@ pub(crate) fn adev_gain_mosaic(m: &Mosaic, p: &Params) -> f32 {
     if let Ok(fp) = std::env::var("SL_ADEV_DUMP") {
         use std::io::Write;
         if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(fp) {
-            let _ = writeln!(fh, "{}", serde_json::json!({"f": f}));
+            let tag = std::env::var("SL_ADEV_TAG").unwrap_or_default();
+            let _ = writeln!(fh, "{}", serde_json::json!({"t": tag, "f": f}));
         }
     }
     2f32.powf(ev.clamp(-0.5, 0.5))

@@ -2387,7 +2387,7 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             let ex = pg.wins[wi * 6u + 3u];
             let ex2 = pg.wins[wi * 6u + 4u];
             let ex3 = pg.wins[wi * 6u + 5u];
-            adj = local_extra(adj, mask, ex, ex2, ex3.x);
+            adj = local_extra(adj, mask, ex, ex2, ex3.x, select(0u, u32(pg.a4.w) + wi * 512u, pg.a4.w > 0.5));
             // masked point colours (LR LocalPointColors) — mirrors the
             // lpcs block in develop.rs local_ops
             let nlp = u32(pg.lpcs[wi * 11u].x);
@@ -2488,7 +2488,7 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
             let ex = pg.blayers2[li * 3u];
             let ex2 = pg.blayers2[li * 3u + 1u];
             let ex3 = pg.blayers2[li * 3u + 2u];
-            adj = local_extra(adj, bmask, ex, ex2, ex3.x);
+            adj = local_extra(adj, bmask, ex, ex2, ex3.x, select(0u, u32(pg.a4.w) + 16u * 512u + li * 512u, pg.a4.w > 0.5));
         }
     }
     return adj;
@@ -2497,7 +2497,14 @@ fn local_ops(adj_in: vec3<f32>, col: vec3<f32>, nx: f32, ny: f32, aspect: f32) -
 // extended LR local adjustments inside a window/brush mask —
 // mirrors local_extra() in develop.rs. ex = contrast/clarity/dehaze/
 // tint, ex2 = highlights/shadows/whites/blacks tone-band offsets.
-fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex: f32) -> vec3<f32> {
+// wl>0: wl = lut-buffer offset of this window's 512-entry tone LUT;
+// the neutral LUT sits at pg.a4.w + 20*512.
+fn wlut_at(base: u32, x: f32) -> f32 {
+    let f = clamp(x, 0.0, 1.0) * 511.0;
+    let i0 = u32(f);
+    return mix(lut[base + i0], lut[base + i0 + 1u], f - f32(i0));
+}
+fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex: f32, wl: u32) -> vec3<f32> {
     var adj = adj_in;
     if (ex.w != 0.0) {
         adj = adj + vec3<f32>(0.0, -ex.w * mask * 0.06, 0.0);
@@ -2511,21 +2518,28 @@ fn local_extra(adj_in: vec3<f32>, mask: f32, ex: vec4<f32>, ex2: vec4<f32>, tex:
             let f = ex.z * mask;
             adj = adj * (1.0 + 0.08 * f) - vec3<f32>(0.015 * f * (1.0 - l));
         }
-        if (ex2.y != 0.0) {
-            adj = adj + vec3<f32>(ex2.y * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * max(1.0 - l / 1.6, 0.0));
-        }
-        if (ex2.x != 0.0) {
-            adj = adj / max(1.0 - ex2.x * mask * 2.19 * sstep(0.60, 1.49, l), 0.15);
-        }
-        if (ex2.z != 0.0) {
-            adj = adj * (1.0 + ex2.z * mask * 0.35 * sstep(0.5, 1.0, l));
-        }
-        if (ex2.w != 0.0) {
-            let lw = 1.0 - sstep(0.0, 0.4, l);
-            if (ex2.w > 0.0) {
-                adj = adj + vec3<f32>(ex2.w * mask * 0.06 * lw);
-            } else {
-                adj = adj * (1.0 + ex2.w * mask * 0.25 * lw);
+        if (wl > 0u) {
+            if (ex2.x != 0.0 || ex2.y != 0.0 || ex2.z != 0.0 || ex2.w != 0.0) {
+                let g = max(wlut_at(wl, l / 1.6), 1e-4) / max(wlut_at(u32(pg.a4.w) + 20u * 512u, l / 1.6), 1e-4);
+                adj = adj * pow(g, mask);
+            }
+        } else {
+            if (ex2.y != 0.0) {
+                adj = adj + vec3<f32>(ex2.y * mask * 0.10 * (1.0 - sstep(0.0, 0.66, l)) * max(1.0 - l / 1.6, 0.0));
+            }
+            if (ex2.x != 0.0) {
+                adj = adj / max(1.0 - ex2.x * mask * 2.19 * sstep(0.60, 1.49, l), 0.15);
+            }
+            if (ex2.z != 0.0) {
+                adj = adj * (1.0 + ex2.z * mask * 0.35 * sstep(0.5, 1.0, l));
+            }
+            if (ex2.w != 0.0) {
+                let lw = 1.0 - sstep(0.0, 0.4, l);
+                if (ex2.w > 0.0) {
+                    adj = adj + vec3<f32>(ex2.w * mask * 0.06 * lw);
+                } else {
+                    adj = adj * (1.0 + ex2.w * mask * 0.25 * lw);
+                }
             }
         }
     }
@@ -2949,7 +2963,8 @@ impl Gpu {
             + 8
             + lut3d.as_ref().map(|c| c.data.len() as u64).unwrap_or(0)
             + n_stg * LUT_N
-            + stg_l3.iter().sum::<u64>();
+            + stg_l3.iter().sum::<u64>()
+            + 21 * 512; // per-window (16) + brush (4) + neutral tone LUTs
         let lut_b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lut"),
             size: lut_len * 4,
@@ -3612,6 +3627,18 @@ impl Gpu {
         lut_buf[2304..2816].copy_from_slice(&p.tone_lut);
         // 3D LUT header + data (shader: size==0 => passthrough)
         lut_buf.resize(lut_len as usize, 0.0);
+        // per-window + per-brush-layer tone LUTs, then the neutral curve —
+        // mirrors develop.rs win_luts/brush_luts. Region base → a4.w.
+        let wlut_base = lut_len as usize - 21 * 512;
+        for i in 0..16 {
+            lut_buf[wlut_base + i * 512..wlut_base + (i + 1) * 512]
+                .copy_from_slice(&p.win_luts[i]);
+        }
+        for i in 0..4 {
+            lut_buf[wlut_base + (16 + i) * 512..wlut_base + (17 + i) * 512]
+                .copy_from_slice(&p.brush_luts[i]);
+        }
+        lut_buf[wlut_base + 20 * 512..wlut_base + 21 * 512].copy_from_slice(&p.tone_neu);
         // per-stage curve/tone regions after the base 3D LUT data
         {
             let dl = p.lut3d.as_ref().map(|c| c.data.len()).unwrap_or(0);
@@ -3653,6 +3680,7 @@ impl Gpu {
         self.queue
             .write_buffer(&lut_b, 0, bytemuck::cast_slice(&lut_buf));
         let mut u_main = mk_uni(&p, 0);
+        u_main.a4[3] = wlut_base as f32;
         u_main.wmeta = wm_main;
         u_main.pm = pm_main;
         u_main.stg0 = [p.stages.len() as f32, 0.0, 0.0, 0.0];
