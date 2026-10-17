@@ -366,3 +366,21 @@ build_tone_lut 機構（中立カーブ比のゲイン）に置換 — LRがマ�
 
 ### 評価実績の修正値（埋め込み分離後）
 - LR-render群のみ: median **0.0837** (混合0.0898から真の値へ)
+
+## 条件付きスタイルモデル（style_model.json / SL_STYLE_MODEL）
+
+グローバル中央値（style_profile.json）は「好み=定数」と仮定するが、
+実際のユーザーの露出・補正量はシーン依存。カタログ編集済み画像群で
+「pretone輝度統計 + EXIF(ISO/絞り/シャッター/焦点距離) → スライダー値」
+のリッジ回帰を学習する（特徴収集: SL_ADEV_DUMP + SL_ADEV_TAG）。
+
+部分サンプル(749件)でのLOO検証:
+  exposure R²=0.42 / texture 0.42 / vibrance 0.34 / dehaze 0.33 /
+  shadows 0.32 / contrast 0.28 / blacks 0.28 / highlights 0.25 /
+  whites 0.24 / clarity 0.27 / saturation 0.02（予測不能→中央値）
+ADEVがLR内部応答を予測して失敗したのと対照的に、ユーザーの実編集値は
+画像条件から予測可能 — 編集は内容条件付きの一貫した関数。
+
+実装: engine.render内でデコード後に style_predict() が特徴量を計算し、
+styled_with() が「デフォルト値のままのスライダー」にのみ
+予測値×style を適用（medianは非モデル対象スライダーのfallback）。
