@@ -311,3 +311,18 @@ recipeなしレンダー(read_sidecar→embedded XMP)で比較すべき。
 
 ### LinearRaw BaselineExposure（前項の確定事項）
 - `m.linear`時 dng_baseline_ev=0 → NR-DNGの2倍明るさ解消
+
+## カタログ駆動スタイル学習（recipe.style / SL_STYLE）
+
+32,323件のサイドカーを全件マイニング：編集済み画像3,577件の
+中央値がユーザー固有の「自動補正の初期値」として使える。
+
+  exposure +1.22EV / highlights -0.64 / shadows +0.54 / vibrance +0.19
+  temp 5150K / tint +11 / sharpen 0.267 / contrast +0.06
+
+- `Recipe.style` (0..1): デフォルト値のままのスライダーにのみ
+  median×style をブレンド — ユーザーが明示的に触った値は上書きしない
+- プロファイルJSONは `SL_STYLE=<path>` または ./style_profile.json
+  （`{"profile": {"exposure": {"median": 1.22}, ...}}` 形式、
+  従来のマイニング出力と互換）
+- engine.render() で一括適用 → CPU/GPU 両経路に自動反映

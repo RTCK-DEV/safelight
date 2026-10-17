@@ -110,6 +110,11 @@ pub struct Recipe {
     pub auto_exposure: bool,
     /// histogram percentile white/black point stretch
     pub auto_contrast: bool,
+    /// user-style auto-look strength 0..1: fills sliders that are still at
+    /// their default with the medians mined from the user's Lightroom
+    /// catalog (style profile JSON, loaded via SL_STYLE)
+    #[serde(default)]
+    pub style: f32,
     // ---- retouch ----
     /// crop fractions [left, top, right, bottom] 0..0.9 (post-rotation frame)
     pub crop: [f32; 4],
@@ -685,6 +690,7 @@ impl Default for Recipe {
             look: String::new(),
             auto_exposure: false,
             auto_contrast: false,
+            style: 0.0,
             crop: [0.0; 4],
             spots: Vec::new(),
             lights: Vec::new(),
@@ -780,6 +786,60 @@ impl Recipe {
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Learned-style auto look: for sliders left at their default, blend in
+    /// the user's catalog median edit by `style` (0..1). The profile JSON is
+    /// `{"median_map": {"exposure": 1.22, ...}}` loaded once from SL_STYLE
+    /// (or ./style_profile.json). Sliders the user already set are kept —
+    /// this only shapes untouched edits.
+    pub fn styled(&self) -> Recipe {
+        let amt = self.style.clamp(0.0, 1.0);
+        if amt == 0.0 {
+            return self.clone();
+        }
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+        static PROF: OnceLock<Option<HashMap<String, f32>>> = OnceLock::new();
+        let prof = PROF.get_or_init(|| {
+            let path = std::env::var("SL_STYLE").unwrap_or_else(|_| "style_profile.json".into());
+            let s = std::fs::read_to_string(path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+            let m = v.get("median_map").or_else(|| v.get("profile"))?;
+            let obj = m.as_object()?;
+            Some(
+                obj.iter()
+                    .filter_map(|(k, x)| {
+                        let mv = x.get("median").and_then(|v| v.as_f64()).or_else(|| x.as_f64())?;
+                        Some((k.clone(), mv as f32))
+                    })
+                    .collect(),
+            )
+        });
+        let Some(map) = prof else { return self.clone() };
+        let mut r = self.clone();
+        for (k, med) in map {
+            let f = match k.as_str() {
+                "exposure" => &mut r.exposure,
+                "contrast" => &mut r.contrast,
+                "highlights" => &mut r.highlights,
+                "shadows" => &mut r.shadows,
+                "whites" => &mut r.whites,
+                "blacks" => &mut r.blacks,
+                "vibrance" => &mut r.vibrance,
+                "saturation" => &mut r.saturation,
+                "dehaze" => &mut r.dehaze,
+                "clarity" => &mut r.clarity,
+                "texture" => &mut r.texture,
+                "sharpen" => &mut r.sharpen,
+                "noise_luma" => &mut r.noise_luma,
+                _ => continue,
+            };
+            if *f == 0.0 {
+                *f = med * amt;
+            }
+        }
+        r
     }
 
     /// LR `crs:Amount` / preset-strength scaling: every adjustment delta is

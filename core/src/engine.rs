@@ -88,6 +88,15 @@ impl Engine {
 
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
+        // learned-style auto look: fills still-default sliders with the
+        // user's catalog-median edits (recipe.style 0..1, SL_STYLE profile)
+        let styled;
+        let recipe = if recipe.style > 0.0 {
+            styled = recipe.styled();
+            &styled
+        } else {
+            recipe
+        };
         // extracted LR mask bitmaps sit next to the image as
         // <stem>.slmask-<digest>.png — make them absolute so the renderer
         // can load them regardless of the caller's cwd.
