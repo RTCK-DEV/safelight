@@ -6607,6 +6607,127 @@ fn estimate_ca_px(lin: &[[f32; 3]], w: usize, h: usize) -> (f32, f32) {
 
 /// CA estimate for the mosaic path (GPU): cheap sparse demosaic via
 /// `demosaic_pixel`, then the shared edge estimator.
+/// Pretone-luma stats over a strided mosaic demosaic: percentiles
+/// (5/25/50/75/95), mean luma, log-mean luma, log-std — the 8 feature
+/// vector shared by ADEV and the conditional style model.
+pub(crate) fn pretone_stats_stride(
+    m: &Mosaic,
+    p: &Params,
+    stride: usize,
+    vw: usize,
+    vh: usize,
+    norm: &[f32; 4],
+) -> Option<[f32; 8]> {
+    let mut hist = [0u32; 256];
+    let (mut n, mut ssum, mut lsum, mut lsq) = (0u32, 0.0f64, 0.0f64, 0.0f64);
+    for vy in 0..vh {
+        for vx in 0..vw {
+            let pt = pre_tone_rgb(demosaic_pixel(m, vx, vy, stride, norm), p, f32::NAN);
+            let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
+            hist[(l * 160.0).min(255.0) as usize] += 1;
+            n += 1;
+            ssum += l as f64;
+            let ll = (l.max(1e-5)).log2() as f64;
+            lsum += ll;
+            lsq += ll * ll;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let pct = |q: f32| -> f32 {
+        let t = (q * n as f32) as u32;
+        let mut c = 0u32;
+        for (i, &b) in hist.iter().enumerate() {
+            c += b;
+            if c > t {
+                return i as f32 / 160.0;
+            }
+        }
+        1.6
+    };
+    let lmu = lsum / n as f64;
+    Some([
+        pct(0.05),
+        pct(0.25),
+        pct(0.50),
+        pct(0.75),
+        pct(0.95),
+        (ssum / n as f64) as f32,
+        lmu as f32,
+        ((lsq / n as f64 - lmu * lmu).max(0.0)).sqrt() as f32,
+    ])
+}
+
+/// Content-conditioned user style: ridge regression from pretone-luma
+/// stats + EXIF (ISO/aperture/shutter/focal) to the user's actual slider
+/// values, trained on their catalog edits. Returns per-slider predictions
+/// used by `Recipe::styled` when a model JSON exists.
+/// Model: SL_STYLE_MODEL or ./style_model.json
+/// {"mu":[15],"sd":[15],"W":{"exposure":{"w":[15],"b":..},..}}
+/// Feature layout (must match stylefit.py):
+///   f[0..8] pretone stats,
+///   log2(iso/100), log2(fnum), log2(shutter*1000), log2(focal/50), prog,
+///   f[0]*log2iso, f[6]*log2shutter
+pub fn style_predict(m: &Mosaic) -> Option<std::collections::HashMap<String, f32>> {
+    use std::sync::OnceLock;
+    static MODEL: OnceLock<Option<serde_json::Value>> = OnceLock::new();
+    let model = MODEL.get_or_init(|| {
+        let path =
+            std::env::var("SL_STYLE_MODEL").unwrap_or_else(|_| "style_model.json".into());
+        let s = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&s).ok()?
+    });
+    let model = model.as_ref()?;
+    let mu = model["mu"].as_array()?;
+    let sd = model["sd"].as_array()?;
+    if mu.len() != 15 || sd.len() != 15 {
+        return None;
+    }
+    // neutral-recipe params for feature extraction (training used
+    // unedited stats — AsShot WB, no exposure)
+    let p0 = build_params(m, &crate::recipe::Recipe::default(), None);
+    let stride = ((m.w.max(m.h) as f32 / 96.0).ceil() as usize).max(1) * m.cfa.h.max(1);
+    let (vw, vh) = (m.w / stride, m.h / stride);
+    if vw < 8 || vh < 8 {
+        return None;
+    }
+    let norm = norm_factors(m);
+    let f = pretone_stats_stride(m, &p0, stride, vw, vh, &norm)?;
+    let i = &m.info;
+    let x = [
+        f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+        (i.iso.max(1.0) / 100.0).log2(),
+        i.aperture.max(0.5).log2(),
+        (i.shutter.max(1e-5) * 1000.0).log2(),
+        (i.focal.max(1.0) / 50.0).log2(),
+        1.0, // expo_prog is ~always manual(1) in the training catalog
+        f[0] * (i.iso.max(1.0) / 100.0).log2(),
+        f[6] * (i.shutter.max(1e-5) * 1000.0).log2(),
+    ];
+    let mut out = std::collections::HashMap::new();
+    if let Some(wm) = model["W"].as_object() {
+        for (k, spec) in wm {
+            let w = spec["w"].as_array().map(|a| {
+                a.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>()
+            });
+            let b = spec["b"].as_f64();
+            let (Some(w), Some(b)) = (w, b) else { continue };
+            if w.len() != 15 {
+                continue;
+            }
+            let mut pred = b as f32;
+            for j in 0..15 {
+                pred += (w[j] as f32)
+                    * (x[j] - mu[j].as_f64().unwrap_or(0.0) as f32)
+                    / (sd[j].as_f64().unwrap_or(1.0) as f32).max(1e-9);
+            }
+            out.insert(k.clone(), pred);
+        }
+    }
+    Some(out)
+}
+
 /// Adaptive EV trim from a coarse CPU demosaic — shared by the GPU path
 /// (which never builds a CPU `lin` buffer). Ridge model over pretone-luma
 /// percentiles + recipe sliders, fitted on the 31-image preview corpus.
@@ -6637,41 +6758,11 @@ pub(crate) fn adev_gain_mosaic(m: &Mosaic, p: &Params) -> f32 {
     if vw < 8 || vh < 8 {
         return 1.0;
     }
-    let mut hist = [0u32; 256];
-    let (mut n, mut ssum, mut lsum, mut lsq) = (0u32, 0.0f64, 0.0f64, 0.0f64);
-    for vy in 0..vh {
-        for vx in 0..vw {
-            let pt = pre_tone_rgb(demosaic_pixel(m, vx, vy, stride, &norm), p, f32::NAN);
-            let l = (0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2]).clamp(0.0, 1.6);
-            hist[(l * 160.0).min(255.0) as usize] += 1;
-            n += 1;
-            ssum += l as f64;
-            let ll = (l.max(1e-5)).log2() as f64;
-            lsum += ll;
-            lsq += ll * ll;
-        }
-    }
-    let pct = |q: f32| -> f32 {
-        let t = (q * n as f32) as u32;
-        let mut c = 0u32;
-        for (i, &b) in hist.iter().enumerate() {
-            c += b;
-            if c > t {
-                return i as f32 / 160.0;
-            }
-        }
-        1.6
+    let Some(st8) = pretone_stats_stride(m, p, stride, vw, vh, &norm) else {
+        return 1.0;
     };
-    let lmu = lsum / n as f64;
     let f = [
-        pct(0.05),
-        pct(0.25),
-        pct(0.50),
-        pct(0.75),
-        pct(0.95),
-        (ssum / n as f64) as f32,
-        lmu as f32,
-        ((lsq / n as f64 - lmu * lmu).max(0.0)).sqrt() as f32,
+        st8[0], st8[1], st8[2], st8[3], st8[4], st8[5], st8[6], st8[7],
         p.exposure_ev,
         p.highlights,
         p.shadows,

@@ -89,14 +89,11 @@ impl Engine {
     /// render with a recipe, fit inside max_px (0 = full res)
     pub fn render(&self, path: &Path, recipe: &Recipe, max_px: u32) -> Result<RgbaImage> {
         // learned-style auto look: fills still-default sliders with the
-        // user's catalog-median edits (recipe.style 0..1, SL_STYLE profile)
-        let styled;
-        let recipe = if recipe.style > 0.0 {
-            styled = recipe.styled();
-            &styled
-        } else {
-            recipe
-        };
+        // user's catalog-median edits (recipe.style 0..1, SL_STYLE profile).
+        // Conditional predictions (image stats + EXIF -> sliders, trained
+        // on catalog edits) override the medians when style_model.json
+        // exists — needs the decoded mosaic, so it runs post-decode via
+        // styled_conditional in the render closure below.
         // extracted LR mask bitmaps sit next to the image as
         // <stem>.slmask-<digest>.png — make them absolute so the renderer
         // can load them regardless of the caller's cwd.
@@ -128,6 +125,20 @@ impl Engine {
             None
         };
         self.with_decoded(path, |d| {
+            // style application needs the decoded image for the
+            // conditional model (pretone stats + EXIF -> slider preds)
+            let styled;
+            let recipe = if recipe.style > 0.0 {
+                let pred = if let decode::Decoded::Mosaic(m) = d {
+                    develop::style_predict(m)
+                } else {
+                    None
+                };
+                styled = recipe.styled_with(pred.as_ref());
+                &styled
+            } else {
+                recipe
+            };
             let mut gpu = self.gpu.lock().unwrap();
             if std::env::var_os("SL_CPU").is_some() {
                 drop(gpu);

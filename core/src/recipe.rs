@@ -794,6 +794,14 @@ impl Recipe {
     /// (or ./style_profile.json). Sliders the user already set are kept —
     /// this only shapes untouched edits.
     pub fn styled(&self) -> Recipe {
+        self.styled_with(None)
+    }
+
+    /// styled() with per-slider predictions overriding the catalog median:
+    /// `pred` maps slider name → predicted value (from the conditional
+    /// model, develop::style_predict). Median is the fallback for sliders
+    /// the model doesn't cover.
+    pub fn styled_with(&self, pred: Option<&std::collections::HashMap<String, f32>>) -> Recipe {
         let amt = self.style.clamp(0.0, 1.0);
         if amt == 0.0 {
             return self.clone();
@@ -816,9 +824,28 @@ impl Recipe {
                     .collect(),
             )
         });
-        let Some(map) = prof else { return self.clone() };
+        // conditional-model sliders don't need the median profile
+        let has_pred = |k: &str| pred.map(|p| p.contains_key(k)).unwrap_or(false);
+        let Some(map) = prof else {
+            // no median profile — still apply conditional predictions
+            let Some(pred) = pred else { return self.clone() };
+            let mut r = self.clone();
+            for (k, &v) in pred {
+                if let Some(f) = Self::style_field(&mut r, k) {
+                    if *f == 0.0 {
+                        *f = v * amt;
+                    }
+                }
+            }
+            return r;
+        };
         let mut r = self.clone();
         for (k, med) in map {
+            let val = if has_pred(k) {
+                *pred.unwrap().get(k).unwrap()
+            } else {
+                *med
+            };
             let f = match k.as_str() {
                 "exposure" => &mut r.exposure,
                 "contrast" => &mut r.contrast,
@@ -836,10 +863,42 @@ impl Recipe {
                 _ => continue,
             };
             if *f == 0.0 {
-                *f = med * amt;
+                *f = val * amt;
+            }
+        }
+        // model sliders not covered by the median profile
+        if let Some(pred) = pred {
+            for (k, &v) in pred {
+                if map.contains_key(k) {
+                    continue;
+                }
+                if let Some(f) = Self::style_field(&mut r, k) {
+                    if *f == 0.0 {
+                        *f = v * amt;
+                    }
+                }
             }
         }
         r
+    }
+
+    fn style_field<'a>(r: &'a mut Recipe, k: &str) -> Option<&'a mut f32> {
+        Some(match k {
+            "exposure" => &mut r.exposure,
+            "contrast" => &mut r.contrast,
+            "highlights" => &mut r.highlights,
+            "shadows" => &mut r.shadows,
+            "whites" => &mut r.whites,
+            "blacks" => &mut r.blacks,
+            "vibrance" => &mut r.vibrance,
+            "saturation" => &mut r.saturation,
+            "dehaze" => &mut r.dehaze,
+            "clarity" => &mut r.clarity,
+            "texture" => &mut r.texture,
+            "sharpen" => &mut r.sharpen,
+            "noise_luma" => &mut r.noise_luma,
+            _ => return None,
+        })
     }
 
     /// LR `crs:Amount` / preset-strength scaling: every adjustment delta is
