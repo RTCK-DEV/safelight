@@ -863,6 +863,24 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
         wb[1] *= 1.0 - ti * 0.30;
         wb[2] *= 1.0 - t * 0.35 + ti * 0.12;
     }
+    // SL_WBG: diagnostic green-channel WB scale (as-shot tint parity probe)
+    if let Ok(k) = std::env::var("SL_WBG") {
+        if let Ok(k) = k.parse::<f32>() {
+            wb[1] /= k;
+        }
+    }
+    // AsShot green-baseline: LR's camera WB carries a tint bias that libraw's
+    // cam_mul omits — measured ~+3% green needed at tint=0, tapering to 0 at
+    // |tint|≈0.07 (836-image corpus: mean G residual −0.020). SL_WBG0
+    // overrides the baseline.
+    if r.wb_mode == WbMode::AsShot {
+        let base: f32 = std::env::var("SL_WBG0")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.03);
+        let ti = r.tint.clamp(-1.0, 1.0).abs();
+        wb[1] *= 1.0 + (base - 1.0) * (1.0 - ti / 0.07).max(0.0);
+    }
 
     // ProPhoto (D50, linear) — ACR's working space for the profile stage
     const XYZ_D50_TO_PROPHOTO: crate::dcp::Mat3 = [
@@ -6616,6 +6634,14 @@ pub(crate) fn adev_gain_mosaic(m: &Mosaic, p: &Params) -> f32 {
     }
     if std::env::var_os("SL_ADEV_DBG").is_some() {
         eprintln!("[adev] feats={:?}", f);
+    }
+    // SL_ADEV_DUMP=<file>: append the 13 raw features as a JSON line for
+    // offline refitting (canonical estimator — mosaic CPU and GPU share it).
+    if let Ok(fp) = std::env::var("SL_ADEV_DUMP") {
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(fp) {
+            let _ = writeln!(fh, "{}", serde_json::json!({"f": f}));
+        }
     }
     2f32.powf(ev.clamp(-0.5, 0.5))
 }

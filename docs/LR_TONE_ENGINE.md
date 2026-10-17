@@ -326,3 +326,14 @@ recipeなしレンダー(read_sidecar→embedded XMP)で比較すべき。
   （`{"profile": {"exposure": {"median": 1.22}, ...}}` 形式、
   従来のマイニング出力と互換）
 - engine.render() で一括適用 → CPU/GPU 両経路に自動反映
+
+## AsShot緑ベースライン（SL_WBG0, 既定1.03）
+
+836枚コーパスの全画素平均残差: R +0.001 / G **−0.020** / B −0.013 —
+系統的にマゼンタ寄り。tint_abs≤5（AsShot相当）では G −0.039 と最大。
+SL_WBG スイープで wb[1]≈+3〜5% の緑不足を確認。tint_abs高では
+残差小さいため |tint| で0.07までテーパーして適用:
+  wb[1] *= 1 + 0.03·max(0, 1−|ti|/0.07)   (AsShotのみ)
+実測: tint_lo群 g-res −0.037→−0.026, mae 0.1194→0.1185。
+原因推定: LR の AsShot WB はカメラ記録 tint バイアス込みだが
+libraw cam_mul は中立 — 本質は BaselineTint 相当の補正。
