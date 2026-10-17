@@ -286,3 +286,28 @@ MAE >0.3 の「最悪」NRファイル群 (8235/9588/8115/9403/4659) は
 内蔵XMPとカタログ設定が一致するファイル (0993/4001) は最初から一致。
 → 今後のコーパス評価では LinearDNG は内蔵XMP側を正とみなすか、
 recipeなしレンダー(read_sidecar→embedded XMP)で比較すべき。
+
+## 拡大評価: 836枚コーパス + 機能別 + ADEV再学習
+
+### 836枚（ベース名衝突除去済み）層化評価
+- **median MAE 0.0878 / mean 0.0999 / p90 0.1683** — 300枚時の0.0965より良好
+- 最悪群の内訳: NR-DNG stale preview（内蔵XMP=0で preview 生成済）+
+  0923ディレクトリ全ゼロレシピ群（プレビューのみ+1.7EV相当で明るい —
+  プレビュー生成後にカタログ設定が変わったstale系）
+
+### ADEV再学習（300枚 oracle EV vs pretone特徴量）
+- LOO R² = −0.006, corr 0.077 — **拡大コーパスではEVオフセットは
+  特徴量から学習不能**と確定。現行ウェイト（31枚fit）を維持、
+  再学習版は不採用。SL_ADEV_DUMP=<file> で特徴量収集可能にした
+
+### 機能別MAE（82件の機能付きペア）
+| 機能 | n | median | 備考 |
+|---|---|---|---|
+| mask(windows) | 19 | 0.121 | 適用済・残差はstale preview混入 |
+| grain | 30 | 0.105 | コーパス同等 |
+| hdr_edit | 12 | 0.142→0.141 | hdr_roll肩圧縮追加(CPU+GPU) |
+| dehaze>0.2 | 6 | 0.197 | 最大ギャップ、dcp強度差 |
+| retouch | 15 | 0.096 | コーパス同等 |
+
+### LinearRaw BaselineExposure（前項の確定事項）
+- `m.linear`時 dng_baseline_ev=0 → NR-DNGの2倍明るさ解消

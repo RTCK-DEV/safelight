@@ -182,6 +182,9 @@ pub struct Params {
     /// adaptive EV trim: predicted per-image exposure compensation gain
     /// (linear multiplier on the pretone buffer, 1.0 = off)
     pub adev_gain: f32,
+    /// HDR-edit highlight rolloff for the SDR preview (LR HDR mode compresses
+    /// the top stops harder); 0 = off
+    pub hdr_roll: f32,
     /// LR catalog orientation as dcraw flip code, -1 = use EXIF flip
     pub orientation: i32,
     pub has_tone: bool,
@@ -1684,6 +1687,7 @@ pub fn build_params(m: &Mosaic, r: &Recipe, stats: Option<&Stats>) -> Params {
             ..r.clone()
         }),
         adev_gain: 1.0,
+        hdr_roll: if r.hdr_edit { 0.6 } else { 0.0 },
         orientation: r.orientation,
         has_tone: r.shadows != 0.0
             || r.highlights != 0.0
@@ -4874,6 +4878,14 @@ fn finish_linear(
         for i in 0..13 {
             ev += W[i] * (f[i] - MU[i]) / SD[i];
         }
+        // SL_ADEV_DUMP=<file>: append the 13 raw features as a JSON line for
+        // offline refitting against the expanded corpus.
+        if let Ok(fp) = std::env::var("SL_ADEV_DUMP") {
+            use std::io::Write;
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(fp) {
+                let _ = writeln!(fh, "{}", serde_json::json!({"f": f}));
+            }
+        }
         pc.adev_gain = 2f32.powf(ev.clamp(-0.5, 0.5));
     }
     let p = &pc;
@@ -5479,7 +5491,10 @@ fn finish_linear(
             }
             let o = (dy * dw + dx) * 4;
             for c in 0..3 {
-                out[o + c] = (srgb_encode(adj[c].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                // HDR-edit SDR preview: extra shoulder above ~0.55 so the
+                // extended-range highlights compress like LR's HDR preview
+                let v = adj[c] - p.hdr_roll * 3.0 * (adj[c] - 0.55).max(0.0).powf(2.2);
+                out[o + c] = (srgb_encode(v.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
             }
             out[o + 3] = 255;
         }

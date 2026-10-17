@@ -2682,6 +2682,8 @@ fn finish_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         }
         adj = adj * (1.0 - pg.a3.w * sstep(r0, r1, d) * 0.9);
     }
+    // HDR-edit SDR preview: extra shoulder above ~0.55 (mirrors develop.rs hdr_roll)
+    adj = adj - pg.extra0.w * 3.0 * pow(max(adj - vec3<f32>(0.55), vec3<f32>(0.0)), vec3<f32>(2.2));
     let enc = srgb_encode(clamp(adj.x, 0.0, 1.0)) * 255.0 + 0.5;
     let enc2 = srgb_encode(clamp(adj.y, 0.0, 1.0)) * 255.0 + 0.5;
     let enc3 = srgb_encode(clamp(adj.z, 0.0, 1.0)) * 255.0 + 0.5;
@@ -3258,7 +3260,7 @@ impl Gpu {
                 p.sharp_mask,
                 p.lens_blur,
             ],
-            extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], 0.0],
+            extra0: [p.vig_shape[0], p.vig_shape[1], p.vig_shape[2], p.hdr_roll],
             extra1: [p.grain_size, p.grain_rough, p.sharp_radius, p.sharp_detail],
             cal0: [p.calib[0], p.calib[1], p.calib[2], p.calib[9]],
             cal1: [p.calib[3], p.calib[4], p.calib[5], 0.0],
